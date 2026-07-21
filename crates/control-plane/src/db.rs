@@ -53,6 +53,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             active_peers   INTEGER NOT NULL DEFAULT 0,
             last_heartbeat INTEGER,
             dns            TEXT,
+            obfuscation_key TEXT,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
@@ -86,6 +87,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN active_peers INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN last_heartbeat INTEGER",
         "ALTER TABLE servers ADD COLUMN dns TEXT",
+        "ALTER TABLE servers ADD COLUMN obfuscation_key TEXT",
     ] {
         let _ = sqlx::query(stmt).execute(pool).await;
     }

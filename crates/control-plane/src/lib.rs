@@ -346,7 +346,8 @@ async fn register_core(
     server_id: &str,
 ) -> ApiResult<RegisterDeviceResponse> {
     let server = sqlx::query(
-        "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns FROM servers WHERE id = ?",
+        "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns, obfuscation_key
+         FROM servers WHERE id = ?",
     )
     .bind(server_id)
     .fetch_optional(&state.pool)
@@ -358,6 +359,7 @@ async fn register_core(
     let tunnel_cidr: String = server.get("tunnel_cidr");
     let server_tunnel_ip: String = server.get("tunnel_ip");
     let server_dns: Option<String> = server.get("dns");
+    let server_obfs: Option<String> = server.get("obfuscation_key");
     let cidr: IpNet = tunnel_cidr
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored cidr")))?;
@@ -386,6 +388,7 @@ async fn register_core(
             server_endpoint,
             server_tunnel_ip,
             server_dns,
+            server_obfs,
         );
     }
 
@@ -416,6 +419,7 @@ async fn register_core(
         server_endpoint,
         server_tunnel_ip,
         server_dns,
+        server_obfs,
     )
 }
 
@@ -558,6 +562,7 @@ async fn used_ips(pool: &SqlitePool, server_id: &str) -> ApiResult<HashSet<IpAdd
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn response_for(
     assigned_ip: String,
     cidr: IpNet,
@@ -565,6 +570,7 @@ fn response_for(
     server_endpoint: String,
     server_tunnel_ip: String,
     dns: Option<String>,
+    obfuscation_key: Option<String>,
 ) -> ApiResult<RegisterDeviceResponse> {
     let public_key = PublicKey::from_str(&server_pk)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored key: {e}")))?;
@@ -576,6 +582,7 @@ fn response_for(
             tunnel_ip: server_tunnel_ip,
         },
         dns,
+        obfuscation_key,
     })
 }
 
@@ -590,6 +597,8 @@ pub struct NewServer<'a> {
     pub capacity: u32,
     /// DNS server handed to clients for leak protection (e.g. the server's tunnel IP).
     pub dns: Option<&'a str>,
+    /// Stealth-mode obfuscation key (base64) this server expects; handed to clients.
+    pub obfuscation_key: Option<&'a str>,
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.
@@ -604,8 +613,8 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
     sqlx::query(
         "INSERT INTO servers
             (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token,
-             country, city, capacity, active_peers, last_heartbeat, dns, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
+             country, city, capacity, active_peers, last_heartbeat, dns, obfuscation_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)",
     )
     .bind(s.id)
     .bind(s.public_key)
@@ -617,6 +626,7 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
     .bind(s.city)
     .bind(s.capacity)
     .bind(s.dns)
+    .bind(s.obfuscation_key)
     .bind(db::now_unix())
     .execute(pool)
     .await?;

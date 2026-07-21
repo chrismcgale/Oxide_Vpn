@@ -79,6 +79,11 @@ pub struct RegisterDeviceResponse {
     /// DNS server to use while connected (defaults applied client-side if absent).
     #[serde(default)]
     pub dns: Option<String>,
+    /// Stealth-mode obfuscation key (base64), if the server runs stealth. The client
+    /// uses it to obfuscate the tunnel. For multihop this is the *exit's* key (the
+    /// tunnel terminates there; the entry relays the obfuscated bytes untouched).
+    #[serde(default)]
+    pub obfuscation_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

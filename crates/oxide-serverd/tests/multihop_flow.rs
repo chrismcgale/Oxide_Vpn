@@ -48,6 +48,7 @@ async fn multihop_client_relay_exit_carries_a_packet() {
             city: None,
             capacity: 0,
             dns: None,
+            obfuscation_key: None,
         },
     )
     .await
@@ -64,6 +65,7 @@ async fn multihop_client_relay_exit_carries_a_packet() {
             city: None,
             capacity: 0,
             dns: None,
+            obfuscation_key: None,
         },
     )
     .await

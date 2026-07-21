@@ -67,6 +67,7 @@ async fn control_plane_provisions_a_working_tunnel() {
             city: None,
             capacity: 0,
             dns: None,
+            obfuscation_key: None,
         },
     )
     .await

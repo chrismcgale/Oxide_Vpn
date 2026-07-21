@@ -250,6 +250,14 @@ fn resolve_registration(
         .parse()
         .with_context(|| format!("bad server endpoint: {}", reg.server.endpoint))?;
 
+    // Use the server's stealth key if it provided one (multihop: this is the exit's key).
+    let obfuscation_key = match &reg.obfuscation_key {
+        Some(k) => Some(
+            k.parse()
+                .context("bad obfuscation key from control plane")?,
+        ),
+        None => None,
+    };
     let iface = InterfaceConfig {
         private_key: device_key,
         address,
@@ -257,7 +265,7 @@ fn resolve_registration(
         listen_port: None,
         mtu,
         dns: reg.dns.as_ref().and_then(|s| s.parse().ok()),
-        obfuscation_key: None,
+        obfuscation_key,
     };
     let peer = PeerParams {
         public_key: reg.server.public_key,
@@ -427,11 +435,14 @@ mod tests {
                 tunnel_ip: "10.8.0.1".into(),
             },
             dns: Some("10.8.0.1".into()),
+            obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
         };
 
         let (iface, peer) = resolve_registration(device, &reg, Some(1400)).unwrap();
         assert_eq!(iface.address.to_string(), "10.8.0.5/24");
         assert_eq!(iface.mtu(), 1400);
+        // The control-plane-provided stealth key is picked up.
+        assert!(iface.obfuscation_key.is_some());
         assert_eq!(peer.endpoint.unwrap().to_string(), "203.0.113.7:51820");
         assert_eq!(peer.public_key, server_pub);
         assert!(peer

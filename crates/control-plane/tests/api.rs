@@ -32,6 +32,7 @@ async fn full_account_device_flow() {
             city: Some("New York"),
             capacity: 100,
             dns: Some("10.8.0.1"),
+            obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
         },
     )
     .await
@@ -65,6 +66,10 @@ async fn full_account_device_flow() {
     assert_eq!(reg.server.tunnel_ip, "10.8.0.1");
     assert_eq!(reg.server.public_key.to_base64(), server_pub);
     assert_eq!(reg.dns.as_deref(), Some("10.8.0.1")); // DNS handed out for leak protection
+    assert_eq!(
+        reg.obfuscation_key.as_deref(),
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+    ); // stealth key handed out
 
     // Re-registering the same device is idempotent (same IP).
     let reg_again = cc
@@ -104,6 +109,7 @@ async fn auth_is_enforced() {
             city: None,
             capacity: 0,
             dns: None,
+            obfuscation_key: None,
         },
     )
     .await
@@ -142,6 +148,7 @@ async fn best_server_selection_balances_by_load_and_location() {
                 city: None,
                 capacity: 100,
                 dns: None,
+                obfuscation_key: None,
             },
         )
         .await

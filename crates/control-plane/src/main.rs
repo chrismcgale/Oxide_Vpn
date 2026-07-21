@@ -55,6 +55,9 @@ enum Cmd {
         /// DNS server handed to clients for leak protection (e.g. the tunnel IP 10.8.0.1).
         #[arg(long)]
         dns: Option<String>,
+        /// Stealth-mode obfuscation key (base64) this server runs. Generate with `genkey`.
+        #[arg(long)]
+        obfuscation_key: Option<String>,
     },
     /// Create an account from the CLI (handy for testing/seeding).
     NewAccount,
@@ -89,6 +92,7 @@ async fn main() -> Result<()> {
             city,
             capacity,
             dns,
+            obfuscation_key,
         } => {
             let cidr: IpNet = cidr.parse().context("invalid --cidr")?;
             let token = add_server(
@@ -102,6 +106,7 @@ async fn main() -> Result<()> {
                     city: city.as_deref(),
                     capacity,
                     dns: dns.as_deref(),
+                    obfuscation_key: obfuscation_key.as_deref(),
                 },
             )
             .await?;
