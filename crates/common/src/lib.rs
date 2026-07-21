@@ -4,6 +4,7 @@
 //! future control plane without pulling any of them in.
 
 pub mod account;
+pub mod agent;
 pub mod api;
 pub mod config;
 pub mod error;

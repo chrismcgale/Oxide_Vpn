@@ -93,11 +93,16 @@ pub struct Engine<T: TunQueue> {
 /// without counting long-idle ones.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(180);
 
-/// A snapshot of engine load, reported to the control plane for server selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A snapshot of engine load/throughput, for the control plane (server selection) and
+/// the client agent/TUI (live status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EngineStats {
     pub total_peers: usize,
     pub active_peers: usize,
+    /// Total bytes encrypted and sent to peers.
+    pub tx_bytes: u64,
+    /// Total bytes received and decrypted from peers.
+    pub rx_bytes: u64,
 }
 
 /// A cheap, cloneable handle for mutating a running engine's peer set. The control
@@ -398,20 +403,26 @@ impl<T: TunQueue> EngineHandle<T> {
             .retain(|_, v| *v != id);
     }
 
-    /// Current load: total peers and how many have a live (recent-handshake) session.
+    /// Current load and throughput: peer counts plus total bytes tx/rx across peers.
     pub fn stats(&self) -> EngineStats {
         let peers = self.shared.table.read().unwrap().snapshot();
         let total_peers = peers.len();
-        let active_peers = peers
-            .iter()
-            .filter(|(_, p)| {
-                let since = p.tunn.lock().unwrap().stats().0;
-                matches!(since, Some(d) if d < ACTIVE_WINDOW)
-            })
-            .count();
+        let mut active_peers = 0;
+        let mut tx_bytes = 0u64;
+        let mut rx_bytes = 0u64;
+        for (_, p) in &peers {
+            let (since, tx, rx, _, _) = p.tunn.lock().unwrap().stats();
+            if matches!(since, Some(d) if d < ACTIVE_WINDOW) {
+                active_peers += 1;
+            }
+            tx_bytes += tx as u64;
+            rx_bytes += rx as u64;
+        }
         EngineStats {
             total_peers,
             active_peers,
+            tx_bytes,
+            rx_bytes,
         }
     }
 

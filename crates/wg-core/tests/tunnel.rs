@@ -333,8 +333,10 @@ async fn peer_added_at_runtime_comes_up() {
 
     assert_eq!(received, packet);
 
-    // The server should now report one live peer (used for load-based selection).
+    // The server should now report one live peer (used for load-based selection) and
+    // non-zero throughput (used for the client agent/TUI status).
     let stats = server_handle.stats();
     assert_eq!(stats.total_peers, 1);
     assert_eq!(stats.active_peers, 1);
+    assert!(stats.tx_bytes > 0 || stats.rx_bytes > 0);
 }
