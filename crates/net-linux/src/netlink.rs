@@ -1,83 +1,166 @@
-//! Interface addressing and routing via iproute2 (`ip`).
+//! Interface addressing and routing via **rtnetlink** (real netlink sockets).
 //!
-//! Named `netlink` because that is the kernel API it fronts; the M5 roadmap swaps the
-//! shell-outs here for a real rtnetlink socket without changing callers.
+//! This replaces the earlier `ip`-command shell-outs for all mutations (link up/mtu,
+//! address add, route add/del) — no dependency on the `iproute2` binary, and operations
+//! go straight to the kernel. The route/address builders are family-agnostic, so IPv6
+//! works the same as IPv4.
+//!
+//! One read — finding the current default gateway/interface — is still done with
+//! `ip route show default`, because reconstructing it from raw netlink route-dump
+//! attributes is disproportionately fiddly for a low-risk read. Everything that
+//! *changes* kernel state goes through netlink.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use futures::TryStreamExt;
 use ipnet::IpNet;
+use rtnetlink::packet_route::route::{RouteMessage, RouteScope};
+use rtnetlink::{new_connection, Handle, LinkUnspec, RouteMessageBuilder};
 
-use crate::cmd::{output, run};
+use crate::cmd::output;
 
-/// Bring an interface administratively up.
-pub fn set_up(ifname: &str) -> io::Result<()> {
-    run("ip", &["link", "set", "dev", ifname, "up"])
+fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
+    io::Error::other(e.to_string())
 }
 
-/// Set the interface MTU. WireGuard's default of 1420 avoids fragmentation under a
-/// 1500-byte path (this is the #1 "ping works, curl hangs" fix).
-pub fn set_mtu(ifname: &str, mtu: u32) -> io::Result<()> {
-    run(
-        "ip",
-        &["link", "set", "dev", ifname, "mtu", &mtu.to_string()],
-    )
+/// A handle to the kernel's routing/addressing via netlink. Cheap to clone.
+#[derive(Clone)]
+pub struct Netlink {
+    handle: Handle,
 }
 
-/// Assign a tunnel address (with prefix) to the interface.
-pub fn add_address(ifname: &str, addr: IpNet) -> io::Result<()> {
-    run("ip", &["addr", "add", &addr.to_string(), "dev", ifname])
+impl Netlink {
+    /// Open a netlink connection and spawn its background task.
+    pub fn connect() -> io::Result<Self> {
+        let (connection, handle, _) = new_connection()?;
+        tokio::spawn(connection);
+        Ok(Netlink { handle })
+    }
+
+    /// Resolve an interface name to its index.
+    pub async fn link_index(&self, name: &str) -> io::Result<u32> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_string())
+            .execute();
+        match links.try_next().await.map_err(to_io)? {
+            Some(link) => Ok(link.header.index),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface {name} not found"),
+            )),
+        }
+    }
+
+    /// Bring an interface up and set its MTU.
+    pub async fn set_up_mtu(&self, index: u32, mtu: u32) -> io::Result<()> {
+        self.handle
+            .link()
+            .set(LinkUnspec::new_with_index(index).up().mtu(mtu).build())
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Assign a tunnel address (with prefix) to the interface.
+    pub async fn add_address(&self, index: u32, addr: IpNet) -> io::Result<()> {
+        self.handle
+            .address()
+            .add(index, addr.addr(), addr.prefix_len())
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Add an on-link route (dst out this interface, no gateway).
+    pub async fn add_route_dev(&self, dst: IpNet, index: u32) -> io::Result<()> {
+        self.handle
+            .route()
+            .add(dev_route(dst, index))
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Remove an on-link route (teardown).
+    pub async fn del_route_dev(&self, dst: IpNet, index: u32) -> io::Result<()> {
+        self.handle
+            .route()
+            .del(dev_route(dst, index))
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Add a `/32` or `/128` host route to `host` via `gateway` out `index`. Pins the
+    /// VPN server's endpoint through the original gateway before the default route is
+    /// swung into the tunnel (so the tunnel's own UDP doesn't recurse into itself).
+    pub async fn add_host_route_via(
+        &self,
+        host: IpAddr,
+        gateway: IpAddr,
+        index: u32,
+    ) -> io::Result<()> {
+        self.handle
+            .route()
+            .add(host_route_via(host, gateway, index)?)
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Remove a host route (teardown).
+    pub async fn del_host_route_via(
+        &self,
+        host: IpAddr,
+        gateway: IpAddr,
+        index: u32,
+    ) -> io::Result<()> {
+        self.handle
+            .route()
+            .del(host_route_via(host, gateway, index)?)
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Capture all IPv4 traffic into the tunnel with the two-halves trick
+    /// (`0.0.0.0/1` + `128.0.0.0/1`), which outranks the existing default by
+    /// longest-prefix match without deleting it.
+    pub async fn set_default_v4_via_dev(&self, index: u32) -> io::Result<()> {
+        self.add_route_dev("0.0.0.0/1".parse().unwrap(), index)
+            .await?;
+        self.add_route_dev("128.0.0.0/1".parse().unwrap(), index)
+            .await
+    }
+
+    /// IPv6 equivalent: `::/1` + `8000::/1`.
+    pub async fn set_default_v6_via_dev(&self, index: u32) -> io::Result<()> {
+        self.add_route_dev("::/1".parse().unwrap(), index).await?;
+        self.add_route_dev("8000::/1".parse().unwrap(), index).await
+    }
+
+    /// Remove the split-default routes we installed (belt-and-suspenders; they also
+    /// vanish when the tun interface is dropped).
+    pub async fn clear_default_via_dev(&self, index: u32, v6: bool) {
+        for cidr in ["0.0.0.0/1", "128.0.0.0/1"] {
+            let _ = self.del_route_dev(cidr.parse().unwrap(), index).await;
+        }
+        if v6 {
+            for cidr in ["::/1", "8000::/1"] {
+                let _ = self.del_route_dev(cidr.parse().unwrap(), index).await;
+            }
+        }
+    }
 }
 
-/// Route a destination prefix out through the interface (on-link).
-pub fn add_route_dev(dst: IpNet, ifname: &str) -> io::Result<()> {
-    run("ip", &["route", "add", &dst.to_string(), "dev", ifname])
-}
-
-/// Delete a route by destination CIDR string (teardown).
-pub fn del_route(cidr: &str) -> io::Result<()> {
-    run("ip", &["route", "del", cidr])
-}
-
-/// Add a `/32` (or `/128`) host route to `host` via a specific gateway. Used to pin
-/// the route to the VPN server's endpoint through the *original* default gateway
-/// before we swing the default route into the tunnel — otherwise the tunnel's own
-/// UDP would recursively route into itself.
-pub fn add_host_route_via(host: IpAddr, gateway: IpAddr, ifname: &str) -> io::Result<()> {
-    let host_cidr = match host {
-        IpAddr::V4(v4) => format!("{v4}/32"),
-        IpAddr::V6(v6) => format!("{v6}/128"),
-    };
-    run(
-        "ip",
-        &[
-            "route",
-            "add",
-            &host_cidr,
-            "via",
-            &gateway.to_string(),
-            "dev",
-            ifname,
-        ],
-    )
-}
-
-/// Capture all traffic into the tunnel using the two-halves trick
-/// (`0.0.0.0/1` + `128.0.0.0/1`), which outranks the existing `0.0.0.0/0` default by
-/// longest-prefix match without deleting it. This is what `wg-quick`'s
-/// `AllowedIPs = 0.0.0.0/0` does under the hood.
-pub fn set_default_via_dev(ifname: &str) -> io::Result<()> {
-    add_route_dev("0.0.0.0/1".parse().unwrap(), ifname)?;
-    add_route_dev("128.0.0.0/1".parse().unwrap(), ifname)?;
-    Ok(())
-}
-
-/// The current default route as `(gateway, egress interface)`, parsed from
-/// `ip route show default`. Needed to pin the server-endpoint host route and to
-/// auto-detect the NAT egress interface.
+/// The current default route as `(gateway, egress interface name)`, parsed from
+/// `ip route show default`. (The one read we don't do over netlink — see module docs.)
 pub fn default_route() -> io::Result<Option<(IpAddr, String)>> {
     let text = output("ip", &["route", "show", "default"])?;
-    // Example: "default via 192.168.1.1 dev eth0 proto dhcp metric 100"
     for line in text.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
         let via = toks
@@ -95,4 +178,38 @@ pub fn default_route() -> io::Result<Option<(IpAddr, String)>> {
         }
     }
     Ok(None)
+}
+
+fn dev_route(dst: IpNet, oif: u32) -> RouteMessage {
+    match dst {
+        IpNet::V4(n) => RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(n.addr(), n.prefix_len())
+            .output_interface(oif)
+            .scope(RouteScope::Link)
+            .build(),
+        IpNet::V6(n) => RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(n.addr(), n.prefix_len())
+            .output_interface(oif)
+            .scope(RouteScope::Link)
+            .build(),
+    }
+}
+
+fn host_route_via(host: IpAddr, gateway: IpAddr, oif: u32) -> io::Result<RouteMessage> {
+    match (host, gateway) {
+        (IpAddr::V4(h), IpAddr::V4(g)) => Ok(RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(h, 32)
+            .gateway(g)
+            .output_interface(oif)
+            .build()),
+        (IpAddr::V6(h), IpAddr::V6(g)) => Ok(RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(h, 128)
+            .gateway(g)
+            .output_interface(oif)
+            .build()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host and gateway address families differ",
+        )),
+    }
 }

@@ -6,6 +6,8 @@
 private_key = "CLIENT_PRIVATE_KEY_BASE64"
 # Client's address inside the tunnel subnet.
 address = "10.8.0.2/24"
+# Optional second address for dual-stack (IPv6 inside the tunnel).
+# address6 = "fd00::2/64"
 # Optional; defaults to 1420.
 mtu = 1420
 # DNS leak protection: while connected, the system resolver is pointed here (and

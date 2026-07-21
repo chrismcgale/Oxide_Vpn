@@ -41,20 +41,22 @@ cat > "$DIR/server.toml" <<EOF
 [interface]
 private_key = "$SPRIV"
 address = "10.8.0.1/24"
+address6 = "fd00::1/64"
 listen_port = 51820
 [[peer]]
 public_key = "$CPUB"
-allowed_ips = ["10.8.0.2/32"]
+allowed_ips = ["10.8.0.2/32", "fd00::2/128"]
 EOF
 
 cat > "$DIR/client.toml" <<EOF
 [interface]
 private_key = "$CPRIV"
 address = "10.8.0.2/24"
+address6 = "fd00::2/64"
 [[peer]]
 public_key = "$SPUB"
 endpoint = "10.99.0.1:51820"
-allowed_ips = ["10.8.0.0/24"]
+allowed_ips = ["10.8.0.0/24", "fd00::/64"]
 persistent_keepalive = 25
 EOF
 
@@ -78,14 +80,22 @@ CLI_PID=$!
 echo "== waiting for handshake =="
 sleep 3
 
-echo "== ping across the tunnel (client -> server) =="
+echo "== ping across the tunnel (client -> server, IPv4) =="
 if ip netns exec "$CLI" ping -c 3 -W 2 10.8.0.1; then
-    echo
-    echo "RESULT: PASS ✓  tunnel carries traffic end-to-end"
-    RC=0
+    echo "IPv4: PASS ✓"
+    echo "== ping across the tunnel (client -> server, IPv6) =="
+    if ip netns exec "$CLI" ping -6 -c 3 -W 2 fd00::1; then
+        echo
+        echo "RESULT: PASS ✓  tunnel carries IPv4 + IPv6 end-to-end"
+        RC=0
+    else
+        echo
+        echo "RESULT: FAIL ✗  (IPv6 across tunnel failed)"
+        RC=1
+    fi
 else
     echo
-    echo "RESULT: FAIL ✗  (see logs below)"
+    echo "RESULT: FAIL ✗  (IPv4 across tunnel failed; see logs below)"
     RC=1
 fi
 

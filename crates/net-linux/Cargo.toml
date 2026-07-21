@@ -14,3 +14,5 @@ libc = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
+rtnetlink = "0.21"
+futures = "0.3.33"

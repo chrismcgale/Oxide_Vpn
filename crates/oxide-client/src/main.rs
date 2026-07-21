@@ -12,7 +12,7 @@
 //!
 //! Requires `CAP_NET_ADMIN` (run as root) for the actual connect.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use oxide_common::api::RegisterDeviceResponse;
 use oxide_common::{keys, Config, InterfaceConfig, SecretKey};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink};
+use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink};
 use oxide_wg_core::{Engine, PeerParams};
 
 const IFNAME: &str = "oxide0";
@@ -253,6 +253,7 @@ fn resolve_registration(
     let iface = InterfaceConfig {
         private_key: device_key,
         address,
+        address6: None,
         listen_port: None,
         mtu,
         dns: reg.dns.as_ref().and_then(|s| s.parse().ok()),
@@ -274,26 +275,57 @@ async fn run_tunnel(
     peers: Vec<PeerParams>,
     kill_switch: bool,
 ) -> Result<()> {
-    let tun = bring_up_interface(IFNAME, iface).context("bringing up tun interface")?;
+    let nl = Netlink::connect().context("opening netlink")?;
+    let (tun, tun_idx) = bring_up_interface(&nl, IFNAME, iface)
+        .await
+        .context("bringing up tun interface")?;
     info!(iface = IFNAME, addr = %iface.address, mtu = iface.mtu(), "interface up");
 
     // Full-tunnel routing: pin the server endpoint via the current default gateway
     // BEFORE swinging the default, or the encrypted UDP would recurse into the tunnel.
-    let mut default_swung = false;
+    // The encrypted transport is over IPv4 (WG-over-IPv6 is a follow-up); IPv6 *inside*
+    // the tunnel (a `::/0` allowed-ip) is routed into the interface here.
+    let mut routed_v4 = false;
+    let mut routed_v6 = false;
     let mut full_tunnel_endpoint: Option<SocketAddr> = None;
+    let mut pinned: Option<(IpAddr, IpAddr, u32)> = None;
     for peer in &peers {
-        if is_full_tunnel(&peer.allowed_ips) {
+        let has_v4 = peer
+            .allowed_ips
+            .iter()
+            .any(|n| matches!(n, IpNet::V4(v) if v.prefix_len() == 0));
+        let has_v6 = peer
+            .allowed_ips
+            .iter()
+            .any(|n| matches!(n, IpNet::V6(v) if v.prefix_len() == 0));
+        if has_v4 || has_v6 {
             let endpoint = peer
                 .endpoint
                 .context("full-tunnel peer must have an endpoint")?;
             let (gw, dev) = netlink::default_route()?
                 .context("no default route found; cannot pin server endpoint")?;
-            netlink::add_host_route_via(endpoint.ip(), gw, &dev)
+            let dev_idx = nl
+                .link_index(&dev)
+                .await
+                .context("resolving egress interface index")?;
+            nl.add_host_route_via(endpoint.ip(), gw, dev_idx)
+                .await
                 .context("pinning server endpoint route")?;
-            netlink::set_default_via_dev(IFNAME).context("swinging default route into tunnel")?;
-            info!(server = %endpoint.ip(), via = %gw, "default route swung into tunnel");
-            default_swung = true;
+            if has_v4 {
+                nl.set_default_v4_via_dev(tun_idx)
+                    .await
+                    .context("swinging IPv4 default into tunnel")?;
+                routed_v4 = true;
+            }
+            if has_v6 {
+                nl.set_default_v6_via_dev(tun_idx)
+                    .await
+                    .context("swinging IPv6 default into tunnel")?;
+                routed_v6 = true;
+            }
+            info!(server = %endpoint.ip(), via = %gw, v4 = routed_v4, v6 = routed_v6, "default route swung into tunnel");
             full_tunnel_endpoint = Some(endpoint);
+            pinned = Some((endpoint.ip(), gw, dev_idx));
             break;
         }
     }
@@ -340,21 +372,13 @@ async fn run_tunnel(
     if let Some(guard) = dns_guard {
         dns::restore(guard);
     }
-    if default_swung {
-        for half in ["0.0.0.0/1", "128.0.0.0/1"] {
-            if let Err(e) = netlink::del_route(half) {
-                warn!(route = half, ?e, "failed to remove split-default route");
-            }
-        }
+    if let Some((host, gw, dev_idx)) = pinned {
+        let _ = nl.del_host_route_via(host, gw, dev_idx).await;
+    }
+    if routed_v4 || routed_v6 {
+        nl.clear_default_via_dev(tun_idx, routed_v6).await;
     }
     Ok(())
-}
-
-/// Is this a full-tunnel peer (routes the entire IPv4 default)?
-fn is_full_tunnel(allowed: &[IpNet]) -> bool {
-    allowed
-        .iter()
-        .any(|n| matches!(n, IpNet::V4(v4) if v4.prefix_len() == 0))
 }
 
 /// Load the device private key from `path`, or generate and persist one (0600).
@@ -400,7 +424,10 @@ mod tests {
         assert_eq!(iface.mtu(), 1400);
         assert_eq!(peer.endpoint.unwrap().to_string(), "203.0.113.7:51820");
         assert_eq!(peer.public_key, server_pub);
-        assert!(is_full_tunnel(&peer.allowed_ips));
+        assert!(peer
+            .allowed_ips
+            .iter()
+            .any(|n| matches!(n, IpNet::V4(v) if v.prefix_len() == 0)));
         assert_eq!(peer.persistent_keepalive, Some(25));
     }
 }

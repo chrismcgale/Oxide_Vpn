@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use oxide_common::api::PeerEntry;
 use oxide_common::{keys, Config, ControlPlaneConfig, SecretKey};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::{bring_up_interface, nat, netlink, sysctl};
+use oxide_net_linux::{bring_up_interface, nat, netlink, sysctl, Netlink};
 use oxide_wg_core::{Engine, EngineHandle, PeerParams, TunQueue};
 
 const IFNAME: &str = "oxide0";
@@ -80,8 +80,11 @@ async fn run(config_path: PathBuf) -> Result<()> {
         .listen_port
         .context("server config must set interface.listen_port")?;
 
-    // Interface: TUN + address + MTU + up.
-    let tun = bring_up_interface(IFNAME, &cfg.interface).context("bringing up tun interface")?;
+    // Interface: TUN + address + MTU + up (over netlink).
+    let nl = Netlink::connect().context("opening netlink")?;
+    let (tun, _idx) = bring_up_interface(&nl, IFNAME, &cfg.interface)
+        .await
+        .context("bringing up tun interface")?;
     info!(iface = IFNAME, addr = %cfg.interface.address, mtu = cfg.interface.mtu(), "interface up");
 
     // Full-tunnel egress: forwarding + relaxed rp_filter + masquerade.

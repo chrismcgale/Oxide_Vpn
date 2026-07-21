@@ -14,5 +14,6 @@ pub mod setup;
 pub mod sysctl;
 pub mod tun;
 
+pub use netlink::Netlink;
 pub use setup::bring_up_interface;
 pub use tun::TunDevice;

@@ -1,18 +1,26 @@
-//! Interface bring-up shared by the server and client daemons: create the TUN
-//! device, set MTU, assign the tunnel address, and bring it up.
+//! Interface bring-up shared by the server and client daemons: create the TUN device,
+//! assign its tunnel address(es), set MTU, and bring it up — all over netlink.
 
 use std::io;
 
 use oxide_common::InterfaceConfig;
 
-use crate::netlink;
+use crate::netlink::Netlink;
 use crate::tun::TunDevice;
 
-/// Create the tunnel interface `name` and apply address/MTU from `iface`.
-pub fn bring_up_interface(name: &str, iface: &InterfaceConfig) -> io::Result<TunDevice> {
+/// Create the tunnel interface `name`, apply address(es)/MTU from `iface`, bring it up.
+/// Returns the device plus its link index (for subsequent route operations).
+pub async fn bring_up_interface(
+    nl: &Netlink,
+    name: &str,
+    iface: &InterfaceConfig,
+) -> io::Result<(TunDevice, u32)> {
     let dev = TunDevice::create(name)?;
-    netlink::set_mtu(name, iface.mtu())?;
-    netlink::add_address(name, iface.address)?;
-    netlink::set_up(name)?;
-    Ok(dev)
+    let index = nl.link_index(name).await?;
+    nl.add_address(index, iface.address).await?;
+    if let Some(addr6) = iface.address6 {
+        nl.add_address(index, addr6).await?;
+    }
+    nl.set_up_mtu(index, iface.mtu()).await?;
+    Ok((dev, index))
 }

@@ -71,6 +71,10 @@ pub struct InterfaceConfig {
     /// Tunnel address of this interface, with prefix (e.g. `10.8.0.1/24`).
     pub address: IpNet,
 
+    /// Optional second tunnel address for dual-stack (typically an IPv6 prefix).
+    #[serde(default)]
+    pub address6: Option<IpNet>,
+
     /// UDP port to listen on. Required for the server; optional (ephemeral) for a client.
     #[serde(default)]
     pub listen_port: Option<u16>,
@@ -174,6 +178,23 @@ mod tests {
         assert_eq!(cfg.interface.mtu(), 1420);
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.nat.unwrap().egress.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn parses_dual_stack_address6() {
+        let toml = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.2/24"
+            address6 = "fd00::2/64"
+
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["0.0.0.0/0", "::/0"]
+        "#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.interface.address6.unwrap().to_string(), "fd00::2/64");
+        assert_eq!(cfg.peers[0].allowed_ips.len(), 2);
     }
 
     #[test]
