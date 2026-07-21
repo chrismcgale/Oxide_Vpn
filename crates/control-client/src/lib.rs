@@ -99,15 +99,19 @@ impl ControlClient {
     }
 
     /// Register this device's public key on `server_id`; returns connection details.
+    /// `pq_ciphertext` carries a post-quantum KEM ciphertext (base64) when the server
+    /// runs PQ; pass `None` otherwise.
     pub async fn register_device(
         &self,
         account: &str,
         public_key: PublicKey,
         server_id: &str,
+        pq_ciphertext: Option<&str>,
     ) -> Result<RegisterDeviceResponse> {
         let req = RegisterDeviceRequest {
             public_key,
             server_id: server_id.to_string(),
+            pq_ciphertext: pq_ciphertext.map(String::from),
         };
         let resp = self
             .http

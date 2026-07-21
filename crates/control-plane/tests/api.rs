@@ -33,6 +33,7 @@ async fn full_account_device_flow() {
             capacity: 100,
             dns: Some("10.8.0.1"),
             obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            pq_public_key: None,
         },
     )
     .await
@@ -59,7 +60,7 @@ async fn full_account_device_flow() {
     // Register a device: first free host is .2 (.1 is the server).
     let dev1 = public_from_secret(&generate_secret());
     let reg = cc
-        .register_device(&account, dev1, "us-nyc-1")
+        .register_device(&account, dev1, "us-nyc-1", None)
         .await
         .unwrap();
     assert_eq!(reg.assigned_ip, "10.8.0.2/24");
@@ -73,7 +74,7 @@ async fn full_account_device_flow() {
 
     // Re-registering the same device is idempotent (same IP).
     let reg_again = cc
-        .register_device(&account, dev1, "us-nyc-1")
+        .register_device(&account, dev1, "us-nyc-1", None)
         .await
         .unwrap();
     assert_eq!(reg_again.assigned_ip, "10.8.0.2/24");
@@ -81,7 +82,7 @@ async fn full_account_device_flow() {
     // A second device gets the next IP.
     let dev2 = public_from_secret(&generate_secret());
     let reg2 = cc
-        .register_device(&account, dev2, "us-nyc-1")
+        .register_device(&account, dev2, "us-nyc-1", None)
         .await
         .unwrap();
     assert_eq!(reg2.assigned_ip, "10.8.0.3/24");
@@ -110,6 +111,7 @@ async fn auth_is_enforced() {
             capacity: 0,
             dns: None,
             obfuscation_key: None,
+            pq_public_key: None,
         },
     )
     .await
@@ -149,6 +151,7 @@ async fn best_server_selection_balances_by_load_and_location() {
                 capacity: 100,
                 dns: None,
                 obfuscation_key: None,
+                pq_public_key: None,
             },
         )
         .await

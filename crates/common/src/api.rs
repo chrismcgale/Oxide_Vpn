@@ -34,6 +34,10 @@ pub struct ServerInfo {
     /// Whether the server has heartbeated recently enough to be considered up.
     #[serde(default = "default_true")]
     pub healthy: bool,
+    /// Post-quantum public (ML-KEM encapsulation) key, base64, if the server runs PQ.
+    /// The client encapsulates to it and sends the ciphertext at registration.
+    #[serde(default)]
+    pub pq_public_key: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -56,6 +60,10 @@ pub struct ServerListResponse {
 pub struct RegisterDeviceRequest {
     pub public_key: PublicKey,
     pub server_id: String,
+    /// Post-quantum KEM ciphertext (base64) the client encapsulated to the server's PQ
+    /// public key. The server decapsulates it to recover the shared PSK.
+    #[serde(default)]
+    pub pq_ciphertext: Option<String>,
 }
 
 /// Register a device for a multihop path: the tunnel terminates at `exit_id`, but
@@ -100,6 +108,10 @@ pub struct PeerEntry {
     pub public_key: PublicKey,
     /// CIDRs allowed for / routed to this peer, e.g. `["10.8.0.5/32"]`.
     pub allowed_ips: Vec<String>,
+    /// The device's PQ KEM ciphertext (base64), if it registered with post-quantum. The
+    /// server decapsulates it to derive this peer's preshared key.
+    #[serde(default)]
+    pub pq_ciphertext: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

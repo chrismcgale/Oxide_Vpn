@@ -16,6 +16,10 @@ mtu = 1420
 # use the SAME key. Generate one with `oxide-serverd genkey`. Lower `mtu` (~1380) when
 # enabled, since obfuscation adds overhead.
 # obfuscation_key = "BASE64_32_BYTE_KEY"
+# Post-quantum: this server's ML-KEM private seed (from `oxide-serverd pq-genkey`).
+# Register the matching public key with `add-server --pq-public-key`. The server then
+# derives a per-device quantum-resistant PSK, layered on x25519.
+# pq_private_seed = "BASE64_64_BYTE_SEED"
 
 # Optional: enable full-tunnel internet egress via NAT masquerade.
 # Omit this whole section for a tunnel-only (no internet egress) server.

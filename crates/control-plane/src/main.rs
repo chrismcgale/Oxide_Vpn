@@ -58,6 +58,9 @@ enum Cmd {
         /// Stealth-mode obfuscation key (base64) this server runs. Generate with `genkey`.
         #[arg(long)]
         obfuscation_key: Option<String>,
+        /// Post-quantum public key (base64) this server runs (from `oxide-serverd pq-genkey`).
+        #[arg(long)]
+        pq_public_key: Option<String>,
     },
     /// Create an account from the CLI (handy for testing/seeding).
     NewAccount,
@@ -93,6 +96,7 @@ async fn main() -> Result<()> {
             capacity,
             dns,
             obfuscation_key,
+            pq_public_key,
         } => {
             let cidr: IpNet = cidr.parse().context("invalid --cidr")?;
             let token = add_server(
@@ -107,6 +111,7 @@ async fn main() -> Result<()> {
                     capacity,
                     dns: dns.as_deref(),
                     obfuscation_key: obfuscation_key.as_deref(),
+                    pq_public_key: pq_public_key.as_deref(),
                 },
             )
             .await?;

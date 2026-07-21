@@ -93,6 +93,12 @@ pub struct InterfaceConfig {
     /// `mtu` (e.g. to 1380) when using it.
     #[serde(default)]
     pub obfuscation_key: Option<SecretKey>,
+
+    /// Server-side post-quantum private key, as its base64 64-byte ML-KEM seed. When set,
+    /// the server decapsulates each device's PQ ciphertext to derive that peer's PSK.
+    /// Generate with `oxide-serverd pq-genkey`.
+    #[serde(default)]
+    pub pq_private_seed: Option<String>,
 }
 
 impl InterfaceConfig {

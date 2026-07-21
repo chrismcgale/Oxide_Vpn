@@ -16,6 +16,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
 use tracing::{info, warn};
@@ -179,16 +181,20 @@ async fn connect(
 
     let cc = ControlClient::new(cp_url);
 
-    let reg = if let Some(exit_id) = &sel.exit {
-        // Multihop: tunnel to the exit through an entry relay.
+    // `psk` is the post-quantum preshared key when the chosen server runs PQ.
+    let (reg, psk) = if let Some(exit_id) = &sel.exit {
+        // Multihop: tunnel to the exit through an entry relay. (PQ over multihop is a
+        // follow-up; single-hop PQ is wired first.)
         let entry_id = match &sel.entry {
             Some(e) => e.clone(),
             None => pick_entry(&cc, &account, exit_id).await?,
         };
         info!(entry = %entry_id, exit = %exit_id, "multihop path");
-        cc.register_device_multihop(&account, device_pub, &entry_id, exit_id)
+        let reg = cc
+            .register_device_multihop(&account, device_pub, &entry_id, exit_id)
             .await
-            .context("registering device (multihop)")?
+            .context("registering device (multihop)")?;
+        (reg, None)
     } else {
         // Single-hop.
         let chosen = match &sel.server {
@@ -205,13 +211,29 @@ async fn connect(
                 .context("selecting best server")?,
         };
         info!(server = %chosen.id, endpoint = %chosen.endpoint, active_peers = chosen.active_peers, "selected server");
-        cc.register_device(&account, device_pub, &chosen.id)
+
+        // Post-quantum: if the server runs PQ, encapsulate to its public key and send the
+        // ciphertext with registration. Both ends end up with the same shared secret,
+        // which becomes the WireGuard PSK (hybrid on top of x25519).
+        let (pq_ct, psk) = match &chosen.pq_public_key {
+            Some(pk_b64) => {
+                let pk = B64.decode(pk_b64).context("bad PQ public key")?;
+                let (ct, shared) =
+                    oxide_pq::encapsulate(&pk).context("post-quantum encapsulation failed")?;
+                info!("post-quantum handshake enabled");
+                (Some(B64.encode(ct)), Some(shared))
+            }
+            None => (None, None),
+        };
+        let reg = cc
+            .register_device(&account, device_pub, &chosen.id, pq_ct.as_deref())
             .await
-            .context("registering device")?
+            .context("registering device")?;
+        (reg, psk)
     };
     info!(assigned_ip = %reg.assigned_ip, endpoint = %reg.server.endpoint, "device registered");
 
-    let (iface, peer) = resolve_registration(device_key, &reg, mtu)?;
+    let (iface, peer) = resolve_registration(device_key, &reg, mtu, psk)?;
     run_tunnel(&iface, vec![peer], kill_switch).await
 }
 
@@ -239,6 +261,7 @@ fn resolve_registration(
     device_key: SecretKey,
     reg: &RegisterDeviceResponse,
     mtu: Option<u32>,
+    psk: Option<[u8; 32]>,
 ) -> Result<(InterfaceConfig, PeerParams)> {
     let address: IpNet = reg
         .assigned_ip
@@ -266,10 +289,11 @@ fn resolve_registration(
         mtu,
         dns: reg.dns.as_ref().and_then(|s| s.parse().ok()),
         obfuscation_key,
+        pq_private_seed: None,
     };
     let peer = PeerParams {
         public_key: reg.server.public_key,
-        preshared_key: None,
+        preshared_key: psk,
         endpoint: Some(endpoint),
         allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
         persistent_keepalive: Some(25),
@@ -438,7 +462,9 @@ mod tests {
             obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
         };
 
-        let (iface, peer) = resolve_registration(device, &reg, Some(1400)).unwrap();
+        let (iface, peer) =
+            resolve_registration(device, &reg, Some(1400), Some([9u8; 32])).unwrap();
+        assert_eq!(peer.preshared_key, Some([9u8; 32])); // PQ-derived PSK applied
         assert_eq!(iface.address.to_string(), "10.8.0.5/24");
         assert_eq!(iface.mtu(), 1400);
         // The control-plane-provided stealth key is picked up.

@@ -12,6 +12,8 @@ oxide-common = { path = "../common" }
 oxide-wg-core = { path = "../wg-core" }
 oxide-net-linux = { path = "../net-linux" }
 oxide-control-client = { path = "../control-client" }
+oxide-pq = { path = "../pq" }
+base64 = "0.22"
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

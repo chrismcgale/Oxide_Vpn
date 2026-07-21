@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
 use oxide_relay::Relay;
@@ -43,6 +45,10 @@ enum Cmd {
     Genkey,
     /// Read a private key (base64) on stdin, print its public key, like `wg pubkey`.
     Pubkey,
+    /// Generate a post-quantum (ML-KEM) keypair: prints the private seed and public key.
+    /// Put the seed in the server config (`pq_private_seed`) and register the public key
+    /// with the control plane (`add-server --pq-public-key`).
+    PqGenkey,
 }
 
 #[tokio::main]
@@ -66,6 +72,15 @@ async fn main() -> Result<()> {
                 .parse()
                 .context("invalid private key on stdin")?;
             println!("{}", keys::public_from_secret(&sk).to_base64());
+            Ok(())
+        }
+        Cmd::PqGenkey => {
+            let (seed, public_key) = oxide_pq::generate();
+            println!("pq_private_seed (server config): {}", B64.encode(&seed));
+            println!(
+                "pq_public_key  (add-server):     {}",
+                B64.encode(&public_key)
+            );
             Ok(())
         }
         Cmd::Up { config } => run(config).await,
@@ -130,12 +145,23 @@ async fn run(config_path: PathBuf) -> Result<()> {
         HANDSHAKE_LIMIT,
     );
 
+    // Decode the post-quantum private seed (if any) so we can decapsulate each device's
+    // ciphertext into its PSK during reconcile.
+    let pq_seed: Option<Vec<u8>> = cfg
+        .interface
+        .pq_private_seed
+        .as_ref()
+        .and_then(|s| B64.decode(s).ok());
+    if pq_seed.is_some() {
+        info!("post-quantum enabled (server will derive per-peer PSKs)");
+    }
+
     // If configured, pull the peer list from the control plane and keep it in sync.
     // The engine's peer table is runtime-mutable, so this reconciles live and the
     // data plane keeps peer state in RAM only (no on-disk peer store).
     if let Some(cp) = cfg.control_plane {
         let handle = engine.handle();
-        tokio::spawn(poll_control_plane(handle, cp));
+        tokio::spawn(poll_control_plane(handle, cp, pq_seed));
     }
 
     // Run until Ctrl-C / SIGTERM, then tear down host state (leave-no-trace).
@@ -156,7 +182,11 @@ async fn run(config_path: PathBuf) -> Result<()> {
 /// Periodically fetch this server's peer list from the control plane, reconcile it into
 /// the running engine, and report live load back via a heartbeat. tokio's interval
 /// fires immediately, so peers load at once.
-async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPlaneConfig) {
+async fn poll_control_plane<T: TunQueue>(
+    handle: EngineHandle<T>,
+    cp: ControlPlaneConfig,
+    pq_seed: Option<Vec<u8>>,
+) {
     let client = ControlClient::new(&cp.url);
     let mut tick = tokio::time::interval(Duration::from_secs(cp.poll_interval_secs.max(1)));
     // Relay listen ports we've already started (this server acting as a multihop entry).
@@ -165,7 +195,10 @@ async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPla
         tick.tick().await;
         match client.fetch_peers(&cp.server_id, &cp.token).await {
             Ok(entries) => {
-                let desired: Vec<PeerParams> = entries.iter().filter_map(peer_from_entry).collect();
+                let desired: Vec<PeerParams> = entries
+                    .iter()
+                    .filter_map(|e| peer_from_entry(e, pq_seed.as_deref()))
+                    .collect();
                 info!(peers = desired.len(), "reconciled peers from control plane");
                 handle.reconcile(desired);
             }
@@ -222,8 +255,9 @@ async fn spawn_relay(listen_port: u16, exit_endpoint: String) {
 }
 
 /// Map a control-plane peer entry to engine params (server peers have no endpoint —
-/// it's learned from the handshake).
-fn peer_from_entry(entry: &PeerEntry) -> Option<PeerParams> {
+/// it's learned from the handshake). If the peer registered with post-quantum and we
+/// have the PQ private seed, decapsulate its ciphertext into the peer's PSK.
+fn peer_from_entry(entry: &PeerEntry, pq_seed: Option<&[u8]>) -> Option<PeerParams> {
     let allowed_ips: Vec<IpNet> = entry
         .allowed_ips
         .iter()
@@ -233,9 +267,14 @@ fn peer_from_entry(entry: &PeerEntry) -> Option<PeerParams> {
         warn!(peer = %entry.public_key.to_base64(), "peer has no valid allowed_ips; skipping");
         return None;
     }
+    let preshared_key = entry
+        .pq_ciphertext
+        .as_ref()
+        .zip(pq_seed)
+        .and_then(|(ct_b64, seed)| oxide_pq::decapsulate(seed, &B64.decode(ct_b64).ok()?));
     Some(PeerParams {
         public_key: entry.public_key,
-        preshared_key: None,
+        preshared_key,
         endpoint: None,
         allowed_ips,
         persistent_keepalive: None,

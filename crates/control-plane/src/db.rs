@@ -54,6 +54,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             last_heartbeat INTEGER,
             dns            TEXT,
             obfuscation_key TEXT,
+            pq_public_key  TEXT,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
@@ -62,6 +63,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             public_key     TEXT NOT NULL UNIQUE,
             server_id      TEXT NOT NULL REFERENCES servers(id),
             tunnel_ip      TEXT NOT NULL,
+            pq_ciphertext  TEXT,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS relays (
@@ -88,6 +90,8 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN last_heartbeat INTEGER",
         "ALTER TABLE servers ADD COLUMN dns TEXT",
         "ALTER TABLE servers ADD COLUMN obfuscation_key TEXT",
+        "ALTER TABLE servers ADD COLUMN pq_public_key TEXT",
+        "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
     ] {
         let _ = sqlx::query(stmt).execute(pool).await;
     }

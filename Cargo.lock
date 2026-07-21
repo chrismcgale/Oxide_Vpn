@@ -1334,11 +1334,13 @@ name = "oxide-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "ipnet",
  "oxide-common",
  "oxide-control-client",
  "oxide-net-linux",
+ "oxide-pq",
  "oxide-wg-core",
  "tokio",
  "tracing",
@@ -1434,12 +1436,14 @@ name = "oxide-serverd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "ipnet",
  "oxide-common",
  "oxide-control-client",
  "oxide-control-plane",
  "oxide-net-linux",
+ "oxide-pq",
  "oxide-relay",
  "oxide-wg-core",
  "tokio",

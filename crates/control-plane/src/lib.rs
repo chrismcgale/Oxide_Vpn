@@ -50,7 +50,7 @@ const SERVER_STALE_SECS: i64 = 90;
 
 /// Columns selected when building a [`ServerInfo`].
 const SERVER_COLUMNS: &str =
-    "id, public_key, endpoint, country, city, capacity, active_peers, last_heartbeat";
+    "id, public_key, endpoint, country, city, capacity, active_peers, last_heartbeat, pq_public_key";
 
 /// Max requests per source IP per [`RATE_WINDOW`]. Protects the account-number bearer
 /// auth from brute force and the account-creation endpoint from abuse.
@@ -289,6 +289,7 @@ fn server_info_from_row(row: &SqliteRow) -> ApiResult<ServerInfo> {
         active_peers: row.get::<i64, _>("active_peers") as u32,
         capacity: row.get::<i64, _>("capacity") as u32,
         healthy,
+        pq_public_key: row.get("pq_public_key"),
     })
 }
 
@@ -299,7 +300,14 @@ async fn register_device(
     Json(req): Json<RegisterDeviceRequest>,
 ) -> ApiResult<Json<RegisterDeviceResponse>> {
     let account = auth_account(&state, &headers).await?;
-    let resp = register_core(&state, &account, &req.public_key, &req.server_id).await?;
+    let resp = register_core(
+        &state,
+        &account,
+        &req.public_key,
+        &req.server_id,
+        req.pq_ciphertext.as_deref(),
+    )
+    .await?;
     Ok(Json(resp))
 }
 
@@ -319,7 +327,8 @@ async fn register_device_multihop(
     }
 
     // The tunnel terminates at the exit, so the device is a peer of the exit.
-    let mut resp = register_core(&state, &account, &req.public_key, &req.exit_id).await?;
+    // (Multihop PQ is a follow-up; single-hop PQ distribution is wired first.)
+    let mut resp = register_core(&state, &account, &req.public_key, &req.exit_id, None).await?;
 
     // The entry's public host, on which it relays. Reuse its stored endpoint's host.
     let entry_endpoint: String = sqlx::query_scalar("SELECT endpoint FROM servers WHERE id = ?")
@@ -344,6 +353,7 @@ async fn register_core(
     account: &str,
     public_key: &PublicKey,
     server_id: &str,
+    pq_ciphertext: Option<&str>,
 ) -> ApiResult<RegisterDeviceResponse> {
     let server = sqlx::query(
         "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns, obfuscation_key
@@ -401,13 +411,15 @@ async fn register_core(
         .ok_or_else(|| AppError::Conflict("server subnet exhausted".into()))?;
 
     sqlx::query(
-        "INSERT INTO devices (account_number, public_key, server_id, tunnel_ip, created_at)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO devices
+            (account_number, public_key, server_id, tunnel_ip, pq_ciphertext, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(account)
     .bind(&device_pk)
     .bind(server_id)
     .bind(assigned.to_string())
+    .bind(pq_ciphertext)
     .bind(db::now_unix())
     .execute(&state.pool)
     .await?;
@@ -491,10 +503,11 @@ async fn list_peers(
 ) -> ApiResult<Json<PeerListResponse>> {
     auth_server(&state, &server_id, &headers).await?;
 
-    let rows = sqlx::query("SELECT public_key, tunnel_ip FROM devices WHERE server_id = ?")
-        .bind(&server_id)
-        .fetch_all(&state.pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT public_key, tunnel_ip, pq_ciphertext FROM devices WHERE server_id = ?")
+            .bind(&server_id)
+            .fetch_all(&state.pool)
+            .await?;
     let peers = rows
         .into_iter()
         .map(|row| {
@@ -503,6 +516,7 @@ async fn list_peers(
             PeerEntry {
                 public_key: PublicKey::from_str(&pk).expect("stored key valid"),
                 allowed_ips: vec![format!("{ip}/32")],
+                pq_ciphertext: row.get("pq_ciphertext"),
             }
         })
         .collect();
@@ -599,6 +613,8 @@ pub struct NewServer<'a> {
     pub dns: Option<&'a str>,
     /// Stealth-mode obfuscation key (base64) this server expects; handed to clients.
     pub obfuscation_key: Option<&'a str>,
+    /// Post-quantum public (ML-KEM) key (base64) this server runs; handed to clients.
+    pub pq_public_key: Option<&'a str>,
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.
@@ -612,9 +628,9 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
     let token = random_token();
     sqlx::query(
         "INSERT INTO servers
-            (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token,
-             country, city, capacity, active_peers, last_heartbeat, dns, obfuscation_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)",
+            (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token, country, city,
+             capacity, active_peers, last_heartbeat, dns, obfuscation_key, pq_public_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
     )
     .bind(s.id)
     .bind(s.public_key)
@@ -627,6 +643,7 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
     .bind(s.capacity)
     .bind(s.dns)
     .bind(s.obfuscation_key)
+    .bind(s.pq_public_key)
     .bind(db::now_unix())
     .execute(pool)
     .await?;

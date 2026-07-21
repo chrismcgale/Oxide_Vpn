@@ -68,6 +68,7 @@ async fn control_plane_provisions_a_working_tunnel() {
             capacity: 0,
             dns: None,
             obfuscation_key: None,
+            pq_public_key: None,
         },
     )
     .await
@@ -84,7 +85,7 @@ async fn control_plane_provisions_a_working_tunnel() {
     let client_priv = generate_secret();
     let client_pub = public_from_secret(&client_priv);
     let reg = cc
-        .register_device(&account, client_pub, "s1")
+        .register_device(&account, client_pub, "s1", None)
         .await
         .unwrap();
 
