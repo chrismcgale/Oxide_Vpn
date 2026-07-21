@@ -10,6 +10,7 @@ members = [
     "crates/obfs",
     "crates/pq",
     "crates/client-core",
+    "crates/oxide-agentd",
     "crates/oxide-serverd",
     "crates/oxide-client",
 ]
