@@ -33,6 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
+blake2 = "0.10"
 ipnet = { version = "2", features = ["serde"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["timeout"] }

@@ -1569,6 +1569,7 @@ dependencies = [
 name = "oxide-mimicry"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "rand_core 0.6.4",
 ]
 

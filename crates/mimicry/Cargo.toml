@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 rand_core = { workspace = true }
+blake2 = { workspace = true }
