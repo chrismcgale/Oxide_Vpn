@@ -9,6 +9,7 @@ members = [
     "crates/relay",
     "crates/obfs",
     "crates/pq",
+    "crates/mimicry",
     "crates/client-core",
     "crates/oxide-agentd",
     "crates/oxide-serverd",
