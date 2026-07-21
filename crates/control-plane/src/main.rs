@@ -10,7 +10,7 @@ use ipnet::IpNet;
 use tracing::info;
 
 use oxide_common::account::format_grouped;
-use oxide_control_plane::{add_server, app, db, AppState};
+use oxide_control_plane::{add_server, app, db, AppState, NewServer};
 
 #[derive(Parser)]
 #[command(name = "oxide-control-plane", about = "Oxide VPN control plane")]
@@ -43,6 +43,15 @@ enum Cmd {
         /// Tunnel subnet the server hands out, e.g. 10.8.0.0/24.
         #[arg(long, default_value = "10.8.0.0/24")]
         cidr: String,
+        /// Country code/name for location-based selection.
+        #[arg(long)]
+        country: Option<String>,
+        /// City for location-based selection.
+        #[arg(long)]
+        city: Option<String>,
+        /// Soft capacity (max peers) for load-based selection. 0 = unlimited.
+        #[arg(long, default_value_t = 0)]
+        capacity: u32,
     },
     /// Create an account from the CLI (handy for testing/seeding).
     NewAccount,
@@ -73,9 +82,24 @@ async fn main() -> Result<()> {
             public_key,
             endpoint,
             cidr,
+            country,
+            city,
+            capacity,
         } => {
             let cidr: IpNet = cidr.parse().context("invalid --cidr")?;
-            let token = add_server(&pool, &id, &public_key, &endpoint, cidr).await?;
+            let token = add_server(
+                &pool,
+                NewServer {
+                    id: &id,
+                    public_key: &public_key,
+                    endpoint: &endpoint,
+                    cidr,
+                    country: country.as_deref(),
+                    city: city.as_deref(),
+                    capacity,
+                },
+            )
+            .await?;
             let server_ip = cidr.hosts().next().expect("cidr has hosts");
             println!("Registered server '{id}'.");
             println!("  endpoint:   {endpoint}");

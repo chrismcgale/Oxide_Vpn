@@ -50,9 +50,16 @@ enum Cmd {
         /// Account number (16 digits, spaces ignored).
         #[arg(long)]
         account: String,
-        /// Server id to connect to (defaults to the first available).
+        /// Explicit server id. If omitted, the least-loaded server is auto-selected
+        /// (optionally filtered by --country/--city).
         #[arg(long)]
         server: Option<String>,
+        /// Auto-select only servers in this country.
+        #[arg(long)]
+        country: Option<String>,
+        /// Auto-select only servers in this city.
+        #[arg(long)]
+        city: Option<String>,
         /// Where to cache this device's private key.
         #[arg(long, default_value = "device.key")]
         key_file: PathBuf,
@@ -103,10 +110,27 @@ async fn main() -> Result<()> {
             control_plane,
             account,
             server,
+            country,
+            city,
             key_file,
             mtu,
-        } => connect(&control_plane, &account, server, &key_file, mtu).await,
+        } => {
+            let sel = ServerSelection {
+                server,
+                country,
+                city,
+            };
+            connect(&control_plane, &account, sel, &key_file, mtu).await
+        }
     }
+}
+
+/// How the client chooses a server: an explicit id, or auto (least-loaded) with
+/// optional location filters.
+struct ServerSelection {
+    server: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
 }
 
 async fn run_static(config_path: PathBuf) -> Result<()> {
@@ -119,7 +143,7 @@ async fn run_static(config_path: PathBuf) -> Result<()> {
 async fn connect(
     cp_url: &str,
     account: &str,
-    server: Option<String>,
+    sel: ServerSelection,
     key_file: &Path,
     mtu: Option<u32>,
 ) -> Result<()> {
@@ -128,18 +152,22 @@ async fn connect(
     let device_pub = keys::public_from_secret(&device_key);
 
     let cc = ControlClient::new(cp_url);
-    let servers = cc.list_servers(&account).await.context("listing servers")?;
-    let chosen = match &server {
-        Some(id) => servers
+    let chosen = match &sel.server {
+        // Explicit server id.
+        Some(id) => cc
+            .list_servers(&account)
+            .await
+            .context("listing servers")?
             .into_iter()
             .find(|s| &s.id == id)
             .with_context(|| format!("no such server: {id}"))?,
-        None => servers
-            .into_iter()
-            .next()
-            .context("control plane advertises no servers")?,
+        // Auto-select the least-loaded server, optionally filtered by location.
+        None => cc
+            .best_server(&account, sel.country.as_deref(), sel.city.as_deref())
+            .await
+            .context("selecting best server")?,
     };
-    info!(server = %chosen.id, endpoint = %chosen.endpoint, "selected server");
+    info!(server = %chosen.id, endpoint = %chosen.endpoint, active_peers = chosen.active_peers, "selected server");
 
     let reg = cc
         .register_device(&account, device_pub, &chosen.id)

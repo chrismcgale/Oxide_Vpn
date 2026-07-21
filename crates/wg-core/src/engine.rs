@@ -84,6 +84,18 @@ pub struct Engine<T: TunQueue> {
     shared: Arc<Shared<T>>,
 }
 
+/// A peer is counted as "active" if it completed a handshake within this window.
+/// WireGuard rekeys about every 2 minutes, so 3 minutes catches live sessions
+/// without counting long-idle ones.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(180);
+
+/// A snapshot of engine load, reported to the control plane for server selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineStats {
+    pub total_peers: usize,
+    pub active_peers: usize,
+}
+
 /// A cheap, cloneable handle for mutating a running engine's peer set. The control
 /// plane loop on the server uses this to reconcile peers as devices come and go.
 #[derive(Clone)]
@@ -337,6 +349,23 @@ impl<T: TunQueue> EngineHandle<T> {
             .lock()
             .unwrap()
             .retain(|_, v| *v != id);
+    }
+
+    /// Current load: total peers and how many have a live (recent-handshake) session.
+    pub fn stats(&self) -> EngineStats {
+        let peers = self.shared.table.read().unwrap().snapshot();
+        let total_peers = peers.len();
+        let active_peers = peers
+            .iter()
+            .filter(|(_, p)| {
+                let since = p.tunn.lock().unwrap().stats().0;
+                matches!(since, Some(d) if d < ACTIVE_WINDOW)
+            })
+            .count();
+        EngineStats {
+            total_peers,
+            active_peers,
+        }
     }
 
     /// Reconcile the peer set to exactly `desired`: add newcomers, remove absentees,

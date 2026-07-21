@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
 
 use oxide_common::api::{
-    CreateAccountResponse, PeerEntry, PeerListResponse, RegisterDeviceRequest,
+    CreateAccountResponse, HeartbeatRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
     RegisterDeviceResponse, ServerInfo, ServerListResponse,
 };
 use oxide_common::PublicKey;
@@ -55,6 +55,46 @@ impl ControlClient {
         let resp = check(resp).await?;
         let body: ServerListResponse = resp.json().await?;
         Ok(body.servers)
+    }
+
+    /// Pick the least-loaded healthy server, optionally filtered by country/city.
+    pub async fn best_server(
+        &self,
+        account: &str,
+        country: Option<&str>,
+        city: Option<&str>,
+    ) -> Result<ServerInfo> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(c) = country {
+            query.push(("country", c));
+        }
+        if let Some(c) = city {
+            query.push(("city", c));
+        }
+        let resp = self
+            .http
+            .get(self.url("/v1/servers/best"))
+            .query(&query)
+            .bearer_auth(account)
+            .send()
+            .await
+            .context("GET /v1/servers/best")?;
+        let resp = check(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Report live load to the control plane (server-authenticated heartbeat).
+    pub async fn heartbeat(&self, server_id: &str, token: &str, active_peers: u32) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/internal/servers/{server_id}/heartbeat")))
+            .bearer_auth(token)
+            .json(&HeartbeatRequest { active_peers })
+            .send()
+            .await
+            .context("POST heartbeat")?;
+        check(resp).await?;
+        Ok(())
     }
 
     /// Register this device's public key on `server_id`; returns connection details.

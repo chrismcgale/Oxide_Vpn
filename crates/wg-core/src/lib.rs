@@ -16,7 +16,7 @@ pub mod table;
 #[cfg(feature = "test-util")]
 pub mod testutil;
 
-pub use engine::{Engine, EngineHandle, PeerParams};
+pub use engine::{Engine, EngineHandle, EngineStats, PeerParams};
 pub use table::PeerId;
 
 pub use oxide_common::{PublicKey, SecretKey, TunQueue};

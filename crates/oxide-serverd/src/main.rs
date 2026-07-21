@@ -128,8 +128,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Periodically fetch this server's peer list from the control plane and reconcile it
-/// into the running engine. tokio's interval fires immediately, so peers load at once.
+/// Periodically fetch this server's peer list from the control plane, reconcile it into
+/// the running engine, and report live load back via a heartbeat. tokio's interval
+/// fires immediately, so peers load at once.
 async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPlaneConfig) {
     let client = ControlClient::new(&cp.url);
     let mut tick = tokio::time::interval(Duration::from_secs(cp.poll_interval_secs.max(1)));
@@ -142,6 +143,15 @@ async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPla
                 handle.reconcile(desired);
             }
             Err(e) => warn!(error = %e, "failed to fetch peers from control plane"),
+        }
+
+        // Report live load so the control plane can balance new clients across servers.
+        let stats = handle.stats();
+        if let Err(e) = client
+            .heartbeat(&cp.server_id, &cp.token, stats.active_peers as u32)
+            .await
+        {
+            warn!(error = %e, "heartbeat failed");
         }
     }
 }

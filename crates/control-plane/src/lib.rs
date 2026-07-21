@@ -11,31 +11,41 @@ pub mod db;
 pub mod error;
 pub mod ip_alloc;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header::AUTHORIZATION;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ipnet::IpNet;
 use rand_core::{OsRng, RngCore};
+use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
 use oxide_common::api::{
-    CreateAccountResponse, PeerEntry, PeerListResponse, RegisterDeviceRequest,
+    CreateAccountResponse, HeartbeatRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
     RegisterDeviceResponse, ServerConnection, ServerInfo, ServerListResponse,
 };
 use oxide_common::PublicKey;
 
 use error::{ApiResult, AppError};
+
+/// A server is considered unhealthy if its last heartbeat is older than this. A server
+/// that has *never* heartbeated is treated as healthy (it may not run the heartbeat
+/// loop); once it starts, staleness applies.
+const SERVER_STALE_SECS: i64 = 90;
+
+/// Columns selected when building a [`ServerInfo`].
+const SERVER_COLUMNS: &str =
+    "id, public_key, endpoint, country, city, capacity, active_peers, last_heartbeat";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,10 +68,12 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/accounts", post(create_account))
         .route("/v1/servers", get(list_servers))
+        .route("/v1/servers/best", get(best_server))
         .route("/v1/devices", post(register_device))
+        .route("/v1/internal/servers/:id/peers", get(list_peers))
         .route(
-            "/v1/internal/servers/:id/peers",
-            get(list_peers),
+            "/v1/internal/servers/:id/heartbeat",
+            post(server_heartbeat),
         )
         .with_state(state)
 }
@@ -129,23 +141,80 @@ async fn list_servers(
     headers: HeaderMap,
 ) -> ApiResult<Json<ServerListResponse>> {
     auth_account(&state, &headers).await?;
-
-    let rows = sqlx::query("SELECT id, public_key, endpoint FROM servers ORDER BY id")
-        .fetch_all(&state.pool)
-        .await?;
-    let mut servers = Vec::with_capacity(rows.len());
-    for row in rows {
-        let pk: String = row.get("public_key");
-        let public_key = PublicKey::from_str(&pk)
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored key: {e}")))?;
-        servers.push(ServerInfo {
-            id: row.get("id"),
-            public_key,
-            endpoint: row.get("endpoint"),
-            location: None,
-        });
-    }
+    let servers = load_servers(&state).await?;
     Ok(Json(ServerListResponse { servers }))
+}
+
+// GET /v1/servers/best?country=..&city=..
+// Picks the least-loaded healthy server, optionally filtered by location.
+async fn best_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> ApiResult<Json<ServerInfo>> {
+    auth_account(&state, &headers).await?;
+    let country = params.get("country");
+    let city = params.get("city");
+
+    let candidate = load_servers(&state)
+        .await?
+        .into_iter()
+        .filter(|s| s.healthy)
+        .filter(|s| country.is_none_or(|c| eq_ci(&s.country, c)))
+        .filter(|s| city.is_none_or(|c| eq_ci(&s.city, c)))
+        .min_by(|a, b| {
+            load_factor(a)
+                .partial_cmp(&load_factor(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.active_peers.cmp(&b.active_peers))
+        });
+
+    candidate
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound("no server matches the requested criteria".into()))
+}
+
+/// Fraction of capacity in use (lower is better). Uncapped servers compare by raw
+/// active-peer count.
+fn load_factor(s: &ServerInfo) -> f64 {
+    if s.capacity > 0 {
+        s.active_peers as f64 / s.capacity as f64
+    } else {
+        s.active_peers as f64
+    }
+}
+
+fn eq_ci(field: &Option<String>, want: &str) -> bool {
+    field
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case(want))
+}
+
+async fn load_servers(state: &AppState) -> ApiResult<Vec<ServerInfo>> {
+    let sql = format!("SELECT {SERVER_COLUMNS} FROM servers ORDER BY id");
+    let rows = sqlx::query(&sql).fetch_all(&state.pool).await?;
+    rows.iter().map(server_info_from_row).collect()
+}
+
+fn server_info_from_row(row: &SqliteRow) -> ApiResult<ServerInfo> {
+    let pk: String = row.get("public_key");
+    let public_key = PublicKey::from_str(&pk)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored key: {e}")))?;
+    let last_hb: Option<i64> = row.get("last_heartbeat");
+    let healthy = match last_hb {
+        None => true,
+        Some(t) => db::now_unix() - t <= SERVER_STALE_SECS,
+    };
+    Ok(ServerInfo {
+        id: row.get("id"),
+        public_key,
+        endpoint: row.get("endpoint"),
+        country: row.get("country"),
+        city: row.get("city"),
+        active_peers: row.get::<i64, _>("active_peers") as u32,
+        capacity: row.get::<i64, _>("capacity") as u32,
+        healthy,
+    })
 }
 
 // POST /v1/devices
@@ -225,22 +294,27 @@ async fn register_device(
     )?))
 }
 
+/// Require the correct server auth token for `server_id`.
+async fn auth_server(state: &AppState, server_id: &str, headers: &HeaderMap) -> ApiResult<()> {
+    let token = bearer(headers).ok_or(AppError::Unauthorized)?;
+    let expected: Option<String> =
+        sqlx::query_scalar("SELECT auth_token FROM servers WHERE id = ?")
+            .bind(server_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    match expected {
+        Some(t) if t == token => Ok(()),
+        _ => Err(AppError::Unauthorized),
+    }
+}
+
 // GET /v1/internal/servers/:id/peers  (server-authenticated)
 async fn list_peers(
     State(state): State<AppState>,
     Path(server_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<PeerListResponse>> {
-    let token = bearer(&headers).ok_or(AppError::Unauthorized)?;
-    let expected: Option<String> =
-        sqlx::query_scalar("SELECT auth_token FROM servers WHERE id = ?")
-            .bind(&server_id)
-            .fetch_optional(&state.pool)
-            .await?;
-    match expected {
-        Some(t) if t == token => {}
-        _ => return Err(AppError::Unauthorized),
-    }
+    auth_server(&state, &server_id, &headers).await?;
 
     let rows = sqlx::query("SELECT public_key, tunnel_ip FROM devices WHERE server_id = ?")
         .bind(&server_id)
@@ -258,6 +332,23 @@ async fn list_peers(
         })
         .collect();
     Ok(Json(PeerListResponse { peers }))
+}
+
+// POST /v1/internal/servers/:id/heartbeat  (server-authenticated)
+async fn server_heartbeat(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+    headers: HeaderMap,
+    Json(hb): Json<HeartbeatRequest>,
+) -> ApiResult<StatusCode> {
+    auth_server(&state, &server_id, &headers).await?;
+    sqlx::query("UPDATE servers SET active_peers = ?, last_heartbeat = ? WHERE id = ?")
+        .bind(hb.active_peers as i64)
+        .bind(db::now_unix())
+        .bind(&server_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn used_ips(pool: &SqlitePool, server_id: &str) -> ApiResult<HashSet<IpAddr>> {
@@ -291,30 +382,41 @@ fn response_for(
     })
 }
 
+/// Server metadata for registration.
+pub struct NewServer<'a> {
+    pub id: &'a str,
+    pub public_key: &'a str,
+    pub endpoint: &'a str,
+    pub cidr: IpNet,
+    pub country: Option<&'a str>,
+    pub city: Option<&'a str>,
+    pub capacity: u32,
+}
+
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.
-pub async fn add_server(
-    pool: &SqlitePool,
-    id: &str,
-    public_key: &str,
-    endpoint: &str,
-    cidr: IpNet,
-) -> anyhow::Result<String> {
+pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<String> {
     // The server takes the first usable host of its subnet as its own tunnel IP.
-    let server_ip = cidr
+    let server_ip = s
+        .cidr
         .hosts()
         .next()
         .ok_or_else(|| anyhow::anyhow!("cidr has no usable hosts"))?;
     let token = random_token();
     sqlx::query(
-        "INSERT INTO servers (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO servers
+            (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token,
+             country, city, capacity, active_peers, last_heartbeat, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
     )
-    .bind(id)
-    .bind(public_key)
-    .bind(endpoint)
-    .bind(cidr.to_string())
+    .bind(s.id)
+    .bind(s.public_key)
+    .bind(s.endpoint)
+    .bind(s.cidr.to_string())
     .bind(server_ip.to_string())
     .bind(&token)
+    .bind(s.country)
+    .bind(s.city)
+    .bind(s.capacity)
     .bind(db::now_unix())
     .execute(pool)
     .await?;

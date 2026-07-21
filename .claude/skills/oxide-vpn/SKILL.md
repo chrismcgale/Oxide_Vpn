@@ -27,13 +27,16 @@ echo "<privkey>" | cargo run -p oxide-serverd -- pubkey
 sudo target/debug/oxide-serverd up --config server.toml
 sudo target/debug/oxide-client  up --config client.toml
 
-# Control plane (M2 — no root; plain web service + SQLite):
+# Control plane (M2/M3 — no root; plain web service + SQLite):
 target/debug/oxide-control-plane --db oxide.db add-server \
-    --id us-1 --public-key <server-pubkey> --endpoint 1.2.3.4:51820 --cidr 10.8.0.0/24
+    --id us-1 --public-key <server-pubkey> --endpoint 1.2.3.4:51820 --cidr 10.8.0.0/24 \
+    --country US --city "New York" --capacity 500      # M3: location + capacity
 target/debug/oxide-control-plane --db oxide.db serve --listen 127.0.0.1:8080
 # Client via control plane (register device, get assigned IP, connect):
 target/debug/oxide-client account --control-plane http://cp:8080          # new account number
-sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <number> --server us-1
+# Explicit server, or auto-select the least-loaded (optionally by location):
+sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --server us-1
+sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --country US
 ```
 
 Config templates: `configs/server.toml.example`, `configs/client.toml.example`.
@@ -47,7 +50,7 @@ in-process control plane):
 ```bash
 cargo test --workspace                                  # everything (19 tests)
 cargo test -p oxide-wg-core --test tunnel               # real handshake over loopback
-cargo test -p oxide-control-plane --test api            # account/device/IP/peer API
+cargo test -p oxide-control-plane --test api            # account/device/IP/peer API + server selection
 cargo test -p oxide-serverd --test control_plane_flow   # CP -> reconcile -> tunnel (capstone)
 ```
 
@@ -79,7 +82,7 @@ Cargo workspace, `crates/`:
 - **`common`** — key newtypes (zeroizing, base64, `wg`-compatible), TOML config, error, the `TunQueue` trait, anonymous account numbers, and the control-plane API DTOs. No tokio/OS deps.
 - **`wg-core`** — the engine: wraps boringtun `Tunn`; three tokio tasks (outbound TUN→UDP, inbound UDP→TUN, 250ms timers) sharing `Arc<Shared>`; allowed-IPs router; **runtime-mutable peer table** (`EngineHandle::{add_peer,remove_peer,reconcile}`). OS-agnostic (talks to TUN via `TunQueue`). `test-util` feature exposes a mock TUN.
 - **`net-linux`** — privileged Linux bits: TUN `ioctl` + `AsyncFd`; `ip`/`nft`/`sysctl` wrappers. (Shell-outs now; netlink/nftables libs are M5.)
-- **`control-plane`** — axum + sqlx(SQLite) service: accounts (anonymous numbers), devices (pubkey + assigned tunnel IP), servers, IP allocation. Never depends on `wg-core`. `add_server` CLI + `serve`.
+- **`control-plane`** — axum + sqlx(SQLite) service: accounts (anonymous numbers), devices (pubkey + assigned tunnel IP), servers (with location + capacity), IP allocation, **load-based server selection** (`GET /v1/servers/best`) fed by **server heartbeats**. Never depends on `wg-core`. `add_server` CLI + `serve`.
 - **`control-client`** — thin reqwest client for the control-plane API, shared by both daemons.
 - **`oxide-serverd` / `oxide-client`** — thin daemons: config → engine → net-linux; Ctrl-C tears down host state. Server optionally polls the control plane and reconciles peers live; client can `connect` via the control plane (register device → assigned IP → tunnel).
 
@@ -96,6 +99,10 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 - **No-logs posture:** the data plane keeps nothing on disk; never `tracing`-log secret key material (the `SecretKey` type refuses to print its bytes). Any persistence belongs in the control plane (M2+), never here.
 
 ## Changelog / Decisions (newest first)
+
+- **2026-07-21 — M3 multi-server selection built.** Servers carry location (country/city) and a soft `capacity`; they heartbeat live load (`active_peers`, derived from boringtun handshake recency via `EngineHandle::stats`) to the control plane. New `GET /v1/servers/best?country=&city=` picks the least-loaded healthy server (load factor = active/capacity); `oxide-client connect` auto-selects when `--server` is omitted (with `--country`/`--city` filters). `oxide-serverd`'s poll loop now also heartbeats. Verified without root (selection test + HTTP smoke test showing the pick flip as load shifts). 20 tests, clippy clean.
+  - Decision: **load = live heartbeated active-peer count**, not registered device count — registrations aren't connections. A server that has never heartbeated is treated as healthy (may not run the loop); staleness (>90s) applies once it starts.
+  - Note: `wg-core` stayed API-additive (just `stats()`), as the roadmap intended.
 
 - **2026-07-21 — M2 control plane v0 built.** New crates `control-plane` (axum + sqlx/SQLite) and `control-client`. Anonymous account numbers (Mullvad-style, no PII), device registration with per-server tunnel-IP allocation, and a token-authed peer-list endpoint. `wg-core` peer table is now runtime-mutable (`EngineHandle::reconcile`); `oxide-serverd` polls the control plane and reconciles live; `oxide-client connect` registers a device and connects. Verified end-to-end without root: control-plane API test, runtime-reconcile test, and a capstone `control_plane_flow` test that drives a real tunnel from a control-plane-provisioned device. 19 tests, clippy clean.
   - Decision: **anonymous account numbers** — the number is the whole credential; no email/PII, minimal stored identity (on-brand for the Mullvad privacy goal).

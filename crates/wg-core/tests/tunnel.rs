@@ -196,4 +196,9 @@ async fn peer_added_at_runtime_comes_up() {
         .expect("server tun channel closed");
 
     assert_eq!(received, packet);
+
+    // The server should now report one live peer (used for load-based selection).
+    let stats = server_handle.stats();
+    assert_eq!(stats.total_peers, 1);
+    assert_eq!(stats.active_peers, 1);
 }

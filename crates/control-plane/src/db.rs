@@ -41,13 +41,18 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS servers (
-            id          TEXT PRIMARY KEY,
-            public_key  TEXT NOT NULL,
-            endpoint    TEXT NOT NULL,
-            tunnel_cidr TEXT NOT NULL,
-            tunnel_ip   TEXT NOT NULL,
-            auth_token  TEXT NOT NULL,
-            created_at  INTEGER NOT NULL
+            id             TEXT PRIMARY KEY,
+            public_key     TEXT NOT NULL,
+            endpoint       TEXT NOT NULL,
+            tunnel_cidr    TEXT NOT NULL,
+            tunnel_ip      TEXT NOT NULL,
+            auth_token     TEXT NOT NULL,
+            country        TEXT,
+            city           TEXT,
+            capacity       INTEGER NOT NULL DEFAULT 0,
+            active_peers   INTEGER NOT NULL DEFAULT 0,
+            last_heartbeat INTEGER,
+            created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +67,19 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await
     .context("initializing schema")?;
+
+    // Idempotent migrations for databases created before the M3 server columns.
+    // SQLite has no "ADD COLUMN IF NOT EXISTS", so we run each and ignore the
+    // "duplicate column" error.
+    for stmt in [
+        "ALTER TABLE servers ADD COLUMN country TEXT",
+        "ALTER TABLE servers ADD COLUMN city TEXT",
+        "ALTER TABLE servers ADD COLUMN capacity INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN active_peers INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN last_heartbeat INTEGER",
+    ] {
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
     Ok(())
 }
 

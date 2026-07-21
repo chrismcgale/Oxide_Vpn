@@ -17,7 +17,7 @@ use ipnet::IpNet;
 use oxide_common::api::PeerEntry;
 use oxide_common::keys::{generate_secret, public_from_secret};
 use oxide_control_client::ControlClient;
-use oxide_control_plane::{add_server, db, serve, AppState};
+use oxide_control_plane::{add_server, db, serve, AppState, NewServer};
 use oxide_wg_core::testutil::{ipv4_packet, MockTun};
 use oxide_wg_core::{Engine, PeerParams};
 
@@ -50,10 +50,15 @@ async fn control_plane_provisions_a_working_tunnel() {
     let server_pub = public_from_secret(&server_priv);
     let token = add_server(
         &pool,
-        "s1",
-        &server_pub.to_base64(),
-        "127.0.0.1:51820", // endpoint value is irrelevant in this loopback test
-        "10.8.0.0/24".parse().unwrap(),
+        NewServer {
+            id: "s1",
+            public_key: &server_pub.to_base64(),
+            endpoint: "127.0.0.1:51820", // endpoint value is irrelevant in this loopback test
+            cidr: "10.8.0.0/24".parse().unwrap(),
+            country: None,
+            city: None,
+            capacity: 0,
+        },
     )
     .await
     .unwrap();

@@ -16,12 +16,15 @@ tunnel, and (optionally) provide full-tunnel internet egress via NAT.
 
 **Milestone 2 complete:** the control plane. Anonymous account numbers (Mullvad-style,
 no email/PII), a device-registration API that allocates tunnel IPs, and a server that
-pulls its peer list from the control plane and reconciles it into the live engine. The
-client can register a device and connect with one command.
+pulls its peer list from the control plane and reconciles it into the live engine.
 
-Roadmap (M3–M6): multi-server selection/load-balancing, privacy features (kill switch,
-DNS leak protection, no-logs/RAM-only, multihop), desktop clients, and fleet ops
-(Postgres, provisioning, DoS hardening).
+**Milestone 3 complete:** multi-server selection and load balancing. Servers advertise
+location and capacity and heartbeat their live load; the control plane picks the
+least-loaded healthy server (optionally filtered by country/city), and the client can
+auto-select instead of naming a server.
+
+Roadmap (M4–M6): privacy features (kill switch, DNS leak protection, no-logs/RAM-only,
+multihop), desktop clients, and fleet ops (Postgres, provisioning, DoS hardening).
 
 ## Quick start
 

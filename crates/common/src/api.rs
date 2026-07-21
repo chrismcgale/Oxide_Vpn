@@ -14,16 +14,36 @@ pub struct CreateAccountResponse {
     pub account_number: String,
 }
 
-/// A VPN server as advertised to clients.
+/// A VPN server as advertised to clients, with location and live load for selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub id: String,
     pub public_key: PublicKey,
     /// Public UDP endpoint, `host:port`.
     pub endpoint: String,
-    /// Optional human location label (country/city) — populated from M3 on.
     #[serde(default)]
-    pub location: Option<String>,
+    pub country: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    /// Peers with a live session, as last reported by the server's heartbeat.
+    #[serde(default)]
+    pub active_peers: u32,
+    /// Soft capacity (max peers) used to compute a load factor. 0 = unset/unlimited.
+    #[serde(default)]
+    pub capacity: u32,
+    /// Whether the server has heartbeated recently enough to be considered up.
+    #[serde(default = "default_true")]
+    pub healthy: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Server-reported live load (server-authenticated heartbeat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    pub active_peers: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
