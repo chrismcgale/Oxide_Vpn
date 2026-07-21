@@ -95,8 +95,7 @@ enum Cmd {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -108,7 +107,10 @@ async fn main() -> Result<()> {
         Cmd::Pubkey => {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
-            let sk: SecretKey = line.trim().parse().context("invalid private key on stdin")?;
+            let sk: SecretKey = line
+                .trim()
+                .parse()
+                .context("invalid private key on stdin")?;
             println!("{}", keys::public_from_secret(&sk).to_base64());
             Ok(())
         }
@@ -157,8 +159,8 @@ struct ServerSelection {
 }
 
 async fn run_static(config_path: PathBuf, kill_switch: bool) -> Result<()> {
-    let cfg = Config::load(&config_path)
-        .with_context(|| format!("loading {}", config_path.display()))?;
+    let cfg =
+        Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
     run_tunnel(&cfg.interface, peers, kill_switch).await
 }

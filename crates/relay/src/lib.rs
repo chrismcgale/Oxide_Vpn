@@ -172,7 +172,10 @@ mod tests {
         tokio::spawn(relay.run());
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client.send_to(b"ping-through-relay", relay_addr).await.unwrap();
+        client
+            .send_to(b"ping-through-relay", relay_addr)
+            .await
+            .unwrap();
 
         let mut b = [0u8; BUF];
         let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut b))

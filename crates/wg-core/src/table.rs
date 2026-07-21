@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::Tunn;
 use boringtun::x25519::{PublicKey as XPublicKey, StaticSecret};
 
@@ -27,6 +28,10 @@ pub struct PeerTable {
     next_index: u32,
     peers: HashMap<PeerId, Arc<Peer>>,
     router: AllowedIps<PeerId>,
+    /// Shared handshake rate limiter (server-side DoS defense). When set, it's handed to
+    /// every peer's `Tunn`, which consults it during `decapsulate`; the engine ticks its
+    /// `reset_count` once a second. `None` on clients.
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl PeerTable {
@@ -36,7 +41,22 @@ impl PeerTable {
             next_index: 0,
             peers: HashMap::new(),
             router: AllowedIps::new(),
+            rate_limiter: None,
         }
+    }
+
+    /// A peer table with a shared handshake rate limiter (server-side). `limit` is the
+    /// number of handshake messages per second tolerated before cookie challenges kick in.
+    pub fn new_rate_limited(static_private: StaticSecret, limit: u64) -> Self {
+        let public = XPublicKey::from(&static_private);
+        let mut table = Self::new(static_private);
+        table.rate_limiter = Some(Arc::new(RateLimiter::new(&public, limit)));
+        table
+    }
+
+    /// The shared rate limiter, if any (the engine ticks its `reset_count`).
+    pub fn rate_limiter(&self) -> Option<Arc<RateLimiter>> {
+        self.rate_limiter.clone()
     }
 
     /// Add a peer. No-op if one with the same public key already exists (so a
@@ -53,7 +73,7 @@ impl PeerTable {
             p.preshared_key,
             p.persistent_keepalive,
             self.next_index,
-            None,
+            self.rate_limiter.clone(),
         );
         self.next_index = self.next_index.wrapping_add(1);
         for net in &p.allowed_ips {

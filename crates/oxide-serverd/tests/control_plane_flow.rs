@@ -26,7 +26,11 @@ fn temp_db_path() -> String {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
     std::env::temp_dir()
-        .join(format!("oxide-serverd-test-{}-{}.db", std::process::id(), n))
+        .join(format!(
+            "oxide-serverd-test-{}-{}.db",
+            std::process::id(),
+            n
+        ))
         .to_string_lossy()
         .into_owned()
 }
@@ -37,7 +41,11 @@ fn peer_from_entry(e: &PeerEntry) -> PeerParams {
         public_key: e.public_key,
         preshared_key: None,
         endpoint: None,
-        allowed_ips: e.allowed_ips.iter().filter_map(|s| s.parse().ok()).collect(),
+        allowed_ips: e
+            .allowed_ips
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect(),
         persistent_keepalive: None,
     }
 }
@@ -74,7 +82,10 @@ async fn control_plane_provisions_a_working_tunnel() {
     let account = cc.create_account().await.unwrap();
     let client_priv = generate_secret();
     let client_pub = public_from_secret(&client_priv);
-    let reg = cc.register_device(&account, client_pub, "s1").await.unwrap();
+    let reg = cc
+        .register_device(&account, client_pub, "s1")
+        .await
+        .unwrap();
 
     let assigned: IpNet = reg.assigned_ip.parse().unwrap();
     let IpAddr::V4(assigned_v4) = assigned.addr() else {

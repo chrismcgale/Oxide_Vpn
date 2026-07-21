@@ -136,7 +136,10 @@ async fn tunnel_carries_a_packet_end_to_end() {
         .expect("timed out waiting for packet across tunnel")
         .expect("server tun channel closed");
 
-    assert_eq!(received, packet, "packet must traverse the tunnel unchanged");
+    assert_eq!(
+        received, packet,
+        "packet must traverse the tunnel unchanged"
+    );
 }
 
 #[tokio::test]
@@ -153,8 +156,10 @@ async fn peer_added_at_runtime_comes_up() {
     let server_addr = server_udp.local_addr().unwrap();
     let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
+    // Use the rate-limited server constructor so the DoS RateLimiter path is exercised;
+    // a normal handshake must still complete under it.
     let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
-    let server = Engine::build(&server_priv, vec![], server_udp, server_tun);
+    let server = Engine::build_server(&server_priv, vec![], server_udp, server_tun, 100);
     let server_handle = server.handle();
 
     let (client_tun, client_inject, _cli_capture) = MockTun::pair();

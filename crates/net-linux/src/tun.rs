@@ -108,8 +108,7 @@ impl TunQueue for TunDevice {
             match guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
                 // SAFETY: fd is valid; buf is a valid readable slice.
-                let n =
-                    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+                let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {

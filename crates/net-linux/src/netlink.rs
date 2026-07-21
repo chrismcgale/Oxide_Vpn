@@ -18,7 +18,10 @@ pub fn set_up(ifname: &str) -> io::Result<()> {
 /// Set the interface MTU. WireGuard's default of 1420 avoids fragmentation under a
 /// 1500-byte path (this is the #1 "ping works, curl hangs" fix).
 pub fn set_mtu(ifname: &str, mtu: u32) -> io::Result<()> {
-    run("ip", &["link", "set", "dev", ifname, "mtu", &mtu.to_string()])
+    run(
+        "ip",
+        &["link", "set", "dev", ifname, "mtu", &mtu.to_string()],
+    )
 }
 
 /// Assign a tunnel address (with prefix) to the interface.
@@ -77,8 +80,14 @@ pub fn default_route() -> io::Result<Option<(IpAddr, String)>> {
     // Example: "default via 192.168.1.1 dev eth0 proto dhcp metric 100"
     for line in text.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
-        let via = toks.iter().position(|t| *t == "via").and_then(|i| toks.get(i + 1));
-        let dev = toks.iter().position(|t| *t == "dev").and_then(|i| toks.get(i + 1));
+        let via = toks
+            .iter()
+            .position(|t| *t == "via")
+            .and_then(|i| toks.get(i + 1));
+        let dev = toks
+            .iter()
+            .position(|t| *t == "dev")
+            .and_then(|i| toks.get(i + 1));
         if let (Some(gw), Some(dev)) = (via, dev) {
             if let Ok(ip) = gw.parse::<IpAddr>() {
                 return Ok(Some((ip, dev.to_string())));

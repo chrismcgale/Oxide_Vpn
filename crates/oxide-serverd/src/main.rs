@@ -49,8 +49,7 @@ enum Cmd {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -62,7 +61,10 @@ async fn main() -> Result<()> {
         Cmd::Pubkey => {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
-            let sk: SecretKey = line.trim().parse().context("invalid private key on stdin")?;
+            let sk: SecretKey = line
+                .trim()
+                .parse()
+                .context("invalid private key on stdin")?;
             println!("{}", keys::public_from_secret(&sk).to_base64());
             Ok(())
         }
@@ -71,8 +73,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
-    let cfg = Config::load(&config_path)
-        .with_context(|| format!("loading {}", config_path.display()))?;
+    let cfg =
+        Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let listen_port = cfg
         .interface
         .listen_port
@@ -104,8 +106,11 @@ async fn run(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("binding UDP :{listen_port}"))?;
     info!(port = listen_port, peers = cfg.peers.len(), "listening");
 
+    // Server-side handshake rate limit (DoS defense): cookie challenges engage above
+    // this many handshake messages/second across all peers.
+    const HANDSHAKE_LIMIT: u64 = 100;
     let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
-    let engine = Engine::build(&cfg.interface.private_key, peers, udp, tun);
+    let engine = Engine::build_server(&cfg.interface.private_key, peers, udp, tun, HANDSHAKE_LIMIT);
 
     // If configured, pull the peer list from the control plane and keep it in sync.
     // The engine's peer table is runtime-mutable, so this reconciles live and the
@@ -174,7 +179,11 @@ async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPla
 
 /// Bind and spawn a relay forwarding `listen_port` to `exit_endpoint` (host:port).
 async fn spawn_relay(listen_port: u16, exit_endpoint: String) {
-    let exit = match tokio::net::lookup_host(&exit_endpoint).await.ok().and_then(|mut a| a.next()) {
+    let exit = match tokio::net::lookup_host(&exit_endpoint)
+        .await
+        .ok()
+        .and_then(|mut a| a.next())
+    {
         Some(addr) => addr,
         None => {
             warn!(exit = %exit_endpoint, "relay: cannot resolve exit endpoint");

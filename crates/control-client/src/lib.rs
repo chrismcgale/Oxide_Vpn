@@ -148,7 +148,11 @@ impl ControlClient {
     }
 
     /// Server-facing: fetch the relay routes this (entry) server should run.
-    pub async fn fetch_relays(&self, server_id: &str, server_token: &str) -> Result<Vec<RelayEntry>> {
+    pub async fn fetch_relays(
+        &self,
+        server_id: &str,
+        server_token: &str,
+    ) -> Result<Vec<RelayEntry>> {
         let resp = self
             .http
             .get(self.url(&format!("/v1/internal/servers/{server_id}/relays")))

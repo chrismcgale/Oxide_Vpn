@@ -10,7 +10,7 @@ use ipnet::IpNet;
 use tracing::info;
 
 use oxide_common::account::format_grouped;
-use oxide_control_plane::{add_server, app, db, AppState, NewServer};
+use oxide_control_plane::{add_server, db, serve, AppState, NewServer};
 
 #[derive(Parser)]
 #[command(name = "oxide-control-plane", about = "Oxide VPN control plane")]
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("binding {listen}"))?;
             info!(%listen, db = %cli.db, "control plane listening");
-            axum::serve(listener, app(state)).await?;
+            serve(listener, state).await?;
         }
         Cmd::AddServer {
             id,

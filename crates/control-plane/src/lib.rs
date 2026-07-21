@@ -12,13 +12,16 @@ pub mod error;
 pub mod ip_alloc;
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -28,12 +31,13 @@ use rand_core::{OsRng, RngCore};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
+use tower_http::timeout::TimeoutLayer;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
 use oxide_common::api::{
-    CreateAccountResponse, HeartbeatRequest, MultihopRegisterRequest, PeerEntry, PeerListResponse,
-    RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerConnection,
-    ServerInfo, ServerListResponse,
+    ApiError, CreateAccountResponse, HeartbeatRequest, MultihopRegisterRequest, PeerEntry,
+    PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse,
+    ServerConnection, ServerInfo, ServerListResponse,
 };
 use oxide_common::PublicKey;
 
@@ -48,11 +52,27 @@ const SERVER_STALE_SECS: i64 = 90;
 const SERVER_COLUMNS: &str =
     "id, public_key, endpoint, country, city, capacity, active_peers, last_heartbeat";
 
+/// Max requests per source IP per [`RATE_WINDOW`]. Protects the account-number bearer
+/// auth from brute force and the account-creation endpoint from abuse.
+const RATE_MAX: u32 = 60;
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Reject request bodies larger than this (JSON API — nothing is big).
+const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Drop requests that take longer than this.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct RateWindow {
+    start: Instant,
+    count: u32,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     /// Serializes device registration so IP allocation can't race under SQLite.
     reg_lock: Arc<Mutex<()>>,
+    /// Fixed-window per-IP request counters.
+    rate: Arc<StdMutex<HashMap<IpAddr, RateWindow>>>,
 }
 
 impl AppState {
@@ -60,8 +80,48 @@ impl AppState {
         AppState {
             pool,
             reg_lock: Arc::new(Mutex::new(())),
+            rate: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
+
+    /// Fixed-window rate check: true if this IP is under the limit (and counts it).
+    fn allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut map = self.rate.lock().unwrap();
+        let w = map.entry(ip).or_insert(RateWindow {
+            start: now,
+            count: 0,
+        });
+        if now.duration_since(w.start) > RATE_WINDOW {
+            *w = RateWindow {
+                start: now,
+                count: 0,
+            };
+        }
+        if w.count >= RATE_MAX {
+            false
+        } else {
+            w.count += 1;
+            true
+        }
+    }
+}
+
+/// Per-IP rate-limiting middleware. Skips limiting when no peer address is available
+/// (e.g. tests that mount the router without connect info).
+async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(ci) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        if !state.allow(ci.0.ip()) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiError {
+                    error: "rate limit exceeded".into(),
+                }),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Build the API router.
@@ -74,17 +134,26 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/devices/multihop", post(register_device_multihop))
         .route("/v1/internal/servers/:id/peers", get(list_peers))
         .route("/v1/internal/servers/:id/relays", get(list_relays))
-        .route(
-            "/v1/internal/servers/:id/heartbeat",
-            post(server_heartbeat),
-        )
+        .route("/v1/internal/servers/:id/heartbeat", post(server_heartbeat))
+        // Outer-to-inner: rate limit, then body-size cap, then request timeout.
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
         .with_state(state)
 }
 
-/// Serve the API on an already-bound listener until the process exits. Convenience
-/// so callers (and tests) don't need to depend on `axum` directly.
+/// Serve the API on an already-bound listener until the process exits. Uses connect
+/// info so the per-IP rate limiter can see the client address. Convenience so callers
+/// (and tests) don't need to depend on `axum` directly.
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
-    axum::serve(listener, app(state)).await
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 /// A random opaque token (server auth). base64 of 24 random bytes.
@@ -109,11 +178,10 @@ async fn auth_account(state: &AppState, headers: &HeaderMap) -> ApiResult<String
     if !is_valid_account_number(&token) {
         return Err(AppError::Unauthorized);
     }
-    let exists: Option<String> =
-        sqlx::query_scalar("SELECT number FROM accounts WHERE number = ?")
-            .bind(&token)
-            .fetch_optional(&state.pool)
-            .await?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT number FROM accounts WHERE number = ?")
+        .bind(&token)
+        .fetch_optional(&state.pool)
+        .await?;
     exists.ok_or(AppError::Unauthorized)
 }
 
@@ -128,7 +196,11 @@ async fn create_account(State(state): State<AppState>) -> ApiResult<Json<CreateA
             .execute(&state.pool)
             .await;
         match res {
-            Ok(_) => return Ok(Json(CreateAccountResponse { account_number: number })),
+            Ok(_) => {
+                return Ok(Json(CreateAccountResponse {
+                    account_number: number,
+                }))
+            }
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
             Err(e) => return Err(e.into()),
         }
@@ -250,12 +322,11 @@ async fn register_device_multihop(
     let mut resp = register_core(&state, &account, &req.public_key, &req.exit_id).await?;
 
     // The entry's public host, on which it relays. Reuse its stored endpoint's host.
-    let entry_endpoint: String =
-        sqlx::query_scalar("SELECT endpoint FROM servers WHERE id = ?")
-            .bind(&req.entry_id)
-            .fetch_optional(&state.pool)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("no such server: {}", req.entry_id)))?;
+    let entry_endpoint: String = sqlx::query_scalar("SELECT endpoint FROM servers WHERE id = ?")
+        .bind(&req.entry_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no such server: {}", req.entry_id)))?;
     let entry_host = host_of(&entry_endpoint);
 
     // Ensure a relay route entry->exit and learn its listen port.
@@ -308,7 +379,14 @@ async fn register_core(
             return Err(AppError::Conflict("device key already registered".into()));
         }
         let ip: String = existing.get("tunnel_ip");
-        return response_for(ip, cidr, server_pk, server_endpoint, server_tunnel_ip, server_dns);
+        return response_for(
+            ip,
+            cidr,
+            server_pk,
+            server_endpoint,
+            server_tunnel_ip,
+            server_dns,
+        );
     }
 
     // Allocate the lowest free host in the subnet.

@@ -57,6 +57,10 @@ pub struct PeerParams {
     pub persistent_keepalive: Option<u16>,
 }
 
+fn private_static(key: &SecretKey) -> StaticSecret {
+    StaticSecret::from(*key.as_bytes())
+}
+
 impl PeerParams {
     /// Build engine peer parameters from a parsed config peer.
     pub fn from_config(p: &oxide_common::PeerConfig) -> Self {
@@ -104,10 +108,25 @@ pub struct EngineHandle<T: TunQueue> {
 }
 
 impl<T: TunQueue> Engine<T> {
-    /// Build an engine from key material and an initial peer set.
+    /// Build an engine from key material and an initial peer set (no DoS rate limiting).
     pub fn build(private_key: &SecretKey, peers: Vec<PeerParams>, udp: UdpSocket, tun: T) -> Self {
-        let static_private = StaticSecret::from(*private_key.as_bytes());
-        let mut table = PeerTable::new(static_private);
+        Self::from_table(PeerTable::new(private_static(private_key)), peers, udp, tun)
+    }
+
+    /// Build a server engine with a shared handshake rate limiter (DoS defense). `limit`
+    /// is handshake messages/second before cookie challenges engage.
+    pub fn build_server(
+        private_key: &SecretKey,
+        peers: Vec<PeerParams>,
+        udp: UdpSocket,
+        tun: T,
+        handshake_limit: u64,
+    ) -> Self {
+        let table = PeerTable::new_rate_limited(private_static(private_key), handshake_limit);
+        Self::from_table(table, peers, udp, tun)
+    }
+
+    fn from_table(mut table: PeerTable, peers: Vec<PeerParams>, udp: UdpSocket, tun: T) -> Self {
         for p in peers {
             table.add(p);
         }
@@ -131,6 +150,18 @@ impl<T: TunQueue> Engine<T> {
     /// Run the three data-plane tasks until one of them fails.
     pub async fn run(self) -> std::io::Result<()> {
         let shared = self.shared;
+
+        // If a handshake rate limiter is configured (server), tick its reset once a
+        // second per the WireGuard spec so the cookie challenge window advances.
+        if let Some(rl) = shared.table.read().unwrap().rate_limiter() {
+            tokio::spawn(async move {
+                let mut tick = interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    rl.reset_count();
+                }
+            });
+        }
 
         // Proactively initiate handshakes toward any peer we have an endpoint for
         // (i.e. the client dialing its server) so the tunnel comes up before user

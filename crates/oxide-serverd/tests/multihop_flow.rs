@@ -106,7 +106,11 @@ async fn multihop_client_relay_exit_carries_a_packet() {
                 public_key: e.public_key,
                 preshared_key: None,
                 endpoint: None,
-                allowed_ips: e.allowed_ips.iter().filter_map(|s| s.parse().ok()).collect(),
+                allowed_ips: e
+                    .allowed_ips
+                    .iter()
+                    .filter_map(|s| s.parse().ok())
+                    .collect(),
                 persistent_keepalive: None,
             })
             .collect(),

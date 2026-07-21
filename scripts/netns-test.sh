@@ -26,8 +26,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== building =="
-( . "$HOME/.cargo/env" 2>/dev/null; cargo build -p oxide-serverd -p oxide-client )
+if [ -z "${OXIDE_SKIP_BUILD:-}" ]; then
+    echo "== building =="
+    ( . "$HOME/.cargo/env" 2>/dev/null; cargo build -p oxide-serverd -p oxide-client )
+fi
 SERVERD="$PWD/$BIN_DIR/oxide-serverd"
 CLIENT="$PWD/$BIN_DIR/oxide-client"
 

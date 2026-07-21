@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use oxide_common::account::is_valid_account_number;
 use oxide_common::keys::{generate_secret, public_from_secret};
 use oxide_control_client::ControlClient;
-use oxide_control_plane::{add_server, app, db, AppState, NewServer};
+use oxide_control_plane::{add_server, app, db, serve, AppState, NewServer};
 
 fn temp_db_path() -> String {
     static N: AtomicU32 = AtomicU32::new(0);
@@ -57,19 +57,28 @@ async fn full_account_device_flow() {
 
     // Register a device: first free host is .2 (.1 is the server).
     let dev1 = public_from_secret(&generate_secret());
-    let reg = cc.register_device(&account, dev1, "us-nyc-1").await.unwrap();
+    let reg = cc
+        .register_device(&account, dev1, "us-nyc-1")
+        .await
+        .unwrap();
     assert_eq!(reg.assigned_ip, "10.8.0.2/24");
     assert_eq!(reg.server.tunnel_ip, "10.8.0.1");
     assert_eq!(reg.server.public_key.to_base64(), server_pub);
     assert_eq!(reg.dns.as_deref(), Some("10.8.0.1")); // DNS handed out for leak protection
 
     // Re-registering the same device is idempotent (same IP).
-    let reg_again = cc.register_device(&account, dev1, "us-nyc-1").await.unwrap();
+    let reg_again = cc
+        .register_device(&account, dev1, "us-nyc-1")
+        .await
+        .unwrap();
     assert_eq!(reg_again.assigned_ip, "10.8.0.2/24");
 
     // A second device gets the next IP.
     let dev2 = public_from_secret(&generate_secret());
-    let reg2 = cc.register_device(&account, dev2, "us-nyc-1").await.unwrap();
+    let reg2 = cc
+        .register_device(&account, dev2, "us-nyc-1")
+        .await
+        .unwrap();
     assert_eq!(reg2.assigned_ip, "10.8.0.3/24");
 
     // The server fetches its peer list with its token: both devices present.
@@ -201,4 +210,31 @@ async fn best_server_selection_balances_by_load_and_location() {
     let de = servers.iter().find(|s| s.id == "de-a").unwrap();
     assert_eq!(de.country.as_deref(), Some("DE"));
     assert_eq!(de.capacity, 100);
+}
+
+#[tokio::test]
+async fn per_ip_rate_limit_kicks_in() {
+    // Serve via `serve()` so connect-info (and thus the per-IP limiter) is active.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let state = AppState::new(pool);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { serve(listener, state).await.unwrap() });
+
+    // Hammer account creation from one IP; within the window it must eventually be
+    // rejected. ControlClient surfaces the 429 as an error carrying the status.
+    let cc = ControlClient::new(&format!("http://{addr}"));
+    let mut saw_limit = false;
+    for _ in 0..80 {
+        if let Err(e) = cc.create_account().await {
+            if e.to_string().contains("429") {
+                saw_limit = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_limit,
+        "expected a 429 after exceeding the per-IP rate limit"
+    );
 }

@@ -1,0 +1,16 @@
+# cargo-deny configuration. CI runs `cargo deny check advisories bans sources`.
+# Licenses are intentionally not gated in CI yet (avoids churn); revisit before release.
+
+[advisories]
+version = 2
+# Add RUSTSEC ids here (with a note) only after evaluating and accepting the risk.
+ignore = []
+
+[bans]
+# Duplicate dependency versions are common in a large tree; warn rather than fail.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
