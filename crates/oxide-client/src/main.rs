@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use oxide_client_core::{resolve_connection, run_tunnel, ConnectRequest};
+use oxide_client_core::{
+    resolve_connection, resolve_mesh, run_tunnel, ConnectRequest, MeshRequest,
+};
 use oxide_common::{keys, Config, SecretKey};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::shutdown_signal;
@@ -59,6 +61,21 @@ enum Cmd {
         #[arg(long)]
         kill_switch: bool,
     },
+    /// Join the account's private mesh (P2P overlay of your own devices) and connect.
+    Mesh {
+        #[arg(long)]
+        control_plane: String,
+        #[arg(long)]
+        account: String,
+        /// The endpoint other devices reach this one at, `host:port` (e.g. your public
+        /// IP and a forwarded UDP port). This is what peers dial to mesh with you.
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long, default_value = "device.key")]
+        key_file: PathBuf,
+        #[arg(long)]
+        mtu: Option<u32>,
+    },
     /// Create a new anonymous account via the control plane and print it.
     Account {
         #[arg(long)]
@@ -92,6 +109,35 @@ async fn main() -> Result<()> {
                 .context("invalid private key on stdin")?;
             println!("{}", keys::public_from_secret(&sk).to_base64());
             Ok(())
+        }
+        Cmd::Mesh {
+            control_plane,
+            account,
+            endpoint,
+            key_file,
+            mtu,
+        } => {
+            let endpoint = endpoint
+                .parse()
+                .with_context(|| format!("invalid --endpoint (want host:port): {endpoint}"))?;
+            let req = MeshRequest {
+                control_plane,
+                account,
+                endpoint,
+                key_file,
+                mtu,
+            };
+            let resolved = resolve_mesh(&req).await?;
+            // Mesh is peer-to-peer within your own devices; no kill switch (it carries
+            // only mesh traffic, not your default route).
+            run_tunnel(
+                &resolved.iface,
+                resolved.peers,
+                false,
+                shutdown_signal(),
+                |_| {},
+            )
+            .await
         }
         Cmd::Account { control_plane } => {
             let number = ControlClient::new(&control_plane).create_account().await?;

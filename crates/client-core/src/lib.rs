@@ -144,6 +144,84 @@ pub async fn resolve_connection(req: &ConnectRequest) -> Result<Resolved> {
     })
 }
 
+/// A mesh-join request (the private overlay of the account's own devices).
+#[derive(Debug, Clone)]
+pub struct MeshRequest {
+    pub control_plane: String,
+    pub account: String,
+    /// The UDP endpoint (host:port) other mesh devices can reach this one at. If the
+    /// port is 0, an ephemeral port is bound and its real number reported.
+    pub endpoint: SocketAddr,
+    pub key_file: PathBuf,
+    pub mtu: Option<u32>,
+}
+
+/// Join the account's private mesh and resolve a local config: our mesh IP plus one
+/// WireGuard peer per other device (each pinned to its mesh `/32`). No privileges needed.
+///
+/// Unlike [`resolve_connection`], no peer carries a default route — the interface holds
+/// the mesh subnet (`address` is a `/16`), so only mesh traffic crosses the tunnel and
+/// normal internet egress is untouched. This is the "Tailscale, but actually private"
+/// side of the hybrid; combine with a `connect` for an anonymous exit.
+pub async fn resolve_mesh(req: &MeshRequest) -> Result<Resolved> {
+    let account = req.account.replace(' ', "");
+    let device_key = load_or_create_key(&req.key_file)?;
+    let device_pub = keys::public_from_secret(&device_key);
+    let cc = ControlClient::new(&req.control_plane);
+
+    let reg = cc
+        .mesh_register(&account, device_pub, &req.endpoint.to_string())
+        .await
+        .context("registering device in mesh")?;
+    let address: IpNet = reg
+        .mesh_ip
+        .parse()
+        .with_context(|| format!("bad mesh_ip from control plane: {}", reg.mesh_ip))?;
+    info!(mesh_ip = %address, peers = reg.peers.len(), "joined mesh");
+
+    let mut peers = Vec::with_capacity(reg.peers.len());
+    for p in &reg.peers {
+        if p.public_key == device_pub {
+            continue; // never peer with ourselves
+        }
+        let peer_ip: IpAddr = p
+            .mesh_ip
+            .split('/')
+            .next()
+            .unwrap_or(&p.mesh_ip)
+            .parse()
+            .with_context(|| format!("bad mesh peer ip: {}", p.mesh_ip))?;
+        let endpoint: SocketAddr = p
+            .endpoint
+            .parse()
+            .with_context(|| format!("bad mesh peer endpoint: {}", p.endpoint))?;
+        peers.push(PeerParams {
+            public_key: p.public_key,
+            preshared_key: None,
+            endpoint: Some(endpoint),
+            allowed_ips: vec![IpNet::from(peer_ip)],
+            persistent_keepalive: Some(25),
+        });
+    }
+
+    let iface = InterfaceConfig {
+        private_key: device_key,
+        address,
+        address6: None,
+        listen_port: Some(req.endpoint.port()),
+        mtu: req.mtu,
+        dns: None,
+        obfuscation_key: None,
+        pq_private_seed: None,
+    };
+    Ok(Resolved {
+        iface,
+        peers,
+        server_id: None,
+        exit_id: None,
+    })
+}
+
 /// Auto-pick an entry server for multihop: the least-loaded server that isn't the exit.
 pub async fn pick_entry(cc: &ControlClient, account: &str, exit_id: &str) -> Result<String> {
     if let Ok(b) = cc.best_server(account, None, None).await {

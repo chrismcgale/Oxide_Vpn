@@ -32,8 +32,14 @@ Ranked by differentiation × real-world impact. All leverage owning the stack.
    feeds the WireGuard PSK (hybrid X25519 + ML-KEM), negotiated through the control plane
    for both single-hop and **multihop** (keyed to the exit). Three capstone tunnels prove
    it (single, CP-negotiated, multihop+relay+PQ). *Next:* PSK rotation.
-4. **Personal-mesh + privacy hybrid.** Tailscale-style device overlay *plus* anonymous
-   exits. The positioning nobody owns: "Tailscale that's actually private."
+4. **Personal-mesh + privacy hybrid.** — *DONE:* control-plane-coordinated WireGuard P2P
+   overlay of the account's own devices — `mesh_devices` + `POST /v1/mesh/register` (stable
+   `/32` in `100.64.0.0/16`, account-scoped peer list), `client-core::resolve_mesh`,
+   `oxide-client mesh`; capstone `mesh_flow` proves two devices talk directly (no server).
+   The mesh carries only its `/16`, so it composes with a full-tunnel `connect` for
+   anonymous egress: Tailscale-style device overlay *plus* anonymous exits — "Tailscale
+   that's actually private." *Next:* NAT traversal (STUN-style hole punching + a DERP-style
+   relay fallback) so devices behind NAT mesh without a forwarded port.
 
 **Secondary:** verifiable no-logs (remote attestation / reproducible builds / transparency
 log); policy split-tunneling (per-app/per-destination routing); developer API/SDK

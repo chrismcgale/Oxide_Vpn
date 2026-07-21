@@ -33,10 +33,18 @@ but sends it through an *entry* server that relays the (still-encrypted) traffic
 single server sees both your IP and your destination. Done the WireGuard-native way (the
 entry is a UDP relay), not onion encryption, so the tunnel stays single-encryption.
 
-**Stealth mode (v1):** an optional obfuscation layer wraps every WireGuard datagram in a
-ChaCha20 keystream (random nonce + padding), so deep-packet inspection can't fingerprint
-or block it — for use where WireGuard is censored. Protocol mimicry (WG-in-TLS/QUIC) is
-the next tier.
+**Mesh hybrid ("Tailscale, but actually private"):** your own devices form a private
+WireGuard peer-to-peer overlay, coordinated by the control plane. Each device joins the
+account's mesh (`oxide-client mesh`), gets a stable mesh IP, and reaches your other
+devices directly — no traffic through a server. Because the mesh carries only its own
+subnet, it composes with a full-tunnel `connect` for anonymous egress: a private device
+overlay *and* an anonymous exit at once, which no incumbent offers.
+
+**Stealth mode:** an optional obfuscation layer wraps every WireGuard datagram in a
+ChaCha20 keystream (random nonce + size-bucket padding) so deep-packet inspection can't
+fingerprint or block it. On top of that, protocol mimicry makes the flow look like
+ordinary web traffic — **TLS-over-TCP** (looks like HTTPS) or **QUIC-over-UDP** (looks
+like HTTP/3, UDP-native and preferred) — for use where WireGuard is censored.
 
 **Post-quantum (core):** an ML-KEM (Kyber) exchange derives a shared secret used as the
 WireGuard preshared key, so the tunnel is protected by x25519 *and* a quantum-resistant
@@ -67,11 +75,11 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/common` | Key types, TOML config, error, `TunQueue`, account numbers, API DTOs |
 | `crates/wg-core` | The boringtun-based tunnel engine, runtime-mutable peers (OS-agnostic) |
 | `crates/net-linux` | Linux TUN device, routing, NAT, sysctls |
-| `crates/control-plane` | Accounts/devices/servers API, selection, multihop (axum + SQLite) |
+| `crates/control-plane` | Accounts/devices/servers API, selection, multihop, mesh (axum + SQLite) |
 | `crates/control-client` | HTTP client for the control-plane API |
 | `crates/relay` | UDP relay for multihop entry servers |
 | `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
-| `crates/mimicry` | TLS-1.3 protocol mimicry (traffic looks like HTTPS) |
+| `crates/mimicry` | Protocol mimicry: TLS-over-TCP (HTTPS) + QUIC-over-UDP (HTTP/3) |
 | `crates/pq` | Post-quantum (ML-KEM) key agreement for a hybrid PSK |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
 | `crates/client-core` | Shared client tunnel logic (resolve + run) |

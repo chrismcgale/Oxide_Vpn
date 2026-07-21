@@ -35,7 +35,8 @@ use tower_http::timeout::TimeoutLayer;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
 use oxide_common::api::{
-    ApiError, CreateAccountResponse, HeartbeatRequest, MultihopRegisterRequest, PeerEntry,
+    ApiError, CreateAccountResponse, HeartbeatRequest, MeshListResponse, MeshPeer,
+    MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest, PeerEntry,
     PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse,
     ServerConnection, ServerInfo, ServerListResponse,
 };
@@ -133,6 +134,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/servers/best", get(best_server))
         .route("/v1/devices", post(register_device))
         .route("/v1/devices/multihop", post(register_device_multihop))
+        .route("/v1/mesh/register", post(mesh_register))
+        .route("/v1/mesh", get(mesh_list))
         .route("/v1/internal/servers/:id/peers", get(list_peers))
         .route("/v1/internal/servers/:id/relays", get(list_relays))
         .route("/v1/internal/servers/:id/heartbeat", post(server_heartbeat))
@@ -512,6 +515,107 @@ async fn register_core(
 
 /// Base UDP port for relay listeners on an entry server.
 const RELAY_PORT_BASE: i64 = 51900;
+
+/// The mesh overlay subnet (Tailscale-style CGNAT space). Devices get a stable `/32` here.
+const MESH_CIDR: &str = "100.64.0.0/16";
+
+// POST /v1/mesh/register — join the account's private mesh, get a mesh IP + the peer list.
+async fn mesh_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<MeshRegisterRequest>,
+) -> ApiResult<Json<MeshRegisterResponse>> {
+    let account = auth_account(&state, &headers).await?;
+    let device_pk = req.public_key.to_base64();
+    let cidr: IpNet = MESH_CIDR.parse().unwrap();
+
+    let _guard = state.reg_lock.lock().await;
+
+    let existing =
+        sqlx::query("SELECT account_number, mesh_ip FROM mesh_devices WHERE public_key = ?")
+            .bind(&device_pk)
+            .fetch_optional(&state.pool)
+            .await?;
+    let mesh_ip = match existing {
+        Some(row) => {
+            let owner: String = row.get("account_number");
+            if owner != account {
+                return Err(AppError::Conflict("device already in another mesh".into()));
+            }
+            // Refresh the reachable endpoint.
+            sqlx::query("UPDATE mesh_devices SET endpoint = ? WHERE public_key = ?")
+                .bind(&req.endpoint)
+                .bind(&device_pk)
+                .execute(&state.pool)
+                .await?;
+            row.get::<String, _>("mesh_ip")
+        }
+        None => {
+            let used = mesh_used_ips(&state.pool).await?;
+            let assigned = ip_alloc::allocate(cidr, cidr.network(), &used)
+                .ok_or_else(|| AppError::Conflict("mesh subnet exhausted".into()))?;
+            sqlx::query(
+                "INSERT INTO mesh_devices (account_number, public_key, mesh_ip, endpoint, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&account)
+            .bind(&device_pk)
+            .bind(assigned.to_string())
+            .bind(&req.endpoint)
+            .bind(db::now_unix())
+            .execute(&state.pool)
+            .await?;
+            assigned.to_string()
+        }
+    };
+
+    Ok(Json(MeshRegisterResponse {
+        mesh_ip: format!("{}/{}", mesh_ip, cidr.prefix_len()),
+        peers: mesh_peers(&state.pool, &account).await?,
+    }))
+}
+
+// GET /v1/mesh — the account's mesh peer list (poll for changes).
+async fn mesh_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<MeshListResponse>> {
+    let account = auth_account(&state, &headers).await?;
+    Ok(Json(MeshListResponse {
+        peers: mesh_peers(&state.pool, &account).await?,
+    }))
+}
+
+async fn mesh_used_ips(pool: &SqlitePool) -> ApiResult<HashSet<IpAddr>> {
+    let rows = sqlx::query("SELECT mesh_ip FROM mesh_devices")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.get::<String, _>("mesh_ip").parse().ok())
+        .collect())
+}
+
+/// All devices in an account's mesh. The client filters out its own key.
+async fn mesh_peers(pool: &SqlitePool, account: &str) -> ApiResult<Vec<MeshPeer>> {
+    let rows = sqlx::query(
+        "SELECT public_key, mesh_ip, endpoint FROM mesh_devices WHERE account_number = ?",
+    )
+    .bind(account)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let pk: String = row.get("public_key");
+            Some(MeshPeer {
+                public_key: PublicKey::from_str(&pk).ok()?,
+                mesh_ip: row.get("mesh_ip"),
+                endpoint: row.get("endpoint"),
+            })
+        })
+        .collect())
+}
 
 /// Ensure a relay route entry->exit exists; return its listen port. Allocates the next
 /// free port on the entry if the route is new.

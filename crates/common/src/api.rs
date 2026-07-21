@@ -136,6 +136,37 @@ pub struct RelayListResponse {
     pub relays: Vec<RelayEntry>,
 }
 
+/// Register this device into the account's private mesh (a Tailscale-style overlay of
+/// the user's own devices), reporting where it's reachable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshRegisterRequest {
+    pub public_key: PublicKey,
+    /// The UDP endpoint (host:port) other devices can reach this one at.
+    pub endpoint: String,
+}
+
+/// One device in the mesh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshPeer {
+    pub public_key: PublicKey,
+    /// Stable mesh address (a `/32` in the mesh subnet, e.g. `100.64.0.5`).
+    pub mesh_ip: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshRegisterResponse {
+    /// This device's assigned mesh address, with the mesh prefix (e.g. `100.64.0.5/16`).
+    pub mesh_ip: String,
+    /// The other devices in the account's mesh.
+    pub peers: Vec<MeshPeer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshListResponse {
+    pub peers: Vec<MeshPeer>,
+}
+
 /// Standard JSON error body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {

@@ -66,6 +66,14 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             pq_ciphertext  TEXT,
             created_at     INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS mesh_devices (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_number TEXT NOT NULL REFERENCES accounts(number),
+            public_key     TEXT NOT NULL UNIQUE,
+            mesh_ip        TEXT NOT NULL UNIQUE,
+            endpoint       TEXT NOT NULL,
+            created_at     INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS relays (
             entry_id    TEXT NOT NULL REFERENCES servers(id),
             exit_id     TEXT NOT NULL REFERENCES servers(id),

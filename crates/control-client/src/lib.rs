@@ -8,7 +8,8 @@ use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
 
 use oxide_common::api::{
-    CreateAccountResponse, HeartbeatRequest, MultihopRegisterRequest, PeerEntry, PeerListResponse,
+    CreateAccountResponse, HeartbeatRequest, MeshListResponse, MeshPeer, MeshRegisterRequest,
+    MeshRegisterResponse, MultihopRegisterRequest, PeerEntry, PeerListResponse,
     RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerInfo,
     ServerListResponse,
 };
@@ -169,6 +170,44 @@ impl ControlClient {
         let resp = check(resp).await?;
         let body: RelayListResponse = resp.json().await?;
         Ok(body.relays)
+    }
+
+    /// Join the account's private mesh, reporting the endpoint others can reach us at.
+    /// Returns our assigned mesh IP and the current peer list.
+    pub async fn mesh_register(
+        &self,
+        account: &str,
+        public_key: PublicKey,
+        endpoint: &str,
+    ) -> Result<MeshRegisterResponse> {
+        let req = MeshRegisterRequest {
+            public_key,
+            endpoint: endpoint.to_string(),
+        };
+        let resp = self
+            .http
+            .post(self.url("/v1/mesh/register"))
+            .bearer_auth(account)
+            .json(&req)
+            .send()
+            .await
+            .context("POST /v1/mesh/register")?;
+        let resp = check(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Poll the account's current mesh peer list.
+    pub async fn mesh_list(&self, account: &str) -> Result<Vec<MeshPeer>> {
+        let resp = self
+            .http
+            .get(self.url("/v1/mesh"))
+            .bearer_auth(account)
+            .send()
+            .await
+            .context("GET /v1/mesh")?;
+        let resp = check(resp).await?;
+        let body: MeshListResponse = resp.json().await?;
+        Ok(body.peers)
     }
 
     /// Server-facing: fetch the peer list for `server_id` (authenticated with the
