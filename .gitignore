@@ -1,1 +1,4 @@
 /target
+# Local runtime configs containing real keys — never commit.
+*.local.toml
+/run/

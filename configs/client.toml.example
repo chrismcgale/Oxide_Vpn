@@ -1,0 +1,21 @@
+# Oxide VPN client config (Milestone 1).
+# Generate keys with:  oxide-client genkey  |  oxide-client pubkey
+
+[interface]
+# Client's private key.
+private_key = "CLIENT_PRIVATE_KEY_BASE64"
+# Client's address inside the tunnel subnet.
+address = "10.8.0.2/24"
+# Optional; defaults to 1420.
+mtu = 1420
+
+[[peer]]
+# The server's public key.
+public_key = "SERVER_PUBLIC_KEY_BASE64"
+# The server's public UDP endpoint.
+endpoint = "SERVER_IP:51820"
+# 0.0.0.0/0 = full tunnel (route ALL traffic through the VPN). Use
+# ["10.8.0.0/24"] instead to only reach other tunnel peers.
+allowed_ips = ["0.0.0.0/0"]
+# Hold NAT state open through the client's router.
+persistent_keepalive = 25

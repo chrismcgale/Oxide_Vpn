@@ -1,0 +1,26 @@
+# Oxide VPN server config (Milestone 1).
+# Generate keys with:  oxide-serverd genkey  |  oxide-serverd pubkey
+# Interoperable with `wg genkey`/`wg pubkey` — the base64 format is identical.
+
+[interface]
+# Server's private key (keep secret; never commit a real one).
+private_key = "SERVER_PRIVATE_KEY_BASE64"
+# Server's address inside the tunnel subnet.
+address = "10.8.0.1/24"
+# UDP port clients connect to.
+listen_port = 51820
+# Optional; defaults to 1420.
+mtu = 1420
+
+# Optional: enable full-tunnel internet egress via NAT masquerade.
+# Omit this whole section for a tunnel-only (no internet egress) server.
+[nat]
+# Egress interface to masquerade through. Omit `egress` to auto-detect the
+# interface that owns the default route.
+egress = "eth0"
+
+# One [[peer]] per client. No `endpoint` here: the server learns each client's
+# address from its handshake (which also enables roaming).
+[[peer]]
+public_key = "CLIENT_PUBLIC_KEY_BASE64"
+allowed_ips = ["10.8.0.2/32"]

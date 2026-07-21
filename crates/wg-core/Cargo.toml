@@ -1,0 +1,17 @@
+[package]
+name = "oxide-wg-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oxide_wg_core"
+path = "src/lib.rs"
+
+[dependencies]
+oxide-common = { path = "../common" }
+boringtun = { workspace = true }
+x25519-dalek = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ipnet = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "oxide-net-linux"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oxide_net_linux"
+path = "src/lib.rs"
+
+[dependencies]
+oxide-common = { path = "../common" }
+tokio = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ipnet = { workspace = true }

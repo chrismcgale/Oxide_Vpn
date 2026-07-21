@@ -1,28 +1,32 @@
-[package]
-name = "rust_vpn"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/wg-core",
+    "crates/net-linux",
+    "crates/oxide-serverd",
+    "crates/oxide-client",
+]
 
-[dependencies]
-tokio = { version = "1.0", features = ["full"] }
-aes-gcm = "0.10"
-rand = "0.8"
-x25519-dalek = "2.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-log = "0.4"
-env_logger = "0.10"
-thiserror = "1.0"
-async-trait = "0.1"
+# Shared dependency versions. Members opt in via `dep.workspace = true`.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+boringtun = "0.7"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ipnet = { version = "2", features = ["serde"] }
 
-[[example]]
-name = "packet_size"
-path = "examples/packet_size.rs"
-
-[[example]]
-name = "single_client"
-path = "examples/single_client.rs"
-
-[[example]]
-name = "multiple_clients"
-path = "examples/multiple_clients.rs"
+# Thin release profile appropriate for a packet-forwarding daemon.
+[profile.release]
+opt-level = 3
+lto = "thin"
