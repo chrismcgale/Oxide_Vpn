@@ -65,9 +65,11 @@ rotation).
   anti-abuse on device registration (subnet exhaustion).
 
 ### Product surface
+- *DONE:* **terminal UI** (`oxide-tui`) + **privileged agent** (`oxide-agentd`) with a
+  Unix-socket control API — the unprivileged-UI/privileged-helper split.
 - **Cross-platform clients** (macOS/Windows, iOS/Android network extensions) — the payoff
-  of `wg-core` being OS-agnostic. GUI/tray, auto-connect, trusted networks. Anonymous
-  payment (cash/crypto).
+  of `wg-core` being OS-agnostic. Desktop tray/GUI (Tauri) over the same agent socket,
+  auto-connect, trusted networks. Anonymous payment (cash/crypto).
 
 ### Quality / CI
 - **CI pipeline** (build + test + clippy + fmt + audit) — biggest credibility jump.

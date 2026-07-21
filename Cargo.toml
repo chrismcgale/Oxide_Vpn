@@ -13,6 +13,7 @@ members = [
     "crates/oxide-agentd",
     "crates/oxide-serverd",
     "crates/oxide-client",
+    "crates/oxide-tui",
 ]
 
 # Shared dependency versions. Members opt in via `dep.workspace = true`.

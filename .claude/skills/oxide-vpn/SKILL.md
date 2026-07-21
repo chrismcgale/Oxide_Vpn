@@ -39,6 +39,10 @@ sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account 
 sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --country US
 # Multihop: tunnel to the exit through an entry relay (entry auto-picked if omitted):
 sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --exit se-1 --entry de-1
+
+# TUI client (agent runs as root; TUI runs as your user):
+sudo target/debug/oxide-agentd &                  # privileged agent on /run/oxide/agent.sock
+target/debug/oxide-tui --control-plane http://cp:8080 --account <n>   # ↑/↓ select · Enter connect · d disconnect · q quit
 ```
 
 Config templates: `configs/server.toml.example`, `configs/client.toml.example`.
@@ -95,7 +99,13 @@ Cargo workspace, `crates/`:
 - **`relay`** — a pure-tokio UDP relay used by **multihop** entry servers: forwards a client's WireGuard ciphertext to the exit server (per-client upstream flows), so no single server sees both the client's IP and its destination. No root; unit-tested over loopback.
 - **`pq`** — **post-quantum** key agreement (ML-KEM-768 via `ml-kem`). `generate`/`encapsulate`/`decapsulate` produce a 32-byte shared secret used as the WireGuard **PSK**, layered on top of x25519 — strictly additive/hybrid (can only strengthen; a flaw in the unaudited ML-KEM can't weaken the classical security). Pure; unit-tested. Capstone: a real tunnel secured by the PQ-derived PSK.
 - **`obfs`** — **stealth mode** codec: wraps each datagram as `[nonce][ChaCha20(key,nonce) XOR ([len][payload][pad])]` so DPI can't fingerprint WireGuard (no fixed header). Padding rounds the datagram up to size **buckets** (256/512/…/1472) so handshakes/keepalives/small data collapse into indistinguishable sizes — traffic-analysis resistance (size dimension). Pure; unit-tested. Used by `wg-core`'s `Transport::Obfuscated`. (Timing-based cover traffic and protocol *mimicry* — WG-in-TLS/QUIC — are the next tiers.)
-- **`oxide-serverd` / `oxide-client`** — thin daemons: config → engine → net-linux; Ctrl-C tears down host state. Server optionally polls the control plane and reconciles peers live; client can `connect` via the control plane (register device → assigned IP → tunnel).
+- **`oxide-serverd`** — server daemon: config → engine → net-linux; polls the control plane and reconciles peers live.
+- **`client-core`** — shared client tunnel logic: `resolve_connection` (control-plane server selection + PQ + registration → local config, unprivileged) and `run_tunnel` (bring up TUN + routing + kill switch + DNS + engine until a caller-supplied `stop`, with an `on_ready` callback exposing the `EngineHandle` for live stats).
+- **`oxide-client`** — thin CLI over `client-core` (`up`/`connect`/`account`/`genkey`).
+- **`oxide-agentd`** — privileged agent: runs as root, owns the tunnel (embedded via `client-core`), serves a Unix-socket control API (newline-JSON: Status/Connect/Disconnect) so the UI never needs root.
+- **`oxide-tui`** — unprivileged terminal UI (ratatui): browse servers from the control plane, connect/disconnect via the agent socket, live status (uptime, tx/rx, peers, stealth/PQ flags).
+
+Client UX architecture: **unprivileged TUI ⇄ Unix socket ⇄ privileged agent**. The agent does all root-requiring work; the TUI is a pure client of the control plane + agent socket.
 
 Control-plane <-> server sync: the server **polls** `GET /v1/internal/servers/{id}/peers` (token-authed) and reconciles into the live engine. The data plane keeps peer state in RAM only; the DB lives solely in the control plane.
 
@@ -116,6 +126,9 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 - **No-logs / RAM-only (audited 2026-07-21):** the data plane (`wg-core`, `oxide-serverd`, `net-linux`) performs **no disk writes** — peers live in RAM only. The engine logs no client PII at the default level (pubkeys/endpoints are `debug`-only). The control-plane DB stores only routing essentials (account numbers, device pubkeys, IP assignments) — no traffic/activity logs. Client-side disk writes are limited to the device key (0600) and the resolv.conf swap, both intentional and local.
 
 ## Changelog / Decisions (newest first)
+
+- **2026-07-21 — Client UX: TUI + privileged agent.** New crates: `client-core` (shared tunnel logic extracted from the CLI, with a controllable `stop` + `on_ready` stats callback), `oxide-agentd` (root agent serving a Unix-socket control API), `oxide-tui` (unprivileged ratatui client). `EngineStats` gained tx/rx bytes; `common::agent` holds the UI⇄agent protocol. Verified without root: agent socket round-trips (Status→disconnected, bad input→error) and the TUI's app-state logic is unit-tested; rendering + the connect path need a TTY/root. 47 tests, clippy + fmt clean.
+  - Decision: **unprivileged UI + privileged agent split** (the M5 plan) — the TUI is a pure client of the control plane + the agent socket, so it never needs root. The tunnel runs *embedded* in the agent (not a supervised child), so status shows real throughput.
 
 - **2026-07-21 — Observability: `/metrics`.** The control plane exposes a Prometheus text endpoint (`GET /metrics`): `oxide_accounts_total`, `oxide_servers_total`, `oxide_devices_total`, and per-server `oxide_server_active_peers{server=…}` / `oxide_server_capacity{…}`. Rendering is a testable function (`render_metrics`). Unauthenticated aggregate counts (no secrets) — firewall/scrape internally in production. 42 tests, clippy + fmt clean.
 

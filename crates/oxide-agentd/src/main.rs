@@ -18,8 +18,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use oxide_common::agent::{AgentRequest, AgentResponse, TunnelStatus, DEFAULT_SOCKET};
 use oxide_client_core::{resolve_connection, run_tunnel, ConnectRequest};
+use oxide_common::agent::{AgentRequest, AgentResponse, TunnelStatus, DEFAULT_SOCKET};
 use oxide_net_linux::TunDevice;
 use oxide_wg_core::EngineHandle;
 

@@ -73,4 +73,7 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
 | `crates/pq` | Post-quantum (ML-KEM) key agreement for a hybrid PSK |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
-| `crates/oxide-client` | Client daemon (static config or control-plane connect) |
+| `crates/client-core` | Shared client tunnel logic (resolve + run) |
+| `crates/oxide-client` | Client CLI (static config or control-plane connect) |
+| `crates/oxide-agentd` | Privileged agent: owns the tunnel, Unix-socket control API |
+| `crates/oxide-tui` | Unprivileged terminal UI (ratatui) |
