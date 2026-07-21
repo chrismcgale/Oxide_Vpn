@@ -1334,8 +1334,22 @@ name = "oxide-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
+ "oxide-client-core",
+ "oxide-common",
+ "oxide-control-client",
+ "oxide-net-linux",
+ "oxide-wg-core",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "oxide-client-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
  "ipnet",
  "oxide-common",
  "oxide-control-client",
@@ -1344,7 +1358,6 @@ dependencies = [
  "oxide-wg-core",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

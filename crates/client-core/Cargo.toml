@@ -1,19 +1,23 @@
 [package]
-name = "oxide-client"
+name = "oxide-client-core"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "oxide-client"
-path = "src/main.rs"
+[lib]
+name = "oxide_client_core"
+path = "src/lib.rs"
 
 [dependencies]
 oxide-common = { path = "../common" }
 oxide-wg-core = { path = "../wg-core" }
 oxide-net-linux = { path = "../net-linux" }
 oxide-control-client = { path = "../control-client" }
-oxide-client-core = { path = "../client-core" }
+oxide-pq = { path = "../pq" }
 tokio = { workspace = true }
-clap = { workspace = true }
-tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+ipnet = { workspace = true }
+tracing = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+oxide-common = { path = "../common" }
