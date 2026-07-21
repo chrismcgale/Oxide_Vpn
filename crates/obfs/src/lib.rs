@@ -7,17 +7,20 @@
 //!
 //! Frame:
 //! ```text
-//! [ nonce: 12 ][ ChaCha20(key, nonce) XOR ( [len: 2 BE][payload][random padding] ) ]
+//! [ nonce: 12 ][ ChaCha20(key, nonce) XOR ( [len: 2 BE][payload][size-bucket padding] ) ]
 //! ```
 //! The nonce is random per packet, so identical payloads produce different ciphertext
-//! and there is no static prefix to match. Random padding breaks the fixed handshake
-//! sizes. This is *obfuscation*, not authentication — the real security is the
-//! WireGuard AEAD underneath, which rejects any tampering; the obfuscation layer only
-//! needs to defeat passive DPI. (Full protocol *mimicry*, e.g. WG-in-TLS/QUIC, is a
-//! future tier.)
+//! and there is no static prefix to match. Padding rounds the *total* datagram size up
+//! to one of a few fixed [`BUCKETS`], so the exact WireGuard message sizes (148/92-byte
+//! handshakes, small keepalives) collapse into a handful of indistinguishable sizes —
+//! the size dimension of traffic-analysis resistance. This is *obfuscation*, not
+//! authentication — the real security is the WireGuard AEAD underneath, which rejects
+//! any tampering; the obfuscation layer only needs to defeat passive DPI. (Timing-based
+//! cover traffic, and full protocol *mimicry* like WG-in-TLS/QUIC, are future tiers.)
 //!
-//! Note: obfuscation adds `12 + 2 + padding` bytes of overhead, so it reduces the
-//! effective path MTU. Lower the tunnel MTU (e.g. to 1380) when using stealth.
+//! Note: obfuscation + bucketing adds overhead, so it reduces the effective path MTU.
+//! Lower the tunnel MTU (e.g. to 1380) when using stealth. Buckets are capped at 1472 so
+//! the datagram plus IPv4+UDP headers (28 bytes) stays within a 1500-byte path.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
@@ -25,15 +28,30 @@ use rand_core::{OsRng, RngCore};
 
 const NONCE_LEN: usize = 12;
 const LEN_HDR: usize = 2;
-/// Max random padding added per packet. Kept small so an obfuscated max-size WireGuard
-/// datagram still fits under a 1500-byte path.
-const MAX_PAD: usize = 32;
+
+/// Total obfuscated-datagram sizes we pad up to. Many plaintext sizes map onto each
+/// bucket, forming an anonymity set. The top bucket (1472) keeps datagram + IPv4/UDP
+/// headers (28 bytes) at the 1500-byte path MTU. Packets larger than the top bucket
+/// (only possible with a too-high tunnel MTU) are sent unpadded.
+const BUCKETS: [usize; 6] = [256, 512, 768, 1024, 1280, 1472];
+
+/// Round `frame_len` up to the smallest bucket that fits, or leave it if it exceeds all.
+fn bucketed(frame_len: usize) -> usize {
+    for &b in &BUCKETS {
+        if frame_len <= b {
+            return b;
+        }
+    }
+    frame_len
+}
 
 /// Wrap `plaintext` into an obfuscated datagram.
 pub fn obfuscate(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let pad = (OsRng.next_u32() as usize) % (MAX_PAD + 1);
+
+    let unpadded = NONCE_LEN + LEN_HDR + plaintext.len();
+    let pad = bucketed(unpadded) - unpadded;
 
     // body = [len: 2][plaintext][pad zeros]; the zeros become keystream after XOR.
     let mut body = Vec::with_capacity(LEN_HDR + plaintext.len() + pad);
@@ -109,5 +127,27 @@ mod tests {
         let key = [7u8; 32];
         let framed = obfuscate(&key, b"");
         assert_eq!(deobfuscate(&key, &framed).unwrap(), b"");
+    }
+
+    #[test]
+    fn sizes_are_normalized_into_buckets() {
+        let key = [4u8; 32];
+        // A tiny keepalive and a WireGuard handshake (148 bytes) must obfuscate to the
+        // SAME size — their exact sizes are no longer distinguishable on the wire.
+        let keepalive = obfuscate(&key, &[0u8; 32]);
+        let handshake = obfuscate(&key, &[0u8; 148]);
+        assert_eq!(keepalive.len(), 256);
+        assert_eq!(handshake.len(), 256);
+
+        // A larger data packet lands in a higher bucket, and always on a boundary.
+        let data = obfuscate(&key, &[0u8; 600]);
+        assert_eq!(data.len(), 768);
+        assert!(BUCKETS.contains(&data.len()));
+
+        // Every bucket still round-trips.
+        for size in [0usize, 32, 148, 600, 1200] {
+            let framed = obfuscate(&key, &vec![7u8; size]);
+            assert_eq!(deobfuscate(&key, &framed).unwrap().len(), size);
+        }
     }
 }
