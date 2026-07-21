@@ -394,9 +394,16 @@ async fn register_device_multihop(
         ));
     }
 
-    // The tunnel terminates at the exit, so the device is a peer of the exit.
-    // (Multihop PQ is a follow-up; single-hop PQ distribution is wired first.)
-    let mut resp = register_core(&state, &account, &req.public_key, &req.exit_id, None).await?;
+    // The tunnel terminates at the exit, so the device is a peer of the exit (and PQ,
+    // if present, keys to the exit).
+    let mut resp = register_core(
+        &state,
+        &account,
+        &req.public_key,
+        &req.exit_id,
+        req.pq_ciphertext.as_deref(),
+    )
+    .await?;
 
     // The entry's public host, on which it relays. Reuse its stored endpoint's host.
     let entry_endpoint: String = sqlx::query_scalar("SELECT endpoint FROM servers WHERE id = ?")

@@ -183,18 +183,35 @@ async fn connect(
 
     // `psk` is the post-quantum preshared key when the chosen server runs PQ.
     let (reg, psk) = if let Some(exit_id) = &sel.exit {
-        // Multihop: tunnel to the exit through an entry relay. (PQ over multihop is a
-        // follow-up; single-hop PQ is wired first.)
+        // Multihop: tunnel to the exit through an entry relay.
         let entry_id = match &sel.entry {
             Some(e) => e.clone(),
             None => pick_entry(&cc, &account, exit_id).await?,
         };
         info!(entry = %entry_id, exit = %exit_id, "multihop path");
+        // Post-quantum keys to the exit (where the tunnel terminates); fetch its key.
+        let (pq_ct, psk) = match cc
+            .list_servers(&account)
+            .await
+            .context("listing servers")?
+            .into_iter()
+            .find(|s| &s.id == exit_id)
+            .and_then(|s| s.pq_public_key)
+        {
+            Some(pk_b64) => {
+                let pk = B64.decode(&pk_b64).context("bad PQ public key")?;
+                let (ct, shared) =
+                    oxide_pq::encapsulate(&pk).context("post-quantum encapsulation failed")?;
+                info!("post-quantum handshake enabled (multihop)");
+                (Some(B64.encode(ct)), Some(shared))
+            }
+            None => (None, None),
+        };
         let reg = cc
-            .register_device_multihop(&account, device_pub, &entry_id, exit_id)
+            .register_device_multihop(&account, device_pub, &entry_id, exit_id, pq_ct.as_deref())
             .await
             .context("registering device (multihop)")?;
-        (reg, None)
+        (reg, psk)
     } else {
         // Single-hop.
         let chosen = match &sel.server {

@@ -193,7 +193,7 @@ async fn best_server_selection_balances_by_load_and_location() {
     // and the entry server sees a relay route to the exit.
     let device = public_from_secret(&generate_secret());
     let mh = cc
-        .register_device_multihop(&account, device, "us-a", "de-a")
+        .register_device_multihop(&account, device, "us-a", "de-a", None)
         .await
         .unwrap();
     // Exit is de-a: its subnet is 10.9.0.0/24, so the assigned IP is in it.
@@ -210,7 +210,7 @@ async fn best_server_selection_balances_by_load_and_location() {
     // entry == exit is rejected.
     let d2 = public_from_secret(&generate_secret());
     assert!(cc
-        .register_device_multihop(&account, d2, "us-a", "us-a")
+        .register_device_multihop(&account, d2, "us-a", "us-a", None)
         .await
         .is_err());
 

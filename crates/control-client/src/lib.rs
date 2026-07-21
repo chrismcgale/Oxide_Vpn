@@ -133,11 +133,13 @@ impl ControlClient {
         public_key: PublicKey,
         entry_id: &str,
         exit_id: &str,
+        pq_ciphertext: Option<&str>,
     ) -> Result<RegisterDeviceResponse> {
         let req = MultihopRegisterRequest {
             public_key,
             entry_id: entry_id.to_string(),
             exit_id: exit_id.to_string(),
+            pq_ciphertext: pq_ciphertext.map(String::from),
         };
         let resp = self
             .http

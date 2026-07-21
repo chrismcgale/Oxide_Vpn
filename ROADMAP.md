@@ -27,11 +27,10 @@ Ranked by differentiation × real-world impact. All leverage owning the stack.
    datagram up to size buckets, so packet sizes normalize into an anonymity set. *Next:*
    constant-rate cover traffic + timing normalization in `wg-core`, so even the multihop
    entry sees only shaped volume.
-3. **Post-quantum handshake.** — *DONE (single-hop):* `pq` crate (ML-KEM-768); the KEM
-   shared secret feeds the WireGuard PSK (hybrid X25519 + ML-KEM), negotiated through the
-   control plane (server publishes its PQ key, client encapsulates at registration, server
-   decapsulates from its peer list). Two capstone tunnels prove it. *Next:* multihop PQ,
-   PSK rotation.
+3. **Post-quantum handshake.** — *DONE:* `pq` crate (ML-KEM-768); the KEM shared secret
+   feeds the WireGuard PSK (hybrid X25519 + ML-KEM), negotiated through the control plane
+   for both single-hop and **multihop** (keyed to the exit). Three capstone tunnels prove
+   it (single, CP-negotiated, multihop+relay+PQ). *Next:* PSK rotation.
 4. **Personal-mesh + privacy hybrid.** Tailscale-style device overlay *plus* anonymous
    exits. The positioning nobody owns: "Tailscale that's actually private."
 

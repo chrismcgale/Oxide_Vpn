@@ -76,6 +76,10 @@ pub struct MultihopRegisterRequest {
     pub public_key: PublicKey,
     pub entry_id: String,
     pub exit_id: String,
+    /// PQ KEM ciphertext (base64) encapsulated to the *exit's* PQ key — the tunnel
+    /// terminates at the exit, so that's where post-quantum keys.
+    #[serde(default)]
+    pub pq_ciphertext: Option<String>,
 }
 
 /// Everything a client needs to build a working tunnel config.

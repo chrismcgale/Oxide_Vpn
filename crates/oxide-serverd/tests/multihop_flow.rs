@@ -4,10 +4,16 @@
 //! keyed to the EXIT, but sends ciphertext to the ENTRY's relay endpoint (as the control
 //! plane instructs). The relay forwards to the exit, which decrypts and delivers the
 //! packet to its tunnel. The entry only ever sees ciphertext it can't read.
+//!
+//! This capstone also exercises **post-quantum over multihop**: the client encapsulates
+//! to the exit's ML-KEM key and the exit decapsulates from its peer list, so the tunnel
+//! is secured by a PQ-derived PSK end to end, through the relay.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use ipnet::IpNet;
 
 use oxide_common::keys::{generate_secret, public_from_secret};
@@ -37,6 +43,8 @@ async fn multihop_client_relay_exit_carries_a_packet() {
     let pool = db::connect(&temp_db_path()).await.unwrap();
     let exit_priv = generate_secret();
     let exit_pub = public_from_secret(&exit_priv);
+    let (exit_pq_seed, exit_pq_pub) = oxide_pq::generate();
+    let exit_pq_pub_b64 = B64.encode(&exit_pq_pub);
     let exit_token = add_server(
         &pool,
         NewServer {
@@ -49,7 +57,7 @@ async fn multihop_client_relay_exit_carries_a_packet() {
             capacity: 0,
             dns: None,
             obfuscation_key: None,
-            pq_public_key: None,
+            pq_public_key: Some(&exit_pq_pub_b64),
         },
     )
     .await
@@ -83,8 +91,16 @@ async fn multihop_client_relay_exit_carries_a_packet() {
     let account = cc.create_account().await.unwrap();
     let client_priv = generate_secret();
     let client_pub = public_from_secret(&client_priv);
+    // Post-quantum: encapsulate to the exit's ML-KEM key.
+    let (pq_ct, client_psk) = oxide_pq::encapsulate(&exit_pq_pub).unwrap();
     let reg = cc
-        .register_device_multihop(&account, client_pub, "entry", "exit")
+        .register_device_multihop(
+            &account,
+            client_pub,
+            "entry",
+            "exit",
+            Some(&B64.encode(&pq_ct)),
+        )
         .await
         .unwrap();
 
@@ -103,19 +119,26 @@ async fn multihop_client_relay_exit_carries_a_packet() {
     let exit_handle = exit_engine.handle();
     tokio::spawn(exit_engine.run());
     let peers = cc.fetch_peers("exit", &exit_token).await.unwrap();
+    // The exit decapsulates each device's PQ ciphertext to derive its PSK.
     exit_handle.reconcile(
         peers
             .iter()
-            .map(|e| PeerParams {
-                public_key: e.public_key,
-                preshared_key: None,
-                endpoint: None,
-                allowed_ips: e
-                    .allowed_ips
-                    .iter()
-                    .filter_map(|s| s.parse().ok())
-                    .collect(),
-                persistent_keepalive: None,
+            .map(|e| {
+                let preshared_key = e
+                    .pq_ciphertext
+                    .as_ref()
+                    .and_then(|ct| oxide_pq::decapsulate(&exit_pq_seed, &B64.decode(ct).ok()?));
+                PeerParams {
+                    public_key: e.public_key,
+                    preshared_key,
+                    endpoint: None,
+                    allowed_ips: e
+                        .allowed_ips
+                        .iter()
+                        .filter_map(|s| s.parse().ok())
+                        .collect(),
+                    persistent_keepalive: None,
+                }
             })
             .collect(),
     );
@@ -133,7 +156,7 @@ async fn multihop_client_relay_exit_carries_a_packet() {
         &client_priv,
         vec![PeerParams {
             public_key: exit_pub,
-            preshared_key: None,
+            preshared_key: Some(client_psk),
             endpoint: Some(relay_endpoint),
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
             persistent_keepalive: Some(5),
