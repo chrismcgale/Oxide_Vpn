@@ -8,6 +8,13 @@ private_key = "CLIENT_PRIVATE_KEY_BASE64"
 address = "10.8.0.2/24"
 # Optional; defaults to 1420.
 mtu = 1420
+# DNS leak protection: while connected, the system resolver is pointed here (and
+# restored on disconnect). Omit to leave DNS untouched.
+dns = "10.8.0.1"
+
+# Kill switch is a runtime flag, not a config field:
+#   sudo oxide-client up --config client.toml --kill-switch
+# It blocks all non-tunnel traffic while connected, so nothing leaks if the tunnel drops.
 
 [[peer]]
 # The server's public key.

@@ -23,8 +23,13 @@ location and capacity and heartbeat their live load; the control plane picks the
 least-loaded healthy server (optionally filtered by country/city), and the client can
 auto-select instead of naming a server.
 
-Roadmap (M4–M6): privacy features (kill switch, DNS leak protection, no-logs/RAM-only,
-multihop), desktop clients, and fleet ops (Postgres, provisioning, DoS hardening).
+**Milestone 4 complete:** privacy / leak prevention. An opt-in kill switch blocks all
+non-tunnel traffic (so nothing leaks if the tunnel drops), DNS leak protection points
+the resolver at the tunnel DNS while connected, and the data plane is audited to keep
+nothing on disk and log no client PII.
+
+Roadmap: multihop (nested tunnels), desktop clients, and fleet ops (Postgres,
+provisioning, DoS hardening).
 
 ## Quick start
 

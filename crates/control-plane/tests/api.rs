@@ -31,6 +31,7 @@ async fn full_account_device_flow() {
             country: Some("US"),
             city: Some("New York"),
             capacity: 100,
+            dns: Some("10.8.0.1"),
         },
     )
     .await
@@ -60,6 +61,7 @@ async fn full_account_device_flow() {
     assert_eq!(reg.assigned_ip, "10.8.0.2/24");
     assert_eq!(reg.server.tunnel_ip, "10.8.0.1");
     assert_eq!(reg.server.public_key.to_base64(), server_pub);
+    assert_eq!(reg.dns.as_deref(), Some("10.8.0.1")); // DNS handed out for leak protection
 
     // Re-registering the same device is idempotent (same IP).
     let reg_again = cc.register_device(&account, dev1, "us-nyc-1").await.unwrap();
@@ -92,6 +94,7 @@ async fn auth_is_enforced() {
             country: Some("DE"),
             city: None,
             capacity: 0,
+            dns: None,
         },
     )
     .await
@@ -129,6 +132,7 @@ async fn best_server_selection_balances_by_load_and_location() {
                 country: Some(country),
                 city: None,
                 capacity: 100,
+                dns: None,
             },
         )
         .await

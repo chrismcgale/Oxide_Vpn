@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use oxide_common::api::RegisterDeviceResponse;
 use oxide_common::{keys, Config, InterfaceConfig, SecretKey};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::{bring_up_interface, netlink};
+use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink};
 use oxide_wg_core::{Engine, PeerParams};
 
 const IFNAME: &str = "oxide0";
@@ -41,6 +41,9 @@ enum Cmd {
     Up {
         #[arg(short, long, default_value = "client.toml")]
         config: PathBuf,
+        /// Block all non-tunnel traffic while connected (prevents leaks on drop).
+        #[arg(long)]
+        kill_switch: bool,
     },
     /// Register with the control plane and connect.
     Connect {
@@ -66,6 +69,9 @@ enum Cmd {
         /// Tunnel MTU (defaults to 1420).
         #[arg(long)]
         mtu: Option<u32>,
+        /// Block all non-tunnel traffic while connected (prevents leaks on drop).
+        #[arg(long)]
+        kill_switch: bool,
     },
     /// Create a new anonymous account via the control plane and print it.
     Account {
@@ -105,7 +111,10 @@ async fn main() -> Result<()> {
             eprintln!("Save this account number — it is your only credential.");
             Ok(())
         }
-        Cmd::Up { config } => run_static(config).await,
+        Cmd::Up {
+            config,
+            kill_switch,
+        } => run_static(config, kill_switch).await,
         Cmd::Connect {
             control_plane,
             account,
@@ -114,13 +123,14 @@ async fn main() -> Result<()> {
             city,
             key_file,
             mtu,
+            kill_switch,
         } => {
             let sel = ServerSelection {
                 server,
                 country,
                 city,
             };
-            connect(&control_plane, &account, sel, &key_file, mtu).await
+            connect(&control_plane, &account, sel, &key_file, mtu, kill_switch).await
         }
     }
 }
@@ -133,11 +143,11 @@ struct ServerSelection {
     city: Option<String>,
 }
 
-async fn run_static(config_path: PathBuf) -> Result<()> {
+async fn run_static(config_path: PathBuf, kill_switch: bool) -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
-    run_tunnel(&cfg.interface, peers).await
+    run_tunnel(&cfg.interface, peers, kill_switch).await
 }
 
 async fn connect(
@@ -146,6 +156,7 @@ async fn connect(
     sel: ServerSelection,
     key_file: &Path,
     mtu: Option<u32>,
+    kill_switch: bool,
 ) -> Result<()> {
     let account = account.replace(' ', "");
     let device_key = load_or_create_key(key_file)?;
@@ -176,7 +187,7 @@ async fn connect(
     info!(assigned_ip = %reg.assigned_ip, "device registered");
 
     let (iface, peer) = resolve_registration(device_key, &reg, mtu)?;
-    run_tunnel(&iface, vec![peer]).await
+    run_tunnel(&iface, vec![peer], kill_switch).await
 }
 
 /// Turn a control-plane registration into a local interface config + server peer.
@@ -213,14 +224,20 @@ fn resolve_registration(
     Ok((iface, peer))
 }
 
-/// Bring up the interface, install routing, run the engine until Ctrl-C, tear down.
-async fn run_tunnel(iface: &InterfaceConfig, peers: Vec<PeerParams>) -> Result<()> {
+/// Bring up the interface, install routing, optional kill switch + DNS, run the engine
+/// until Ctrl-C, then tear everything down (in reverse order) so the host is left clean.
+async fn run_tunnel(
+    iface: &InterfaceConfig,
+    peers: Vec<PeerParams>,
+    kill_switch: bool,
+) -> Result<()> {
     let tun = bring_up_interface(IFNAME, iface).context("bringing up tun interface")?;
     info!(iface = IFNAME, addr = %iface.address, mtu = iface.mtu(), "interface up");
 
     // Full-tunnel routing: pin the server endpoint via the current default gateway
     // BEFORE swinging the default, or the encrypted UDP would recurse into the tunnel.
     let mut default_swung = false;
+    let mut full_tunnel_endpoint: Option<SocketAddr> = None;
     for peer in &peers {
         if is_full_tunnel(&peer.allowed_ips) {
             let endpoint = peer
@@ -233,8 +250,29 @@ async fn run_tunnel(iface: &InterfaceConfig, peers: Vec<PeerParams>) -> Result<(
             netlink::set_default_via_dev(IFNAME).context("swinging default route into tunnel")?;
             info!(server = %endpoint.ip(), via = %gw, "default route swung into tunnel");
             default_swung = true;
+            full_tunnel_endpoint = Some(endpoint);
             break;
         }
+    }
+
+    // DNS leak protection: point the resolver at the tunnel DNS while connected.
+    let dns_guard = match iface.dns {
+        Some(dns) => {
+            let guard = dns::set_dns(&[dns]).context("setting tunnel DNS")?;
+            info!(%dns, "tunnel DNS installed");
+            Some(guard)
+        }
+        None => None,
+    };
+
+    // Kill switch: block everything except loopback, the tunnel, and the encrypted UDP
+    // to the server. Installed after routing so the server endpoint is known; it keeps
+    // working across reconnects and prevents leaks if the tunnel drops.
+    if kill_switch {
+        let ep = full_tunnel_endpoint
+            .context("--kill-switch requires a full-tunnel (0.0.0.0/0) peer with an endpoint")?;
+        killswitch::enable(ep.ip(), ep.port(), IFNAME).context("enabling kill switch")?;
+        info!(server = %ep, "kill switch enabled");
     }
 
     let bind_port = iface.listen_port.unwrap_or(0);
@@ -250,6 +288,15 @@ async fn run_tunnel(iface: &InterfaceConfig, peers: Vec<PeerParams>) -> Result<(
         _ = tokio::signal::ctrl_c() => { info!("shutting down"); }
     }
 
+    // Teardown in reverse order.
+    if kill_switch {
+        if let Err(e) = killswitch::disable() {
+            warn!(?e, "failed to remove kill switch");
+        }
+    }
+    if let Some(guard) = dns_guard {
+        dns::restore(guard);
+    }
     if default_swung {
         for half in ["0.0.0.0/1", "128.0.0.0/1"] {
             if let Err(e) = netlink::del_route(half) {

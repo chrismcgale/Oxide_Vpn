@@ -74,14 +74,16 @@ Manual two-host verification (Milestone 1 definition of done):
 - **Ping works but curl/large transfers hang** — MTU. Interface MTU must be 1420; if a path is smaller, lower it. Classic PMTU black hole; MSS clamping is an M5 item.
 - **Full tunnel connects then the connection dies** — the encrypted UDP is routing into the tunnel. The client pins a `/32` host route to the server endpoint via the original gateway *before* swinging the default (`netlink::add_host_route_via`). Verify with `ip route get <server-ip>`.
 - **NAT egress silently drops replies** — strict `rp_filter`. We set it to loose (2); confirm `sysctl net.ipv4.conf.all.rp_filter`.
-- **`nft` table left behind after a crash** — `sudo nft delete table inet oxide`.
+- **`nft` table left behind after a crash** — `sudo nft delete table inet oxide` (NAT) or `sudo nft delete table inet oxide-ks` (kill switch).
+- **Kill switch locked me out / SSH froze** — the kill switch drops all non-tunnel output. On a remote box this can cut your session. Remove it with `sudo nft delete table inet oxide-ks`. It only permits loopback, the tunnel, and UDP to the server endpoint.
+- **DNS didn't change / reverted** — `systemd-resolved` or NetworkManager may own `/etc/resolv.conf` and rewrite it; our direct swap is best-effort until a resolved-aware backend exists.
 
 ## Architecture (brief)
 
 Cargo workspace, `crates/`:
 - **`common`** — key newtypes (zeroizing, base64, `wg`-compatible), TOML config, error, the `TunQueue` trait, anonymous account numbers, and the control-plane API DTOs. No tokio/OS deps.
 - **`wg-core`** — the engine: wraps boringtun `Tunn`; three tokio tasks (outbound TUN→UDP, inbound UDP→TUN, 250ms timers) sharing `Arc<Shared>`; allowed-IPs router; **runtime-mutable peer table** (`EngineHandle::{add_peer,remove_peer,reconcile}`). OS-agnostic (talks to TUN via `TunQueue`). `test-util` feature exposes a mock TUN.
-- **`net-linux`** — privileged Linux bits: TUN `ioctl` + `AsyncFd`; `ip`/`nft`/`sysctl` wrappers. (Shell-outs now; netlink/nftables libs are M5.)
+- **`net-linux`** — privileged Linux bits: TUN `ioctl` + `AsyncFd`; `ip`/`nft`/`sysctl` wrappers; **kill switch** (`killswitch.rs`, nft output-drop) and **DNS leak protection** (`dns.rs`, resolv.conf swap/restore). (Shell-outs now; netlink/nftables libs are M5.)
 - **`control-plane`** — axum + sqlx(SQLite) service: accounts (anonymous numbers), devices (pubkey + assigned tunnel IP), servers (with location + capacity), IP allocation, **load-based server selection** (`GET /v1/servers/best`) fed by **server heartbeats**. Never depends on `wg-core`. `add_server` CLI + `serve`.
 - **`control-client`** — thin reqwest client for the control-plane API, shared by both daemons.
 - **`oxide-serverd` / `oxide-client`** — thin daemons: config → engine → net-linux; Ctrl-C tears down host state. Server optionally polls the control plane and reconciles peers live; client can `connect` via the control plane (register device → assigned IP → tunnel).
@@ -98,7 +100,17 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 - **Peer demux is by source-address cache with an all-peers fallback** (M1). A proper receiver-index table is an M2 refinement; matters once one server has many clients.
 - **No-logs posture:** the data plane keeps nothing on disk; never `tracing`-log secret key material (the `SecretKey` type refuses to print its bytes). Any persistence belongs in the control plane (M2+), never here.
 
+## Privacy posture (no-logs / leak prevention)
+
+- **Kill switch** (`--kill-switch`): an nft `output` chain (policy drop) permitting only loopback, the tunnel interface, and the encrypted UDP to the server. Nothing leaks in the clear if the tunnel drops. Removed on disconnect.
+- **DNS leak protection**: while connected, `/etc/resolv.conf` is repointed at the tunnel DNS (handed out by the control plane per-server, or set in client config) and restored on disconnect. Caveat: `systemd-resolved`/NetworkManager may reclaim the file — a resolved-aware backend is future work.
+- **No-logs / RAM-only (audited 2026-07-21):** the data plane (`wg-core`, `oxide-serverd`, `net-linux`) performs **no disk writes** — peers live in RAM only. The engine logs no client PII at the default level (pubkeys/endpoints are `debug`-only). The control-plane DB stores only routing essentials (account numbers, device pubkeys, IP assignments) — no traffic/activity logs. Client-side disk writes are limited to the device key (0600) and the resolv.conf swap, both intentional and local.
+
 ## Changelog / Decisions (newest first)
+
+- **2026-07-21 — M4 privacy (leak prevention) built.** Kill switch + DNS leak protection in `net-linux` (pure ruleset/resolv.conf builders, unit-tested; applied via nft/resolv.conf, needs root). Control plane hands out a per-server DNS in device registration. `oxide-client` gains `--kill-switch` and applies/tears down DNS + kill switch around the tunnel in the right order. No-logs posture audited (data plane keeps nothing on disk, no info-level PII). 24 tests, clippy clean. Multihop deferred to its own milestone (nested tunnels + entry/exit pairing is substantial).
+  - Decision: kill switch is **opt-in** (`--kill-switch`) in v0 to avoid surprising lockouts from a CLI; a real client would default it on with a toggle.
+  - Decision: manage `/etc/resolv.conf` directly for v0 (simple, auditable); resolved/NetworkManager backends later.
 
 - **2026-07-21 — M3 multi-server selection built.** Servers carry location (country/city) and a soft `capacity`; they heartbeat live load (`active_peers`, derived from boringtun handshake recency via `EngineHandle::stats`) to the control plane. New `GET /v1/servers/best?country=&city=` picks the least-loaded healthy server (load factor = active/capacity); `oxide-client connect` auto-selects when `--server` is omitted (with `--country`/`--city` filters). `oxide-serverd`'s poll loop now also heartbeats. Verified without root (selection test + HTTP smoke test showing the pick flip as load shifts). 20 tests, clippy clean.
   - Decision: **load = live heartbeated active-peer count**, not registered device count — registrations aren't connections. A server that has never heartbeated is treated as healthy (may not run the loop); staleness (>90s) applies once it starts.

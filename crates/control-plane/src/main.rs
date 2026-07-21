@@ -52,6 +52,9 @@ enum Cmd {
         /// Soft capacity (max peers) for load-based selection. 0 = unlimited.
         #[arg(long, default_value_t = 0)]
         capacity: u32,
+        /// DNS server handed to clients for leak protection (e.g. the tunnel IP 10.8.0.1).
+        #[arg(long)]
+        dns: Option<String>,
     },
     /// Create an account from the CLI (handy for testing/seeding).
     NewAccount,
@@ -85,6 +88,7 @@ async fn main() -> Result<()> {
             country,
             city,
             capacity,
+            dns,
         } => {
             let cidr: IpNet = cidr.parse().context("invalid --cidr")?;
             let token = add_server(
@@ -97,6 +101,7 @@ async fn main() -> Result<()> {
                     country: country.as_deref(),
                     city: city.as_deref(),
                     capacity,
+                    dns: dns.as_deref(),
                 },
             )
             .await?;

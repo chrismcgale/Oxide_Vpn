@@ -227,7 +227,7 @@ async fn register_device(
 
     // Load the target server.
     let server = sqlx::query(
-        "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip FROM servers WHERE id = ?",
+        "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns FROM servers WHERE id = ?",
     )
     .bind(&req.server_id)
     .fetch_optional(&state.pool)
@@ -238,6 +238,7 @@ async fn register_device(
     let server_endpoint: String = server.get("endpoint");
     let tunnel_cidr: String = server.get("tunnel_cidr");
     let server_tunnel_ip: String = server.get("tunnel_ip");
+    let server_dns: Option<String> = server.get("dns");
     let cidr: IpNet = tunnel_cidr
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored cidr")))?;
@@ -261,7 +262,12 @@ async fn register_device(
         }
         let ip: String = existing.get("tunnel_ip");
         return Ok(Json(response_for(
-            ip, cidr, server_pk, server_endpoint, server_tunnel_ip,
+            ip,
+            cidr,
+            server_pk,
+            server_endpoint,
+            server_tunnel_ip,
+            server_dns,
         )?));
     }
 
@@ -291,6 +297,7 @@ async fn register_device(
         server_pk,
         server_endpoint,
         server_tunnel_ip,
+        server_dns,
     )?))
 }
 
@@ -368,6 +375,7 @@ fn response_for(
     server_pk: String,
     server_endpoint: String,
     server_tunnel_ip: String,
+    dns: Option<String>,
 ) -> ApiResult<RegisterDeviceResponse> {
     let public_key = PublicKey::from_str(&server_pk)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored key: {e}")))?;
@@ -378,7 +386,7 @@ fn response_for(
             endpoint: server_endpoint,
             tunnel_ip: server_tunnel_ip,
         },
-        dns: None,
+        dns,
     })
 }
 
@@ -391,6 +399,8 @@ pub struct NewServer<'a> {
     pub country: Option<&'a str>,
     pub city: Option<&'a str>,
     pub capacity: u32,
+    /// DNS server handed to clients for leak protection (e.g. the server's tunnel IP).
+    pub dns: Option<&'a str>,
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.
@@ -405,8 +415,8 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
     sqlx::query(
         "INSERT INTO servers
             (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token,
-             country, city, capacity, active_peers, last_heartbeat, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
+             country, city, capacity, active_peers, last_heartbeat, dns, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
     )
     .bind(s.id)
     .bind(s.public_key)
@@ -417,6 +427,7 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
     .bind(s.country)
     .bind(s.city)
     .bind(s.capacity)
+    .bind(s.dns)
     .bind(db::now_unix())
     .execute(pool)
     .await?;

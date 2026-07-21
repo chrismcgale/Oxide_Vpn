@@ -6,6 +6,8 @@
 //! `wg-core` stays testable without root and a future `net-macos` can be a sibling.
 
 pub mod cmd;
+pub mod dns;
+pub mod killswitch;
 pub mod nat;
 pub mod netlink;
 pub mod setup;

@@ -7,16 +7,13 @@
 
 use std::io;
 
-use crate::cmd::run;
+use crate::cmd::{apply_nft_ruleset, run};
 
 const TABLE: &str = "oxide";
 
-/// Install masquerade + forward rules: tunnel `tun_if` traffic egresses via `egress`.
-pub fn enable_masquerade(tun_if: &str, egress: &str) -> io::Result<()> {
-    // Start clean in case a previous run left the table behind.
-    let _ = disable_masquerade();
-
-    let ruleset = format!(
+/// The masquerade + forward ruleset for tunnel `tun_if` egressing via `egress`.
+pub fn build_ruleset(tun_if: &str, egress: &str) -> String {
+    format!(
         "table inet {TABLE} {{
             chain postrouting {{
                 type nat hook postrouting priority srcnat; policy accept;
@@ -28,26 +25,14 @@ pub fn enable_masquerade(tun_if: &str, egress: &str) -> io::Result<()> {
                 oifname \"{tun_if}\" accept
             }}
         }}"
-    );
+    )
+}
 
-    // Apply the ruleset atomically from stdin: `nft -f -`.
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(ruleset.as_bytes())?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("nft failed to load oxide ruleset"))
-    }
+/// Install masquerade + forward rules: tunnel `tun_if` traffic egresses via `egress`.
+pub fn enable_masquerade(tun_if: &str, egress: &str) -> io::Result<()> {
+    // Start clean in case a previous run left the table behind.
+    let _ = disable_masquerade();
+    apply_nft_ruleset(&build_ruleset(tun_if, egress))
 }
 
 /// Remove the `oxide` nftables table. Idempotent; ignores "no such table".
