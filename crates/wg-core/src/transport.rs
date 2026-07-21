@@ -4,11 +4,14 @@
 //! in the clear or through the obfuscation layer ("stealth mode"). Keeping this an enum
 //! (rather than a generic) avoids threading another type parameter through the engine.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use tokio::net::UdpSocket;
 
+use oxide_mimicry::quic;
 use oxide_obfs::{deobfuscate, obfuscate};
 
 use crate::mimic::MimicTransport;
@@ -23,6 +26,14 @@ pub enum Transport {
     Obfuscated { socket: UdpSocket, key: [u8; 32] },
     /// TLS-mimicry over TCP: the flow looks like an HTTPS session ("stealth tier 2").
     Mimic(MimicTransport),
+    /// QUIC-mimicry over UDP: the flow looks like an HTTP/3 (QUIC) session. UDP-native,
+    /// so no TCP-over-TCP penalty. First packet to each peer is a QUIC Initial, the rest
+    /// short-header packets.
+    QuicMimic {
+        socket: UdpSocket,
+        key: [u8; 32],
+        sent_initial: Mutex<HashSet<SocketAddr>>,
+    },
 }
 
 impl Transport {
@@ -38,6 +49,14 @@ impl Transport {
         Transport::Mimic(transport)
     }
 
+    pub fn quic_mimic(socket: UdpSocket, key: [u8; 32]) -> Self {
+        Transport::QuicMimic {
+            socket,
+            key,
+            sent_initial: Mutex::new(HashSet::new()),
+        }
+    }
+
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         match self {
             Transport::Plain(s) => s.send_to(buf, addr).await,
@@ -47,6 +66,23 @@ impl Transport {
                 Ok(buf.len())
             }
             Transport::Mimic(m) => m.send_to(buf, addr).await,
+            Transport::QuicMimic {
+                socket,
+                key,
+                sent_initial,
+            } => {
+                let obf = obfuscate(key, buf);
+                // The first datagram to a peer is a QUIC Initial (long header + embedded
+                // ClientHello); subsequent ones are short-header 1-RTT packets.
+                let first = sent_initial.lock().unwrap().insert(addr);
+                let dg = if first {
+                    quic::initial_packet(&obf)
+                } else {
+                    quic::short_packet(&obf)
+                };
+                socket.send_to(&dg, addr).await?;
+                Ok(buf.len())
+            }
         }
     }
 
@@ -67,6 +103,19 @@ impl Transport {
                 }
             }
             Transport::Mimic(m) => m.recv_from(buf).await,
+            Transport::QuicMimic { socket, key, .. } => {
+                let mut raw = [0u8; OBFS_BUF];
+                loop {
+                    let (n, addr) = socket.recv_from(&mut raw).await?;
+                    if let Some(payload) = quic::parse(&raw[..n]) {
+                        if let Some(plain) = deobfuscate(key, &payload) {
+                            let m = plain.len().min(buf.len());
+                            buf[..m].copy_from_slice(&plain[..m]);
+                            return Ok((m, addr));
+                        }
+                    }
+                }
+            }
         }
     }
 }

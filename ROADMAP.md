@@ -20,9 +20,10 @@ Ranked by differentiation × real-world impact. All leverage owning the stack.
 
 1. **Stealth mode / censorship resistance.** — *tier 1 DONE:* `obfs` (ChaCha20 keystream)
    + `Transport::Obfuscated`, distributed via the control plane. *tier 2 DONE:* `mimicry`
-   crate (TLS 1.3) + `Transport::Mimic` — the flow looks like an HTTPS session over TCP.
-   *Next:* config/CP selector so daemons choose `mimic`; QUIC mimicry (UDP, HTTP/3-like);
-   obfuscation/mimicry in the `relay`.
+   crate — **TLS-over-TCP** (`Transport::Mimic`, looks like HTTPS) and **QUIC-over-UDP**
+   (`Transport::QuicMimic`, looks like HTTP/3, UDP-native — the preferred mode). *Next:*
+   config/CP transport selector so daemons choose the stealth transport; mimicry in the
+   `relay`; a full QUIC state-machine emulator to beat *active* probing.
 2. **Traffic-analysis defense (DAITA-style).** — *size dimension DONE:* obfs pads every
    datagram up to size buckets, so packet sizes normalize into an anonymity set. *Next:*
    constant-rate cover traffic + timing normalization in `wg-core`, so even the multihop

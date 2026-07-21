@@ -17,6 +17,8 @@
 
 use rand_core::{OsRng, RngCore};
 
+pub mod quic;
+
 /// TLS record content types.
 pub const REC_HANDSHAKE: u8 = 0x16;
 pub const REC_CHANGE_CIPHER_SPEC: u8 = 0x14;

@@ -331,6 +331,66 @@ async fn tunnel_works_over_tls_mimicry() {
 }
 
 #[tokio::test]
+async fn tunnel_works_over_quic_mimicry() {
+    // QUIC mimicry (UDP-native, no TCP-over-TCP): the same real WireGuard tunnel, but on
+    // the wire it looks like an HTTP/3 (QUIC) session — a long-header Initial with an
+    // embedded ClientHello, then short-header packets.
+    let key = [0x44u8; 32];
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::quic_mimic(server_udp, key),
+        server_tun,
+    );
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::quic_mimic(client_udp, key),
+        client_tun,
+    );
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"tunnel disguised as http3",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; QUIC-mimicry tunnel never delivered")
+        .expect("server tun channel closed");
+    assert_eq!(received, packet);
+}
+
+#[tokio::test]
 async fn peer_added_at_runtime_comes_up() {
     // Same as above, but the server starts with NO peers and the client is added
     // live through the EngineHandle after the engine is already running — the path
