@@ -1,20 +1,28 @@
-//! Oxide VPN client daemon (Milestone 1).
+//! Oxide VPN client daemon.
 //!
-//! Dials a configured server endpoint, brings up a TUN interface, and (for a
-//! full-tunnel peer, `allowed_ips = 0.0.0.0/0`) swings the default route into the
-//! tunnel — pinning the server endpoint through the original gateway first so the
-//! tunnel's own UDP doesn't route into itself.
+//! Two ways to connect:
+//!   * `up --config client.toml` — static WireGuard-style config (M1).
+//!   * `connect --control-plane <url> --account <n>` — register this device with the
+//!     control plane, receive an assigned tunnel IP and server details, and connect
+//!     (M2). The device keypair is generated and cached locally on first use.
 //!
-//! Requires `CAP_NET_ADMIN` (run as root in M1).
+//! For a full-tunnel peer (`allowed_ips = 0.0.0.0/0`) the client swings the default
+//! route into the tunnel, pinning the server endpoint through the original gateway
+//! first so the tunnel's own UDP doesn't recurse into itself.
+//!
+//! Requires `CAP_NET_ADMIN` (run as root) for the actual connect.
 
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
 use tracing::{info, warn};
 
-use oxide_common::{keys, Config, SecretKey};
+use oxide_common::api::RegisterDeviceResponse;
+use oxide_common::{keys, Config, InterfaceConfig, SecretKey};
+use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, netlink};
 use oxide_wg_core::{Engine, PeerParams};
 
@@ -29,10 +37,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Connect to the server and route traffic through the tunnel.
+    /// Connect using a static config file.
     Up {
         #[arg(short, long, default_value = "client.toml")]
         config: PathBuf,
+    },
+    /// Register with the control plane and connect.
+    Connect {
+        /// Control-plane base URL, e.g. http://cp.example:8080
+        #[arg(long)]
+        control_plane: String,
+        /// Account number (16 digits, spaces ignored).
+        #[arg(long)]
+        account: String,
+        /// Server id to connect to (defaults to the first available).
+        #[arg(long)]
+        server: Option<String>,
+        /// Where to cache this device's private key.
+        #[arg(long, default_value = "device.key")]
+        key_file: PathBuf,
+        /// Tunnel MTU (defaults to 1420).
+        #[arg(long)]
+        mtu: Option<u32>,
+    },
+    /// Create a new anonymous account via the control plane and print it.
+    Account {
+        #[arg(long)]
+        control_plane: String,
     },
     /// Print a fresh private key (base64), like `wg genkey`.
     Genkey,
@@ -61,34 +92,112 @@ async fn main() -> Result<()> {
             println!("{}", keys::public_from_secret(&sk).to_base64());
             Ok(())
         }
-        Cmd::Up { config } => run(config).await,
+        Cmd::Account { control_plane } => {
+            let number = ControlClient::new(&control_plane).create_account().await?;
+            println!("{}", oxide_common::account::format_grouped(&number));
+            eprintln!("Save this account number — it is your only credential.");
+            Ok(())
+        }
+        Cmd::Up { config } => run_static(config).await,
+        Cmd::Connect {
+            control_plane,
+            account,
+            server,
+            key_file,
+            mtu,
+        } => connect(&control_plane, &account, server, &key_file, mtu).await,
     }
 }
 
-/// Is this a full-tunnel peer (routes the entire IPv4 default)?
-fn is_full_tunnel(allowed: &[IpNet]) -> bool {
-    allowed
-        .iter()
-        .any(|n| matches!(n, IpNet::V4(v4) if v4.prefix_len() == 0))
-}
-
-async fn run(config_path: PathBuf) -> Result<()> {
+async fn run_static(config_path: PathBuf) -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
+    let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
+    run_tunnel(&cfg.interface, peers).await
+}
 
-    // Interface: TUN + address + MTU + up.
-    let tun = bring_up_interface(IFNAME, &cfg.interface).context("bringing up tun interface")?;
-    info!(iface = IFNAME, addr = %cfg.interface.address, mtu = cfg.interface.mtu(), "interface up");
+async fn connect(
+    cp_url: &str,
+    account: &str,
+    server: Option<String>,
+    key_file: &Path,
+    mtu: Option<u32>,
+) -> Result<()> {
+    let account = account.replace(' ', "");
+    let device_key = load_or_create_key(key_file)?;
+    let device_pub = keys::public_from_secret(&device_key);
 
-    // Set up full-tunnel routing if any peer asks for 0.0.0.0/0. Pin the server
-    // endpoint via the current default gateway BEFORE swinging the default, or the
-    // encrypted UDP to the server would recurse into the tunnel.
+    let cc = ControlClient::new(cp_url);
+    let servers = cc.list_servers(&account).await.context("listing servers")?;
+    let chosen = match &server {
+        Some(id) => servers
+            .into_iter()
+            .find(|s| &s.id == id)
+            .with_context(|| format!("no such server: {id}"))?,
+        None => servers
+            .into_iter()
+            .next()
+            .context("control plane advertises no servers")?,
+    };
+    info!(server = %chosen.id, endpoint = %chosen.endpoint, "selected server");
+
+    let reg = cc
+        .register_device(&account, device_pub, &chosen.id)
+        .await
+        .context("registering device")?;
+    info!(assigned_ip = %reg.assigned_ip, "device registered");
+
+    let (iface, peer) = resolve_registration(device_key, &reg, mtu)?;
+    run_tunnel(&iface, vec![peer]).await
+}
+
+/// Turn a control-plane registration into a local interface config + server peer.
+/// Pure/testable: no I/O, no privileges.
+fn resolve_registration(
+    device_key: SecretKey,
+    reg: &RegisterDeviceResponse,
+    mtu: Option<u32>,
+) -> Result<(InterfaceConfig, PeerParams)> {
+    let address: IpNet = reg
+        .assigned_ip
+        .parse()
+        .with_context(|| format!("bad assigned_ip: {}", reg.assigned_ip))?;
+    let endpoint: SocketAddr = reg
+        .server
+        .endpoint
+        .parse()
+        .with_context(|| format!("bad server endpoint: {}", reg.server.endpoint))?;
+
+    let iface = InterfaceConfig {
+        private_key: device_key,
+        address,
+        listen_port: None,
+        mtu,
+        dns: reg.dns.as_ref().and_then(|s| s.parse().ok()),
+    };
+    let peer = PeerParams {
+        public_key: reg.server.public_key,
+        preshared_key: None,
+        endpoint: Some(endpoint),
+        allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+        persistent_keepalive: Some(25),
+    };
+    Ok((iface, peer))
+}
+
+/// Bring up the interface, install routing, run the engine until Ctrl-C, tear down.
+async fn run_tunnel(iface: &InterfaceConfig, peers: Vec<PeerParams>) -> Result<()> {
+    let tun = bring_up_interface(IFNAME, iface).context("bringing up tun interface")?;
+    info!(iface = IFNAME, addr = %iface.address, mtu = iface.mtu(), "interface up");
+
+    // Full-tunnel routing: pin the server endpoint via the current default gateway
+    // BEFORE swinging the default, or the encrypted UDP would recurse into the tunnel.
     let mut default_swung = false;
-    for peer in &cfg.peers {
+    for peer in &peers {
         if is_full_tunnel(&peer.allowed_ips) {
             let endpoint = peer
                 .endpoint
-                .context("full-tunnel peer must set an endpoint")?;
+                .context("full-tunnel peer must have an endpoint")?;
             let (gw, dev) = netlink::default_route()?
                 .context("no default route found; cannot pin server endpoint")?;
             netlink::add_host_route_via(endpoint.ip(), gw, &dev)
@@ -100,14 +209,12 @@ async fn run(config_path: PathBuf) -> Result<()> {
         }
     }
 
-    // UDP socket (ephemeral source port unless the config pins one).
-    let bind_port = cfg.interface.listen_port.unwrap_or(0);
+    let bind_port = iface.listen_port.unwrap_or(0);
     let udp = tokio::net::UdpSocket::bind(("0.0.0.0", bind_port))
         .await
         .context("binding client UDP socket")?;
 
-    let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
-    let engine = Engine::build(&cfg.interface.private_key, peers, udp, tun);
+    let engine = Engine::build(&iface.private_key, peers, udp, tun);
     info!("connecting");
 
     tokio::select! {
@@ -115,10 +222,6 @@ async fn run(config_path: PathBuf) -> Result<()> {
         _ = tokio::signal::ctrl_c() => { info!("shutting down"); }
     }
 
-    // Remove the split-default routes we added; the pinned host route and the TUN
-    // interface (and its on-link routes) go away when the interface is dropped, but
-    // the split-default routes are attached to the interface too, so this is mostly
-    // belt-and-suspenders.
     if default_swung {
         for half in ["0.0.0.0/1", "128.0.0.0/1"] {
             if let Err(e) = netlink::del_route(half) {
@@ -127,4 +230,59 @@ async fn run(config_path: PathBuf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Is this a full-tunnel peer (routes the entire IPv4 default)?
+fn is_full_tunnel(allowed: &[IpNet]) -> bool {
+    allowed
+        .iter()
+        .any(|n| matches!(n, IpNet::V4(v4) if v4.prefix_len() == 0))
+}
+
+/// Load the device private key from `path`, or generate and persist one (0600).
+fn load_or_create_key(path: &Path) -> Result<SecretKey> {
+    if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading key file {}", path.display()))?;
+        return text.trim().parse().context("parsing device key");
+    }
+    let key = keys::generate_secret();
+    std::fs::write(path, key.to_base64())
+        .with_context(|| format!("writing key file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    info!(path = %path.display(), "generated new device key");
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxide_common::api::ServerConnection;
+
+    #[test]
+    fn resolve_registration_builds_full_tunnel_peer() {
+        let device = keys::generate_secret();
+        let server_pub = keys::public_from_secret(&keys::generate_secret());
+        let reg = RegisterDeviceResponse {
+            assigned_ip: "10.8.0.5/24".into(),
+            server: ServerConnection {
+                public_key: server_pub,
+                endpoint: "203.0.113.7:51820".into(),
+                tunnel_ip: "10.8.0.1".into(),
+            },
+            dns: Some("10.8.0.1".into()),
+        };
+
+        let (iface, peer) = resolve_registration(device, &reg, Some(1400)).unwrap();
+        assert_eq!(iface.address.to_string(), "10.8.0.5/24");
+        assert_eq!(iface.mtu(), 1400);
+        assert_eq!(peer.endpoint.unwrap().to_string(), "203.0.113.7:51820");
+        assert_eq!(peer.public_key, server_pub);
+        assert!(is_full_tunnel(&peer.allowed_ips));
+        assert_eq!(peer.persistent_keepalive, Some(25));
+    }
 }

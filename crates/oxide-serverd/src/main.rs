@@ -8,14 +8,18 @@
 //! routes/sysctls, and installs an nftables masquerade table.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ipnet::IpNet;
 use tracing::{info, warn};
 
-use oxide_common::{keys, Config, SecretKey};
+use oxide_common::api::PeerEntry;
+use oxide_common::{keys, Config, ControlPlaneConfig, SecretKey};
+use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, nat, netlink, sysctl};
-use oxide_wg_core::{Engine, PeerParams};
+use oxide_wg_core::{Engine, EngineHandle, PeerParams, TunQueue};
 
 const IFNAME: &str = "oxide0";
 
@@ -101,6 +105,14 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
     let engine = Engine::build(&cfg.interface.private_key, peers, udp, tun);
 
+    // If configured, pull the peer list from the control plane and keep it in sync.
+    // The engine's peer table is runtime-mutable, so this reconciles live and the
+    // data plane keeps peer state in RAM only (no on-disk peer store).
+    if let Some(cp) = cfg.control_plane {
+        let handle = engine.handle();
+        tokio::spawn(poll_control_plane(handle, cp));
+    }
+
     // Run until Ctrl-C, then tear down host state (leave-no-trace).
     tokio::select! {
         r = engine.run() => { r.context("engine stopped")?; }
@@ -114,4 +126,43 @@ async fn run(config_path: PathBuf) -> Result<()> {
     }
     // TUN device is dropped here, removing the interface and its routes.
     Ok(())
+}
+
+/// Periodically fetch this server's peer list from the control plane and reconcile it
+/// into the running engine. tokio's interval fires immediately, so peers load at once.
+async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPlaneConfig) {
+    let client = ControlClient::new(&cp.url);
+    let mut tick = tokio::time::interval(Duration::from_secs(cp.poll_interval_secs.max(1)));
+    loop {
+        tick.tick().await;
+        match client.fetch_peers(&cp.server_id, &cp.token).await {
+            Ok(entries) => {
+                let desired: Vec<PeerParams> = entries.iter().filter_map(peer_from_entry).collect();
+                info!(peers = desired.len(), "reconciled peers from control plane");
+                handle.reconcile(desired);
+            }
+            Err(e) => warn!(error = %e, "failed to fetch peers from control plane"),
+        }
+    }
+}
+
+/// Map a control-plane peer entry to engine params (server peers have no endpoint —
+/// it's learned from the handshake).
+fn peer_from_entry(entry: &PeerEntry) -> Option<PeerParams> {
+    let allowed_ips: Vec<IpNet> = entry
+        .allowed_ips
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if allowed_ips.is_empty() {
+        warn!(peer = %entry.public_key.to_base64(), "peer has no valid allowed_ips; skipping");
+        return None;
+    }
+    Some(PeerParams {
+        public_key: entry.public_key,
+        preshared_key: None,
+        endpoint: None,
+        allowed_ips,
+        persistent_keepalive: None,
+    })
 }

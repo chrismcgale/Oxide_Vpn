@@ -38,8 +38,30 @@ pub struct Config {
     #[serde(default)]
     pub nat: Option<NatConfig>,
 
+    /// If present, the server pulls its peer list from the control plane instead of
+    /// (or in addition to) any static `[[peer]]` entries.
+    #[serde(default)]
+    pub control_plane: Option<ControlPlaneConfig>,
+
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlPlaneConfig {
+    /// Base URL of the control plane, e.g. `http://cp.example:8080`.
+    pub url: String,
+    /// This server's id as registered with the control plane.
+    pub server_id: String,
+    /// This server's auth token (from `oxide-control-plane add-server`).
+    pub token: String,
+    /// How often to re-fetch the peer list, in seconds.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_poll_interval() -> u64 {
+    15
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,8 +134,10 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.peers.is_empty() {
-            return Err(Error::Config("at least one [[peer]] is required".into()));
+        if self.peers.is_empty() && self.control_plane.is_none() {
+            return Err(Error::Config(
+                "at least one [[peer]] or a [control_plane] section is required".into(),
+            ));
         }
         for p in &self.peers {
             if p.allowed_ips.is_empty() {

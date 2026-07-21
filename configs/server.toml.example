@@ -19,8 +19,20 @@ mtu = 1420
 # interface that owns the default route.
 egress = "eth0"
 
+# --- Option A (M1): static peers ---
 # One [[peer]] per client. No `endpoint` here: the server learns each client's
 # address from its handshake (which also enables roaming).
 [[peer]]
 public_key = "CLIENT_PUBLIC_KEY_BASE64"
 allowed_ips = ["10.8.0.2/32"]
+
+# --- Option B (M2): pull peers from the control plane ---
+# Instead of static [[peer]] blocks, let the control plane manage peers. Register
+# this server with `oxide-control-plane add-server` and paste the printed values.
+# With this section present, [[peer]] blocks are optional and the peer list is
+# fetched and reconciled at runtime (kept in RAM only).
+# [control_plane]
+# url = "http://control-plane-host:8080"
+# server_id = "us-1"
+# token = "SERVER_AUTH_TOKEN"
+# poll_interval_secs = 15

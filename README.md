@@ -12,12 +12,16 @@ privacy features, clients, and ops — is what Oxide builds on top.
 
 **Milestone 1 complete:** a real single tunnel. Server and client daemons establish a
 genuine WireGuard handshake, create TUN devices, route traffic across the encrypted
-tunnel, and (optionally) provide full-tunnel internet egress via NAT. Static config;
-no control plane yet.
+tunnel, and (optionally) provide full-tunnel internet egress via NAT.
 
-Roadmap (M2–M6): control plane (auth, server list, ephemeral keys), multi-server
-selection, privacy features (kill switch, DNS leak protection, no-logs/RAM-only,
-multihop), desktop clients, and fleet ops.
+**Milestone 2 complete:** the control plane. Anonymous account numbers (Mullvad-style,
+no email/PII), a device-registration API that allocates tunnel IPs, and a server that
+pulls its peer list from the control plane and reconciles it into the live engine. The
+client can register a device and connect with one command.
+
+Roadmap (M3–M6): multi-server selection/load-balancing, privacy features (kill switch,
+DNS leak protection, no-logs/RAM-only, multihop), desktop clients, and fleet ops
+(Postgres, provisioning, DoS hardening).
 
 ## Quick start
 
@@ -39,8 +43,10 @@ Config templates live in `configs/`. Operational details are in the project runb
 
 | Crate | Role |
 |-------|------|
-| `crates/common` | Key types, TOML config, error, the `TunQueue` trait |
-| `crates/wg-core` | The boringtun-based tunnel engine (OS-agnostic) |
+| `crates/common` | Key types, TOML config, error, `TunQueue`, account numbers, API DTOs |
+| `crates/wg-core` | The boringtun-based tunnel engine, runtime-mutable peers (OS-agnostic) |
 | `crates/net-linux` | Linux TUN device, routing, NAT, sysctls |
-| `crates/oxide-serverd` | Server daemon |
-| `crates/oxide-client` | Client daemon |
+| `crates/control-plane` | Accounts/devices/servers API (axum + SQLite) |
+| `crates/control-client` | HTTP client for the control-plane API |
+| `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
+| `crates/oxide-client` | Client daemon (static config or control-plane connect) |

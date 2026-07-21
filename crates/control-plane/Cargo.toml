@@ -1,24 +1,30 @@
 [package]
-name = "oxide-serverd"
+name = "oxide-control-plane"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "oxide-serverd"
+name = "oxide-control-plane"
 path = "src/main.rs"
+
+[lib]
+name = "oxide_control_plane"
+path = "src/lib.rs"
 
 [dependencies]
 oxide-common = { path = "../common" }
-oxide-wg-core = { path = "../wg-core" }
-oxide-net-linux = { path = "../net-linux" }
-oxide-control-client = { path = "../control-client" }
+axum = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 ipnet = { workspace = true }
+rand_core = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
-oxide-control-plane = { path = "../control-plane" }
-oxide-wg-core = { path = "../wg-core", features = ["test-util"] }
+oxide-control-client = { path = "../control-client" }

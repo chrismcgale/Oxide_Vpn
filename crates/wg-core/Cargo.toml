@@ -7,6 +7,10 @@ edition = "2021"
 name = "oxide_wg_core"
 path = "src/lib.rs"
 
+[features]
+# Exposes in-memory TUN test helpers for this crate's and downstream integration tests.
+test-util = []
+
 [dependencies]
 oxide-common = { path = "../common" }
 boringtun = { workspace = true }

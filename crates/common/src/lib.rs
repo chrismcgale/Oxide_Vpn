@@ -3,12 +3,14 @@
 //! shared by the data plane (`wg-core`), the platform layer (`net-linux`), and a
 //! future control plane without pulling any of them in.
 
+pub mod account;
+pub mod api;
 pub mod config;
 pub mod error;
 pub mod keys;
 pub mod tun;
 
-pub use config::{Config, InterfaceConfig, NatConfig, PeerConfig};
+pub use config::{Config, ControlPlaneConfig, InterfaceConfig, NatConfig, PeerConfig};
 pub use error::{Error, Result};
 pub use keys::{PublicKey, SecretKey};
 pub use tun::TunQueue;

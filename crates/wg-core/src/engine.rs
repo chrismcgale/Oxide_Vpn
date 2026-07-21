@@ -11,11 +11,13 @@
 //!   * **timers** — every 250 ms call `update_timers` on each peer, which drives
 //!     handshake retransmission, rekeying, and persistent keepalives.
 //!
+//! Peers live in a runtime-mutable [`PeerTable`] behind an `RwLock` so the control
+//! plane can add/remove them on a live server (see [`EngineHandle`]).
+//!
 //! Two boringtun contracts we honour deliberately:
 //!   1. `update_timers` MUST be called on a ticker or handshakes never retry.
 //!   2. After `decapsulate` returns `WriteToNetwork`, we MUST keep calling
-//!      `decapsulate(None, &[], buf)` until it returns `Done`, sending each datagram,
-//!      or the handshake stalls.
+//!      `decapsulate(None, &[], buf)` until it returns `Done`, sending each datagram.
 //!
 //! `Tunn` is not `Sync` and is mutated by every call, so it lives behind a blocking
 //! `std::sync::Mutex`. We only hold that lock to run one boringtun call into a stack
@@ -23,11 +25,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use boringtun::noise::{Tunn, TunnResult};
-use boringtun::x25519::{PublicKey as XPublicKey, StaticSecret};
+use boringtun::x25519::StaticSecret;
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
 use tokio::time::interval;
@@ -36,7 +38,7 @@ use tracing::{debug, trace, warn};
 use oxide_common::{PublicKey, SecretKey, TunQueue};
 
 use crate::peer::Peer;
-use crate::router::AllowedIps;
+use crate::table::{PeerId, PeerTable};
 
 /// Max datagram/packet we buffer. Tunnel MTU is 1420; WireGuard adds ~32 bytes of
 /// overhead. 2048 leaves comfortable headroom without being wasteful.
@@ -71,51 +73,46 @@ impl PeerParams {
 struct Shared<T: TunQueue> {
     udp: UdpSocket,
     tun: T,
-    peers: Vec<Peer>,
-    router: AllowedIps,
-    /// Source-address -> peer index cache, learned as datagrams arrive. Lets the
-    /// inbound path route directly instead of trying every peer. (A proper
-    /// receiver-index table is an M2 refinement.)
-    addr_to_peer: Mutex<HashMap<SocketAddr, usize>>,
+    table: RwLock<PeerTable>,
+    /// Source-address -> peer id cache, learned as datagrams arrive. Lets the inbound
+    /// path route directly instead of trying every peer. (A proper receiver-index
+    /// table is a later refinement.)
+    addr_to_peer: Mutex<HashMap<SocketAddr, PeerId>>,
 }
 
 pub struct Engine<T: TunQueue> {
     shared: Arc<Shared<T>>,
 }
 
+/// A cheap, cloneable handle for mutating a running engine's peer set. The control
+/// plane loop on the server uses this to reconcile peers as devices come and go.
+#[derive(Clone)]
+pub struct EngineHandle<T: TunQueue> {
+    shared: Arc<Shared<T>>,
+}
+
 impl<T: TunQueue> Engine<T> {
-    /// Build an engine from key material and peer parameters.
+    /// Build an engine from key material and an initial peer set.
     pub fn build(private_key: &SecretKey, peers: Vec<PeerParams>, udp: UdpSocket, tun: T) -> Self {
         let static_private = StaticSecret::from(*private_key.as_bytes());
-
-        let mut router = AllowedIps::new();
-        let mut peer_vec = Vec::with_capacity(peers.len());
-
-        for (idx, p) in peers.into_iter().enumerate() {
-            let peer_public = XPublicKey::from(*p.public_key.as_bytes());
-            // rate_limiter=None in M1; cookie/DoS defense is M6 work.
-            let tunn = Tunn::new(
-                static_private.clone(),
-                peer_public,
-                p.preshared_key,
-                p.persistent_keepalive,
-                idx as u32,
-                None,
-            );
-            for net in &p.allowed_ips {
-                router.insert(*net, idx);
-            }
-            peer_vec.push(Peer::new(tunn, p.endpoint, p.allowed_ips, p.public_key));
+        let mut table = PeerTable::new(static_private);
+        for p in peers {
+            table.add(p);
         }
-
         Engine {
             shared: Arc::new(Shared {
                 udp,
                 tun,
-                peers: peer_vec,
-                router,
+                table: RwLock::new(table),
                 addr_to_peer: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    /// A handle for adding/removing peers while the engine runs.
+    pub fn handle(&self) -> EngineHandle<T> {
+        EngineHandle {
+            shared: self.shared.clone(),
         }
     }
 
@@ -144,7 +141,8 @@ impl<T: TunQueue> Engine<T> {
     }
 
     async fn init_handshakes(shared: &Arc<Shared<T>>) {
-        for (idx, peer) in shared.peers.iter().enumerate() {
+        let peers = shared.table.read().unwrap().snapshot();
+        for (id, peer) in peers {
             let Some(endpoint) = peer.endpoint() else {
                 continue;
             };
@@ -159,7 +157,7 @@ impl<T: TunQueue> Engine<T> {
                 }
             };
             if let Some(d) = datagram {
-                debug!(peer = idx, %endpoint, "initiating handshake");
+                debug!(peer = %PublicKey(id).to_base64(), %endpoint, "initiating handshake");
                 let _ = shared.udp.send_to(&d, endpoint).await;
             }
         }
@@ -178,11 +176,10 @@ impl<T: TunQueue> Engine<T> {
                 trace!("dropping non-IP / short packet from tun");
                 continue;
             };
-            let Some(idx) = shared.router.lookup(dst) else {
+            let Some(peer) = shared.table.read().unwrap().route(dst) else {
                 trace!(%dst, "no peer owns destination; dropping");
                 continue;
             };
-            let peer = &shared.peers[idx];
 
             let (datagram, endpoint) = {
                 let mut out = [0u8; MAX_PKT];
@@ -191,10 +188,9 @@ impl<T: TunQueue> Engine<T> {
                     TunnResult::WriteToNetwork(d) => (Some(d.to_vec()), peer.endpoint()),
                     TunnResult::Done => (None, None),
                     TunnResult::Err(e) => {
-                        warn!(peer = idx, ?e, "encapsulate error");
+                        warn!(?e, "encapsulate error");
                         (None, None)
                     }
-                    // encapsulate only ever yields WriteToNetwork or Done/Err.
                     _ => (None, None),
                 }
             };
@@ -204,7 +200,7 @@ impl<T: TunQueue> Engine<T> {
                     shared.udp.send_to(&d, ep).await?;
                 }
                 (Some(_), None) => {
-                    trace!(peer = idx, "have datagram but no endpoint yet; dropping");
+                    trace!("have datagram but no endpoint yet; dropping");
                 }
                 _ => {}
             }
@@ -224,14 +220,16 @@ impl<T: TunQueue> Engine<T> {
     /// `src` first, falling back to every peer (a handshake from a new endpoint has
     /// no cache entry yet). The first peer that decapsulates without error owns it.
     async fn handle_incoming(shared: &Arc<Shared<T>>, datagram: Vec<u8>, src: SocketAddr) {
-        let candidates: Vec<usize> = match shared.addr_to_peer.lock().unwrap().get(&src) {
-            Some(&idx) => vec![idx],
-            None => (0..shared.peers.len()).collect(),
+        let candidates: Vec<(PeerId, Arc<Peer>)> = {
+            let cached = shared.addr_to_peer.lock().unwrap().get(&src).copied();
+            let table = shared.table.read().unwrap();
+            match cached.and_then(|id| table.get(&id).map(|p| (id, p))) {
+                Some(hit) => vec![hit],
+                None => table.snapshot(),
+            }
         };
 
-        for idx in candidates {
-            let peer = &shared.peers[idx];
-
+        for (id, peer) in candidates {
             // Collect boringtun's outputs while holding the lock, then act after
             // releasing it (we must not .await while the Tunn mutex is held).
             let mut to_network: Vec<Vec<u8>> = Vec::new();
@@ -256,17 +254,17 @@ impl<T: TunQueue> Engine<T> {
                         }
                     }
                     TunnResult::WriteToTunnelV4(pkt, addr) => {
-                        if shared.router.is_allowed_for(addr.into(), idx) {
+                        if shared.table.read().unwrap().source_ok(addr.into(), &id) {
                             to_tun = Some(pkt.to_vec());
                         } else {
-                            warn!(peer = idx, %addr, "inbound source not in allowed_ips; dropping");
+                            warn!(%addr, "inbound source not in allowed_ips; dropping");
                         }
                     }
                     TunnResult::WriteToTunnelV6(pkt, addr) => {
-                        if shared.router.is_allowed_for(addr.into(), idx) {
+                        if shared.table.read().unwrap().source_ok(addr.into(), &id) {
                             to_tun = Some(pkt.to_vec());
                         } else {
-                            warn!(peer = idx, %addr, "inbound source not in allowed_ips; dropping");
+                            warn!(%addr, "inbound source not in allowed_ips; dropping");
                         }
                     }
                 }
@@ -280,16 +278,16 @@ impl<T: TunQueue> Engine<T> {
             // This peer owns the datagram. Learn/refresh its endpoint (roaming) and
             // cache the source -> peer mapping.
             if peer.set_endpoint(src) {
-                debug!(peer = idx, %src, "learned/updated peer endpoint");
+                debug!(peer = %PublicKey(id).to_base64(), %src, "learned/updated peer endpoint");
             }
-            shared.addr_to_peer.lock().unwrap().insert(src, idx);
+            shared.addr_to_peer.lock().unwrap().insert(src, id);
 
             for d in to_network {
                 let _ = shared.udp.send_to(&d, src).await;
             }
             if let Some(pkt) = to_tun {
                 if let Err(e) = shared.tun.send(&pkt).await {
-                    warn!(peer = idx, ?e, "tun write failed");
+                    warn!(?e, "tun write failed");
                 }
             }
             return;
@@ -300,14 +298,15 @@ impl<T: TunQueue> Engine<T> {
         let mut tick = interval(TIMER_TICK);
         loop {
             tick.tick().await;
-            for (idx, peer) in shared.peers.iter().enumerate() {
+            let peers = shared.table.read().unwrap().snapshot();
+            for (_id, peer) in peers {
                 let datagram = {
                     let mut buf = [0u8; MAX_PKT];
                     let mut tunn = peer.tunn.lock().unwrap();
                     match tunn.update_timers(&mut buf) {
                         TunnResult::WriteToNetwork(d) => Some(d.to_vec()),
                         TunnResult::Err(e) => {
-                            debug!(peer = idx, ?e, "timer tick error (likely connection reset)");
+                            debug!(?e, "timer tick error (likely connection reset)");
                             None
                         }
                         _ => None,
@@ -319,6 +318,42 @@ impl<T: TunQueue> Engine<T> {
                     }
                 }
             }
+        }
+    }
+}
+
+impl<T: TunQueue> EngineHandle<T> {
+    /// Add a peer (no-op if its public key is already present).
+    pub fn add_peer(&self, params: PeerParams) {
+        self.shared.table.write().unwrap().add(params);
+    }
+
+    /// Remove a peer by public key and forget any cached endpoint mapping for it.
+    pub fn remove_peer(&self, public_key: &PublicKey) {
+        let id = public_key.0;
+        self.shared.table.write().unwrap().remove(&id);
+        self.shared
+            .addr_to_peer
+            .lock()
+            .unwrap()
+            .retain(|_, v| *v != id);
+    }
+
+    /// Reconcile the peer set to exactly `desired`: add newcomers, remove absentees,
+    /// and leave existing peers (and their live sessions) untouched.
+    pub fn reconcile(&self, desired: Vec<PeerParams>) {
+        let desired_ids: std::collections::HashSet<PeerId> =
+            desired.iter().map(|p| p.public_key.0).collect();
+
+        let current = self.shared.table.read().unwrap().ids();
+        for id in current {
+            if !desired_ids.contains(&id) {
+                self.remove_peer(&PublicKey(id));
+            }
+        }
+        let mut table = self.shared.table.write().unwrap();
+        for p in desired {
+            table.add(p);
         }
     }
 }

@@ -138,3 +138,62 @@ async fn tunnel_carries_a_packet_end_to_end() {
 
     assert_eq!(received, packet, "packet must traverse the tunnel unchanged");
 }
+
+#[tokio::test]
+async fn peer_added_at_runtime_comes_up() {
+    // Same as above, but the server starts with NO peers and the client is added
+    // live through the EngineHandle after the engine is already running — the path
+    // the control plane uses when a device registers.
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(&server_priv, vec![], server_udp, server_tun);
+    let server_handle = server.handle();
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        client_udp,
+        client_tun,
+    );
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    // Register the client on the running server, as the control plane would.
+    server_handle.add_peer(PeerParams {
+        public_key: client_pub,
+        preshared_key: None,
+        endpoint: None,
+        allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+        persistent_keepalive: None,
+    });
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"added at runtime",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; runtime-added peer never came up")
+        .expect("server tun channel closed");
+
+    assert_eq!(received, packet);
+}
