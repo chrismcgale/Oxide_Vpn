@@ -38,6 +38,10 @@ ChaCha20 keystream (random nonce + padding), so deep-packet inspection can't fin
 or block it — for use where WireGuard is censored. Protocol mimicry (WG-in-TLS/QUIC) is
 the next tier.
 
+**Post-quantum (core):** an ML-KEM (Kyber) exchange derives a shared secret used as the
+WireGuard preshared key, so the tunnel is protected by x25519 *and* a quantum-resistant
+KEM — additive, so it can only strengthen security.
+
 Roadmap: desktop/mobile clients, and fleet ops (Postgres, provisioning, DoS hardening).
 
 ## Quick start
@@ -67,5 +71,6 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/control-client` | HTTP client for the control-plane API |
 | `crates/relay` | UDP relay for multihop entry servers |
 | `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
+| `crates/pq` | Post-quantum (ML-KEM) key agreement for a hybrid PSK |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
 | `crates/oxide-client` | Client daemon (static config or control-plane connect) |

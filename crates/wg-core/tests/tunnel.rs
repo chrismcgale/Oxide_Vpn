@@ -203,6 +203,71 @@ async fn tunnel_works_over_obfuscated_transport() {
 }
 
 #[tokio::test]
+async fn tunnel_secured_by_post_quantum_psk() {
+    // Post-quantum hybrid: an ML-KEM exchange derives a shared secret that both ends use
+    // as the WireGuard preshared key, layered on top of x25519. The tunnel must come up
+    // with the PQ-derived PSK on both sides (a mismatch would fail the handshake).
+    let (server_seed, server_pub_pq) = oxide_pq::generate();
+    let (ciphertext, client_shared) = oxide_pq::encapsulate(&server_pub_pq).unwrap();
+    let server_shared = oxide_pq::decapsulate(&server_seed, &ciphertext).unwrap();
+    assert_eq!(client_shared, server_shared, "KEM secrets must agree");
+    let psk = client_shared; // 32 bytes -> WireGuard PSK slot
+
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: Some(psk),
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::plain(server_udp),
+        server_tun,
+    );
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: Some(psk),
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::plain(client_udp),
+        client_tun,
+    );
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"post-quantum tunnel works",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; PQ-PSK tunnel never delivered")
+        .expect("server tun channel closed");
+    assert_eq!(received, packet);
+}
+
+#[tokio::test]
 async fn peer_added_at_runtime_comes_up() {
     // Same as above, but the server starts with NO peers and the client is added
     // live through the EngineHandle after the engine is already running — the path

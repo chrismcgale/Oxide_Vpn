@@ -8,6 +8,7 @@ members = [
     "crates/control-client",
     "crates/relay",
     "crates/obfs",
+    "crates/pq",
     "crates/oxide-serverd",
     "crates/oxide-client",
 ]

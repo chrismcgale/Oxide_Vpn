@@ -11,6 +11,9 @@ path = "src/lib.rs"
 # Exposes in-memory TUN test helpers for this crate's and downstream integration tests.
 test-util = []
 
+[dev-dependencies]
+oxide-pq = { path = "../pq" }
+
 [dependencies]
 oxide-common = { path = "../common" }
 oxide-obfs = { path = "../obfs" }
