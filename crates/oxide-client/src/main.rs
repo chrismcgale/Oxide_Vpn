@@ -24,7 +24,7 @@ use oxide_common::api::RegisterDeviceResponse;
 use oxide_common::{keys, Config, InterfaceConfig, SecretKey};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink};
-use oxide_wg_core::{Engine, PeerParams};
+use oxide_wg_core::{Engine, PeerParams, Transport};
 
 const IFNAME: &str = "oxide0";
 
@@ -257,6 +257,7 @@ fn resolve_registration(
         listen_port: None,
         mtu,
         dns: reg.dns.as_ref().and_then(|s| s.parse().ok()),
+        obfuscation_key: None,
     };
     let peer = PeerParams {
         public_key: reg.server.public_key,
@@ -355,7 +356,16 @@ async fn run_tunnel(
         .await
         .context("binding client UDP socket")?;
 
-    let engine = Engine::build(&iface.private_key, peers, udp, tun);
+    // Stealth mode: obfuscate the transport if a key is configured.
+    let transport = match &iface.obfuscation_key {
+        Some(k) => {
+            info!("stealth mode enabled (obfuscated transport)");
+            Transport::obfuscated(udp, *k.as_bytes())
+        }
+        None => Transport::plain(udp),
+    };
+
+    let engine = Engine::build(&iface.private_key, peers, transport, tun);
     info!("connecting");
 
     tokio::select! {

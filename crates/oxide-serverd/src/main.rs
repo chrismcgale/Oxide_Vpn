@@ -21,7 +21,7 @@ use oxide_common::api::PeerEntry;
 use oxide_common::{keys, Config, ControlPlaneConfig, SecretKey};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, nat, netlink, sysctl, Netlink};
-use oxide_wg_core::{Engine, EngineHandle, PeerParams, TunQueue};
+use oxide_wg_core::{Engine, EngineHandle, PeerParams, Transport, TunQueue};
 
 const IFNAME: &str = "oxide0";
 
@@ -109,11 +109,26 @@ async fn run(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("binding UDP :{listen_port}"))?;
     info!(port = listen_port, peers = cfg.peers.len(), "listening");
 
+    // Stealth mode: wrap the socket in the obfuscation transport if a key is configured.
+    let transport = match &cfg.interface.obfuscation_key {
+        Some(k) => {
+            info!("stealth mode enabled (obfuscated transport)");
+            Transport::obfuscated(udp, *k.as_bytes())
+        }
+        None => Transport::plain(udp),
+    };
+
     // Server-side handshake rate limit (DoS defense): cookie challenges engage above
     // this many handshake messages/second across all peers.
     const HANDSHAKE_LIMIT: u64 = 100;
     let peers = cfg.peers.iter().map(PeerParams::from_config).collect();
-    let engine = Engine::build_server(&cfg.interface.private_key, peers, udp, tun, HANDSHAKE_LIMIT);
+    let engine = Engine::build_server(
+        &cfg.interface.private_key,
+        peers,
+        transport,
+        tun,
+        HANDSHAKE_LIMIT,
+    );
 
     // If configured, pull the peer list from the control plane and keep it in sync.
     // The engine's peer table is runtime-mutable, so this reconciles live and the

@@ -31,7 +31,6 @@ use std::time::Duration;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::StaticSecret;
 use ipnet::IpNet;
-use tokio::net::UdpSocket;
 use tokio::time::interval;
 use tracing::{debug, trace, warn};
 
@@ -39,6 +38,7 @@ use oxide_common::{PublicKey, SecretKey, TunQueue};
 
 use crate::peer::Peer;
 use crate::table::{PeerId, PeerTable};
+use crate::transport::Transport;
 
 /// Max datagram/packet we buffer. Tunnel MTU is 1420; WireGuard adds ~32 bytes of
 /// overhead. 2048 leaves comfortable headroom without being wasteful.
@@ -75,7 +75,7 @@ impl PeerParams {
 }
 
 struct Shared<T: TunQueue> {
-    udp: UdpSocket,
+    transport: Transport,
     tun: T,
     table: RwLock<PeerTable>,
     /// Source-address -> peer id cache, learned as datagrams arrive. Lets the inbound
@@ -109,8 +109,19 @@ pub struct EngineHandle<T: TunQueue> {
 
 impl<T: TunQueue> Engine<T> {
     /// Build an engine from key material and an initial peer set (no DoS rate limiting).
-    pub fn build(private_key: &SecretKey, peers: Vec<PeerParams>, udp: UdpSocket, tun: T) -> Self {
-        Self::from_table(PeerTable::new(private_static(private_key)), peers, udp, tun)
+    /// `transport` is plain UDP or the obfuscated ("stealth") transport.
+    pub fn build(
+        private_key: &SecretKey,
+        peers: Vec<PeerParams>,
+        transport: Transport,
+        tun: T,
+    ) -> Self {
+        Self::from_table(
+            PeerTable::new(private_static(private_key)),
+            peers,
+            transport,
+            tun,
+        )
     }
 
     /// Build a server engine with a shared handshake rate limiter (DoS defense). `limit`
@@ -118,21 +129,26 @@ impl<T: TunQueue> Engine<T> {
     pub fn build_server(
         private_key: &SecretKey,
         peers: Vec<PeerParams>,
-        udp: UdpSocket,
+        transport: Transport,
         tun: T,
         handshake_limit: u64,
     ) -> Self {
         let table = PeerTable::new_rate_limited(private_static(private_key), handshake_limit);
-        Self::from_table(table, peers, udp, tun)
+        Self::from_table(table, peers, transport, tun)
     }
 
-    fn from_table(mut table: PeerTable, peers: Vec<PeerParams>, udp: UdpSocket, tun: T) -> Self {
+    fn from_table(
+        mut table: PeerTable,
+        peers: Vec<PeerParams>,
+        transport: Transport,
+        tun: T,
+    ) -> Self {
         for p in peers {
             table.add(p);
         }
         Engine {
             shared: Arc::new(Shared {
-                udp,
+                transport,
                 tun,
                 table: RwLock::new(table),
                 addr_to_peer: Mutex::new(HashMap::new()),
@@ -201,7 +217,7 @@ impl<T: TunQueue> Engine<T> {
             };
             if let Some(d) = datagram {
                 debug!(peer = %PublicKey(id).to_base64(), %endpoint, "initiating handshake");
-                let _ = shared.udp.send_to(&d, endpoint).await;
+                let _ = shared.transport.send_to(&d, endpoint).await;
             }
         }
     }
@@ -240,7 +256,7 @@ impl<T: TunQueue> Engine<T> {
 
             match (datagram, endpoint) {
                 (Some(d), Some(ep)) => {
-                    shared.udp.send_to(&d, ep).await?;
+                    shared.transport.send_to(&d, ep).await?;
                 }
                 (Some(_), None) => {
                     trace!("have datagram but no endpoint yet; dropping");
@@ -253,7 +269,7 @@ impl<T: TunQueue> Engine<T> {
     async fn inbound_loop(shared: Arc<Shared<T>>) -> std::io::Result<()> {
         let mut buf = [0u8; MAX_PKT];
         loop {
-            let (n, src) = shared.udp.recv_from(&mut buf).await?;
+            let (n, src) = shared.transport.recv_from(&mut buf).await?;
             let datagram = buf[..n].to_vec();
             Self::handle_incoming(&shared, datagram, src).await;
         }
@@ -326,7 +342,7 @@ impl<T: TunQueue> Engine<T> {
             shared.addr_to_peer.lock().unwrap().insert(src, id);
 
             for d in to_network {
-                let _ = shared.udp.send_to(&d, src).await;
+                let _ = shared.transport.send_to(&d, src).await;
             }
             if let Some(pkt) = to_tun {
                 if let Err(e) = shared.tun.send(&pkt).await {
@@ -357,7 +373,7 @@ impl<T: TunQueue> Engine<T> {
                 };
                 if let Some(d) = datagram {
                     if let Some(ep) = peer.endpoint() {
-                        let _ = shared.udp.send_to(&d, ep).await;
+                        let _ = shared.transport.send_to(&d, ep).await;
                     }
                 }
             }

@@ -86,6 +86,13 @@ pub struct InterfaceConfig {
     /// DNS server to install while the tunnel is up (client-side; used from M4 on).
     #[serde(default)]
     pub dns: Option<IpAddr>,
+
+    /// Stealth mode: a 32-byte pre-shared obfuscation key (base64). When set, all
+    /// WireGuard datagrams are wrapped by the obfuscation layer so DPI can't fingerprint
+    /// them. Client and server must share the same key. Reduces effective MTU — lower
+    /// `mtu` (e.g. to 1380) when using it.
+    #[serde(default)]
+    pub obfuscation_key: Option<SecretKey>,
 }
 
 impl InterfaceConfig {

@@ -15,7 +15,7 @@ use oxide_control_client::ControlClient;
 use oxide_control_plane::{add_server, db, serve, AppState, NewServer};
 use oxide_relay::Relay;
 use oxide_wg_core::testutil::{ipv4_packet, MockTun};
-use oxide_wg_core::{Engine, PeerParams};
+use oxide_wg_core::{Engine, PeerParams, Transport};
 
 fn temp_db_path() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -95,7 +95,7 @@ async fn multihop_client_relay_exit_carries_a_packet() {
 
     // --- exit engine, reconciled from the control plane ---
     let (exit_tun, _exit_inject, mut exit_capture) = MockTun::pair();
-    let exit_engine = Engine::build(&exit_priv, vec![], exit_udp, exit_tun);
+    let exit_engine = Engine::build(&exit_priv, vec![], Transport::plain(exit_udp), exit_tun);
     let exit_handle = exit_engine.handle();
     tokio::spawn(exit_engine.run());
     let peers = cc.fetch_peers("exit", &exit_token).await.unwrap();
@@ -134,7 +134,7 @@ async fn multihop_client_relay_exit_carries_a_packet() {
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
             persistent_keepalive: Some(5),
         }],
-        client_udp,
+        Transport::plain(client_udp),
         client_tun,
     );
     tokio::spawn(client_engine.run());

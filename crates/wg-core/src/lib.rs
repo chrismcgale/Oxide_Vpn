@@ -12,11 +12,13 @@ pub mod engine;
 pub mod peer;
 pub mod router;
 pub mod table;
+pub mod transport;
 
 #[cfg(feature = "test-util")]
 pub mod testutil;
 
 pub use engine::{Engine, EngineHandle, EngineStats, PeerParams};
 pub use table::PeerId;
+pub use transport::Transport;
 
 pub use oxide_common::{PublicKey, SecretKey, TunQueue};

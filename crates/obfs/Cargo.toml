@@ -1,0 +1,12 @@
+[package]
+name = "oxide-obfs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oxide_obfs"
+path = "src/lib.rs"
+
+[dependencies]
+chacha20 = "0.9"
+rand_core = { workspace = true }

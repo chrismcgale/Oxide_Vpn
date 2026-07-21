@@ -13,6 +13,7 @@ test-util = []
 
 [dependencies]
 oxide-common = { path = "../common" }
+oxide-obfs = { path = "../obfs" }
 boringtun = { workspace = true }
 x25519-dalek = { workspace = true }
 tokio = { workspace = true }

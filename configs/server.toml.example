@@ -11,6 +11,11 @@ address = "10.8.0.1/24"
 listen_port = 51820
 # Optional; defaults to 1420.
 mtu = 1420
+# Stealth mode (censorship resistance): a shared 32-byte obfuscation key (base64).
+# When set, WireGuard traffic is wrapped so DPI can't fingerprint it. The client must
+# use the SAME key. Generate one with `oxide-serverd genkey`. Lower `mtu` (~1380) when
+# enabled, since obfuscation adds overhead.
+# obfuscation_key = "BASE64_32_BYTE_KEY"
 
 # Optional: enable full-tunnel internet egress via NAT masquerade.
 # Omit this whole section for a tunnel-only (no internet egress) server.

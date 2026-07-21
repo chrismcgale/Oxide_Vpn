@@ -56,6 +56,8 @@ cargo test -p oxide-control-plane --test api            # account/device/IP/peer
 cargo test -p oxide-serverd --test control_plane_flow   # CP -> reconcile -> tunnel (capstone)
 cargo test -p oxide-serverd --test multihop_flow        # client -> entry relay -> exit (multihop capstone)
 cargo test -p oxide-relay                               # UDP relay forwarding + flow isolation
+cargo test -p oxide-obfs                                # obfuscation codec
+cargo test -p oxide-wg-core --test tunnel tunnel_works_over_obfuscated_transport  # stealth capstone
 ```
 
 Fastest full (privileged) test — two network namespaces on one host, real handshake +
@@ -91,6 +93,7 @@ Cargo workspace, `crates/`:
 - **`control-plane`** — axum + sqlx(SQLite) service: accounts (anonymous numbers), devices (pubkey + assigned tunnel IP), servers (with location + capacity), IP allocation, **load-based server selection** (`GET /v1/servers/best`) fed by **server heartbeats**. Never depends on `wg-core`. `add_server` CLI + `serve`.
 - **`control-client`** — thin reqwest client for the control-plane API, shared by both daemons.
 - **`relay`** — a pure-tokio UDP relay used by **multihop** entry servers: forwards a client's WireGuard ciphertext to the exit server (per-client upstream flows), so no single server sees both the client's IP and its destination. No root; unit-tested over loopback.
+- **`obfs`** — **stealth mode** codec: wraps each datagram as `[nonce][ChaCha20(key,nonce) XOR ([len][payload][random pad])]` so DPI can't fingerprint WireGuard (no fixed header/sizes). Pure; unit-tested. Used by `wg-core`'s `Transport::Obfuscated`. (Protocol *mimicry* — WG-in-TLS/QUIC — is the next stealth tier.)
 - **`oxide-serverd` / `oxide-client`** — thin daemons: config → engine → net-linux; Ctrl-C tears down host state. Server optionally polls the control plane and reconciles peers live; client can `connect` via the control plane (register device → assigned IP → tunnel).
 
 Control-plane <-> server sync: the server **polls** `GET /v1/internal/servers/{id}/peers` (token-authed) and reconciles into the live engine. The data plane keeps peer state in RAM only; the DB lives solely in the control plane.
@@ -112,6 +115,11 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 - **No-logs / RAM-only (audited 2026-07-21):** the data plane (`wg-core`, `oxide-serverd`, `net-linux`) performs **no disk writes** — peers live in RAM only. The engine logs no client PII at the default level (pubkeys/endpoints are `debug`-only). The control-plane DB stores only routing essentials (account numbers, device pubkeys, IP assignments) — no traffic/activity logs. Client-side disk writes are limited to the device key (0600) and the resolv.conf swap, both intentional and local.
 
 ## Changelog / Decisions (newest first)
+
+- **2026-07-21 — Stealth mode (signature feature).** New `obfs` crate (ChaCha20 obfuscation codec) + `wg-core` `Transport` enum (`Plain` | `Obfuscated`). The engine now sends/receives over `Transport` instead of a raw `UdpSocket`; with an `obfuscation_key` set (config field, shared client/server), every datagram is wrapped so there's no WireGuard fingerprint on the wire and undecodable probes are silently dropped. `Engine::build`/`build_server` take a `Transport`. Verified without root: codec tests + a capstone that runs a real WireGuard tunnel entirely over the obfuscated transport. 34 tests, clippy + fmt clean.
+  - Decision: **obfs4/Shadowsocks-style keystream obfuscation** (defeats fingerprint-based blocking, which is how WG gets blocked), not protocol mimicry yet. Full TLS/QUIC mimicry is the next stealth tier. It's obfuscation, not AEAD — the real security is the WireGuard layer underneath.
+  - Decision: `Transport` as an enum (not a generic) to avoid threading another type parameter through the engine.
+  - Note: obfuscation adds ~14+padding bytes/packet — lower the tunnel MTU (~1380) when using it. Obfs key is a 32-byte base64 (generate with `oxide-serverd genkey`). Control-plane distribution of the obfs key (so `connect` can use stealth) is the immediate follow-up; static config works now.
 
 - **2026-07-21 — Hardening pass 2: netlink + IPv6.** `net-linux` link/addr/route now go through **rtnetlink** (real netlink) instead of `ip` shell-outs — a `Netlink` handle (async, cloneable). `bring_up_interface` is async, returns the link index, and assigns both `address` and the new `address6`. **IPv6 inside the tunnel** works: dual-stack tunnel addresses and `::/0` full-tunnel routing (`::/1` + `8000::/1`). The netns test now pings both IPv4 and IPv6 across the tunnel (CI verifies). 29 tests, clippy + fmt clean.
   - Decision: migrate **mutations** to netlink; keep the single default-route *read* as `ip route show` (reconstructing it from raw netlink dumps is disproportionately fiddly for a low-risk read). nftables (NAT/kill switch) still shells out to `nft` — nft-via-netlink is a separate follow-up.

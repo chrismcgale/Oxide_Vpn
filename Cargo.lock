@@ -1284,6 +1284,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-obfs"
+version = "0.1.0"
+dependencies = [
+ "chacha20 0.9.1",
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "oxide-relay"
 version = "0.1.0"
 dependencies = [
@@ -1316,6 +1324,7 @@ dependencies = [
  "boringtun",
  "ipnet",
  "oxide-common",
+ "oxide-obfs",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

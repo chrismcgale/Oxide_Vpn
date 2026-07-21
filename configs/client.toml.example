@@ -14,6 +14,9 @@ mtu = 1420
 # restored on disconnect). Omit to leave DNS untouched.
 dns = "10.8.0.1"
 
+# Stealth mode (censorship resistance): must match the server's obfuscation_key.
+# obfuscation_key = "BASE64_32_BYTE_KEY"
+
 # Kill switch is a runtime flag, not a config field:
 #   sudo oxide-client up --config client.toml --kill-switch
 # It blocks all non-tunnel traffic while connected, so nothing leaks if the tunnel drops.

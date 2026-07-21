@@ -33,6 +33,11 @@ but sends it through an *entry* server that relays the (still-encrypted) traffic
 single server sees both your IP and your destination. Done the WireGuard-native way (the
 entry is a UDP relay), not onion encryption, so the tunnel stays single-encryption.
 
+**Stealth mode (v1):** an optional obfuscation layer wraps every WireGuard datagram in a
+ChaCha20 keystream (random nonce + padding), so deep-packet inspection can't fingerprint
+or block it — for use where WireGuard is censored. Protocol mimicry (WG-in-TLS/QUIC) is
+the next tier.
+
 Roadmap: desktop/mobile clients, and fleet ops (Postgres, provisioning, DoS hardening).
 
 ## Quick start
@@ -61,5 +66,6 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/control-plane` | Accounts/devices/servers API, selection, multihop (axum + SQLite) |
 | `crates/control-client` | HTTP client for the control-plane API |
 | `crates/relay` | UDP relay for multihop entry servers |
+| `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
 | `crates/oxide-client` | Client daemon (static config or control-plane connect) |

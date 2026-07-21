@@ -18,10 +18,11 @@ service can't touch.
 
 Ranked by differentiation × real-world impact. All leverage owning the stack.
 
-1. **Stealth mode / censorship resistance.** Make WG traffic look like HTTPS/QUIC so DPI
-   (China/Iran/Russia) can't detect-and-block it. Lives in the `relay` layer: the entry
-   speaks an obfuscated transport (Shadowsocks-style / obfs4 / WG-in-QUIC). Biggest
-   real-world impact.
+1. **Stealth mode / censorship resistance.** — *v1 DONE:* `obfs` crate (ChaCha20 keystream
+   obfuscation) + `wg-core` `Transport::Obfuscated`; a shared `obfuscation_key` wraps every
+   datagram so DPI can't fingerprint WireGuard. *Next tiers:* protocol **mimicry**
+   (WG-in-TLS/QUIC so it looks like real HTTPS), control-plane distribution of the obfs key
+   (so `connect`/multihop use stealth), and obfuscation in the `relay`.
 2. **Traffic-analysis defense (DAITA-style).** Padding, constant-rate cover traffic, and
    timing normalization in `wg-core` to defeat ML traffic fingerprinting — so even the
    multihop entry sees only shaped volume. Cutting-edge.

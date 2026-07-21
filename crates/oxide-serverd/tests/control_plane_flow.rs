@@ -19,7 +19,7 @@ use oxide_common::keys::{generate_secret, public_from_secret};
 use oxide_control_client::ControlClient;
 use oxide_control_plane::{add_server, db, serve, AppState, NewServer};
 use oxide_wg_core::testutil::{ipv4_packet, MockTun};
-use oxide_wg_core::{Engine, PeerParams};
+use oxide_wg_core::{Engine, PeerParams, Transport};
 
 fn temp_db_path() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -97,7 +97,12 @@ async fn control_plane_provisions_a_working_tunnel() {
     let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_udp.local_addr().unwrap();
     let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
-    let server_engine = Engine::build(&server_priv, vec![], server_udp, server_tun);
+    let server_engine = Engine::build(
+        &server_priv,
+        vec![],
+        Transport::plain(server_udp),
+        server_tun,
+    );
     let handle = server_engine.handle();
     tokio::spawn(server_engine.run());
 
@@ -116,7 +121,7 @@ async fn control_plane_provisions_a_working_tunnel() {
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
             persistent_keepalive: Some(5),
         }],
-        client_udp,
+        Transport::plain(client_udp),
         client_tun,
     );
     tokio::spawn(client_engine.run());
