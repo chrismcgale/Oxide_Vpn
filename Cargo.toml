@@ -19,7 +19,7 @@ members = [
 
 # Shared dependency versions. Members opt in via `dep.workspace = true`.
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
 boringtun = "0.7"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"

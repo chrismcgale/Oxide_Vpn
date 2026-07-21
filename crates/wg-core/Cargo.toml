@@ -17,6 +17,7 @@ oxide-pq = { path = "../pq" }
 [dependencies]
 oxide-common = { path = "../common" }
 oxide-obfs = { path = "../obfs" }
+oxide-mimicry = { path = "../mimicry" }
 boringtun = { workspace = true }
 x25519-dalek = { workspace = true }
 tokio = { workspace = true }

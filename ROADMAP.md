@@ -18,11 +18,11 @@ service can't touch.
 
 Ranked by differentiation × real-world impact. All leverage owning the stack.
 
-1. **Stealth mode / censorship resistance.** — *v1 DONE:* `obfs` crate (ChaCha20 keystream
-   obfuscation) + `wg-core` `Transport::Obfuscated`; a shared `obfuscation_key` wraps every
-   datagram so DPI can't fingerprint WireGuard. *Next tiers:* protocol **mimicry**
-   (WG-in-TLS/QUIC so it looks like real HTTPS), control-plane distribution of the obfs key
-   (so `connect`/multihop use stealth), and obfuscation in the `relay`.
+1. **Stealth mode / censorship resistance.** — *tier 1 DONE:* `obfs` (ChaCha20 keystream)
+   + `Transport::Obfuscated`, distributed via the control plane. *tier 2 DONE:* `mimicry`
+   crate (TLS 1.3) + `Transport::Mimic` — the flow looks like an HTTPS session over TCP.
+   *Next:* config/CP selector so daemons choose `mimic`; QUIC mimicry (UDP, HTTP/3-like);
+   obfuscation/mimicry in the `relay`.
 2. **Traffic-analysis defense (DAITA-style).** — *size dimension DONE:* obfs pads every
    datagram up to size buckets, so packet sizes normalize into an anonymity set. *Next:*
    constant-rate cover traffic + timing normalization in `wg-core`, so even the multihop

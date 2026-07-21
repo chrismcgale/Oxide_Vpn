@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use oxide_common::keys::{generate_secret, public_from_secret};
 use oxide_common::TunQueue;
-use oxide_wg_core::{Engine, PeerParams, Transport};
+use oxide_wg_core::{Engine, MimicTransport, PeerParams, Transport};
 
 /// In-memory stand-in for a TUN device. `recv` yields packets the test injected
 /// (as if the OS wanted to send them out); `send` captures packets the engine wrote
@@ -263,6 +263,69 @@ async fn tunnel_secured_by_post_quantum_psk() {
     let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
         .await
         .expect("timed out; PQ-PSK tunnel never delivered")
+        .expect("server tun channel closed");
+    assert_eq!(received, packet);
+}
+
+#[tokio::test]
+async fn tunnel_works_over_tls_mimicry() {
+    // Protocol mimicry (stealth tier 2): the same real WireGuard handshake + data path,
+    // but carried over a TCP flow that looks like a TLS/HTTPS session. On the wire a
+    // censor sees a ClientHello with an SNI, a ServerHello, and application_data records.
+    let key = [0x33u8; 32];
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    // Server listens (mimic TLS); client connects to its address.
+    let server_mimic = MimicTransport::bind("127.0.0.1:0".parse().unwrap(), key)
+        .await
+        .unwrap();
+    let server_addr = server_mimic.local_addr().unwrap();
+    let client_mimic = MimicTransport::connect(server_addr, key).await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::mimic(server_mimic),
+        server_tun,
+    );
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::mimic(client_mimic),
+        client_tun,
+    );
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"tunnel disguised as https",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; TLS-mimicry tunnel never delivered")
         .expect("server tun channel closed");
     assert_eq!(received, packet);
 }

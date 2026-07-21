@@ -96,7 +96,10 @@ fn common_extensions(sni: Option<&str>) -> Vec<u8> {
     // supported_groups: x25519, secp256r1
     exts.extend_from_slice(&extension(0x000a, &u16_len(&[0x00, 0x1d, 0x00, 0x17])));
     // signature_algorithms
-    exts.extend_from_slice(&extension(0x000d, &u16_len(&[0x04, 0x03, 0x08, 0x04, 0x04, 0x01])));
+    exts.extend_from_slice(&extension(
+        0x000d,
+        &u16_len(&[0x04, 0x03, 0x08, 0x04, 0x04, 0x01]),
+    ));
     // supported_versions: TLS 1.3
     exts.extend_from_slice(&extension(0x002b, &u8_len(&[0x03, 0x04])));
     // key_share: x25519 with a random public value
@@ -156,7 +159,11 @@ pub fn server_hello() -> Vec<u8> {
     let mut out = record(REC_HANDSHAKE, [0x03, 0x03], &handshake);
     out.extend_from_slice(&record(REC_CHANGE_CIPHER_SPEC, [0x03, 0x03], &[0x01]));
     // Encrypted-looking cert/finished as application_data.
-    out.extend_from_slice(&record(REC_APPLICATION_DATA, [0x03, 0x03], &rand_bytes(512)));
+    out.extend_from_slice(&record(
+        REC_APPLICATION_DATA,
+        [0x03, 0x03],
+        &rand_bytes(512),
+    ));
     out
 }
 
@@ -219,7 +226,7 @@ mod tests {
         let sh = server_hello();
         assert_eq!(sh[0], REC_HANDSHAKE);
         assert_eq!(sh[5], 0x02); // ServerHello
-        // Somewhere later there is a change_cipher_spec and application_data record.
+                                 // Somewhere later there is a change_cipher_spec and application_data record.
         let (n1, _, _) = read_record(&sh).unwrap();
         let (_n2, ct2, _) = read_record(&sh[n1..]).unwrap();
         assert_eq!(ct2, REC_CHANGE_CIPHER_SPEC);

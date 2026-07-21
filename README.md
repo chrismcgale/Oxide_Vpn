@@ -71,6 +71,7 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/control-client` | HTTP client for the control-plane API |
 | `crates/relay` | UDP relay for multihop entry servers |
 | `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
+| `crates/mimicry` | TLS-1.3 protocol mimicry (traffic looks like HTTPS) |
 | `crates/pq` | Post-quantum (ML-KEM) key agreement for a hybrid PSK |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
 | `crates/client-core` | Shared client tunnel logic (resolve + run) |

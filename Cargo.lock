@@ -1652,6 +1652,7 @@ dependencies = [
  "boringtun",
  "ipnet",
  "oxide-common",
+ "oxide-mimicry",
  "oxide-obfs",
  "oxide-pq",
  "thiserror 2.0.19",

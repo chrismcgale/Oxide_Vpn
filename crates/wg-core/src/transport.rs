@@ -11,6 +11,8 @@ use tokio::net::UdpSocket;
 
 use oxide_obfs::{deobfuscate, obfuscate};
 
+use crate::mimic::MimicTransport;
+
 /// Scratch buffer for an obfuscated datagram (WireGuard max + obfs overhead).
 const OBFS_BUF: usize = 2048;
 
@@ -19,6 +21,8 @@ pub enum Transport {
     Plain(UdpSocket),
     /// Obfuscated UDP: each datagram is wrapped so DPI can't fingerprint it.
     Obfuscated { socket: UdpSocket, key: [u8; 32] },
+    /// TLS-mimicry over TCP: the flow looks like an HTTPS session ("stealth tier 2").
+    Mimic(MimicTransport),
 }
 
 impl Transport {
@@ -30,6 +34,10 @@ impl Transport {
         Transport::Obfuscated { socket, key }
     }
 
+    pub fn mimic(transport: MimicTransport) -> Self {
+        Transport::Mimic(transport)
+    }
+
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         match self {
             Transport::Plain(s) => s.send_to(buf, addr).await,
@@ -38,6 +46,7 @@ impl Transport {
                 socket.send_to(&framed, addr).await?;
                 Ok(buf.len())
             }
+            Transport::Mimic(m) => m.send_to(buf, addr).await,
         }
     }
 
@@ -57,6 +66,7 @@ impl Transport {
                     }
                 }
             }
+            Transport::Mimic(m) => m.recv_from(buf).await,
         }
     }
 }

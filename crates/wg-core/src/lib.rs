@@ -9,6 +9,7 @@
 //! remove them on a live server.
 
 pub mod engine;
+pub mod mimic;
 pub mod peer;
 pub mod router;
 pub mod table;
@@ -18,6 +19,7 @@ pub mod transport;
 pub mod testutil;
 
 pub use engine::{Engine, EngineHandle, EngineStats, PeerParams};
+pub use mimic::MimicTransport;
 pub use table::PeerId;
 pub use transport::Transport;
 
