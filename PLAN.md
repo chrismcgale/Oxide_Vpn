@@ -1,0 +1,285 @@
+# Oxide VPN — Development Plan & Runbook
+
+> **What this file is.** The forward-looking execution plan: where the project is, how we
+> work, and ~6 months of ambitious development laid out at an agent's pace (fast — think in
+> *sprints of hours*, not weeks). It complements, and does not duplicate:
+> - `README.md` — the pitch and status for humans.
+> - `ROADMAP.md` — the high-level vision and signature bets.
+> - `.claude/skills/oxide-vpn/SKILL.md` — the **operational** runbook (Run · Debug ·
+>   Architecture · Gotchas · Changelog). Read that to *build/run/debug*; read this to know
+>   *what to build next and why*.
+>
+> **How to resume after a context clear:** read this file top-to-bottom, then
+> `SKILL.md`'s Architecture + Changelog, then open the current Wave and take the next
+> unchecked sprint. Keep the checkboxes here in sync as you land work.
+
+---
+
+## Part 0 — Current state (2026-07-21)
+
+A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
+Linux-first, as a 14-crate Cargo workspace. ~70 tests, all green, all verified **without
+root** (mock TUN + loopback UDP + in-process control plane); the live-kernel path is
+verified by the CI netns job.
+
+**Done (M1–M4 + signature features):**
+- **Data plane** (`wg-core`): boringtun engine, 3 tokio tasks, runtime-mutable peer table
+  (`EngineHandle`), allowed-IPs router, `Transport` enum abstraction.
+- **Control plane** (`control-plane`/`control-client`): anonymous account numbers, device
+  registration + IP allocation, server list with location/capacity + heartbeat load,
+  least-loaded selection, `/metrics` (Prometheus). axum + sqlx/SQLite.
+- **Privacy**: kill switch + DNS leak protection (`net-linux`), audited no-logs/RAM-only
+  data plane.
+- **Multihop** (`relay`): WireGuard-native — entry relays exit-keyed ciphertext; no single
+  server sees both ends.
+- **Stealth** (`obfs` + `mimicry`): tier 1 ChaCha20 obfuscation + size-bucket padding; tier
+  2 protocol mimicry — TLS-over-TCP (`Transport::Mimic`) and QUIC-over-UDP
+  (`Transport::QuicMimic`); tier 3 **active-probe resistance** — the QUIC Initial is
+  authenticated (timestamp + nonce + keyed BLAKE2 MAC), forged/stale/replayed Initials
+  dropped in silence.
+- **Post-quantum** (`pq`): ML-KEM-768 → WireGuard PSK, hybrid, single-hop + multihop.
+- **Mesh hybrid**: control-plane-coordinated private WireGuard P2P overlay of the account's
+  own devices (`resolve_mesh`, `oxide-client mesh`); composes with a full-tunnel exit.
+- **Client UX**: `client-core` (shared tunnel logic) → `oxide-agentd` (root agent, Unix
+  socket API) → `oxide-tui` (unprivileged ratatui).
+- **Hardening/CI**: RateLimiter DoS defense, per-IP auth limiting, rtnetlink, IPv6-in-tunnel,
+  SIGTERM, MSS clamping; CI runs fmt + clippy `-D` + test + cargo-deny + a privileged netns
+  job.
+
+**Known gaps / debt (fold into the waves below):**
+- No config/control-plane **transport selector** — the stealth transports exist but daemons
+  can't yet be told which to use (obfs key is wired; mimic/quic/daita are not).
+- Peer demux is an O(peers) source-address fallback, not a receiver-index table.
+- `nft`/`sysctl` still shell out; DNS backend isn't `systemd-resolved`-aware.
+- WG **transport** is IPv4-only (IPv6 *inside* the tunnel works).
+- SQLite single-node; no Postgres/HA; no provisioning automation.
+- No desktop/mobile/cross-platform clients yet.
+
+---
+
+## Part 1 — How we work (definition of done)
+
+Every landed increment must, before commit:
+1. **Build clean**, `cargo clippy --workspace --all-targets` with **zero** warnings.
+2. **Tests green**, `cargo test --workspace`; new behavior gets new tests, verified
+   **without root** (mock TUN + loopback + in-process control plane; pure builders
+   unit-tested). Root-only paths get a netns/CI test, not a local run.
+3. **`cargo fmt --all`** applied.
+4. **Docs updated in the same change**: `SKILL.md` Changelog entry (newest first) +
+   the relevant section; update `ROADMAP.md`/`README.md`/this `PLAN.md` checkboxes; update
+   the auto-memory pointer when the architecture shifts.
+5. **One cohesive commit** with a descriptive body. Push/PR **only when the user asks**.
+   Commit trailer: `Co-Authored-By: Claude ...`.
+
+Design discipline carried over and to keep: **vendor/read a crate's real API from source
+before writing against it** (saved us on boringtun, rtnetlink, ml-kem, ratatui). **Build on
+established crypto**, never invent primitives. **Silence is a feature** — undecodable/forged
+traffic is dropped without response (probe resistance). **The data plane keeps nothing on
+disk.**
+
+---
+
+## Part 2 — The 6-month plan
+
+Four **waves**. Wave 1 is the agreed moonshots, in order. Later waves are ordered by
+leverage but can be re-prioritized. Each sprint is a self-contained, committable increment.
+
+### WAVE 1 — Signature moonshots (agreed order)
+
+#### Sprint 1A — DAITA: traffic-analysis defense  ⟶ *start here*
+**Goal.** A passive/ML observer (and even our own multihop entry) sees only shaped,
+contentless volume — constant packet **rate**, constant **size**, with **cover traffic**
+filling idle slots. Finishes the traffic-analysis story begun by obfs (which already did the
+*size* dimension via buckets).
+
+**Design.**
+- New `shaper` module (in `wg-core`, or a small `daita` crate). **Pure** decision logic,
+  unit-tested: given a slot tick and a queue of pending real datagrams, emit exactly one
+  cell per slot — a real datagram if queued, else a **cover** cell — every cell padded to a
+  fixed `cell_size`.
+- **Cover cells** must be indistinguishable on the wire but droppable by the peer. Add a
+  1-byte frame **type** to the stealth payload (`REAL` vs `COVER`) *inside* the obfs frame,
+  so cover is recognized and dropped **before boringtun** ever sees it. Cover carries random
+  padding to `cell_size`.
+- **Integration.** The engine's outbound path gains an optional shaper: real encapsulated
+  packets enqueue instead of sending immediately; a shaper task drains at the slot cadence.
+  A `Transport`-level or engine-level hook — decide during implementation which keeps the
+  peer-generic engine cleanest (client single-peer, fixed endpoint, is the v1 target).
+- **Scope v1:** client→server egress shaping, one peer. Document server-side and
+  bidirectional shaping, and adaptive/learned defenses (maybenot-style), as Sprint 4A.
+
+**Acceptance.** Shaper unit tests (constant cadence; cover fills idle slots; all cells one
+size). Transport test: cover cells dropped, real payloads still delivered. Capstone: a real
+WireGuard tunnel with DAITA on, packet crosses, wire trace shows constant-size cells at a
+steady rate. **Honesty in docs:** this is a padding+rate defense with a real
+bandwidth/latency cost, not a learned framework; quantify overhead.
+
+#### Sprint 1B — Undetectable server (decoy-forwarding)
+**Goal.** The server is byte-for-byte indistinguishable from an ordinary web server. Today
+unauthenticated first-contact is *silently dropped* (port looks dead). Instead, **proxy it
+to a real TLS/QUIC backend** so the port looks alive and boring — even the *absence* of a
+normal response can't be a probe signal. Completes censorship-resistance on top of the
+authenticated Initial (Sprint tier 3).
+
+**Design.**
+- Server keeps per-source first-contact state. First datagram that **fails** Initial auth →
+  don't drop; splice the flow to a configured `decoy_backend` (a real HTTP/3 or HTTPS
+  endpoint — ideally a real site co-hosted on the box) and relay both directions
+  transparently (reuse `relay`-crate patterns; UDP for QUIC, TCP for the TLS-mimic path).
+- Authenticated flows tunnel as normal. Unauthenticated flows are proxied for their lifetime.
+- Config: `decoy_backend = "host:port"`; docs on picking a plausible backend and, ideally,
+  actually serving a real site there.
+
+**Acceptance.** Test: a bogus/forged Initial is forwarded to a stub backend and the backend's
+response returns to the prober; a genuine authenticated Initial still tunnels; both concurrently
+(loopback backend, no root). Docs: threat model — strongest when the decoy is a real service
+you host; note timing/behavioral caveats.
+
+#### Sprint 1C — True onion multihop
+**Goal.** Upgrade multihop from "entry blindly relays exit-keyed ciphertext" to **nested
+per-hop encryption**: each relay peels exactly one layer and knows only its previous and next
+hop — never both your IP and your destination, even if a single hop is compromised.
+
+**Design fork (decide at implementation — see Part 4):**
+- **(a) Nested WireGuard** ("WG-in-WG-in-WG"): the client runs a WG session to the entry,
+  carrying inside it a WG session to the middle, carrying a WG session to the exit. Each hop
+  terminates one tunnel and forwards the inner ciphertext. Reuses audited crypto; the engine
+  is peer-generic so it's feasible; cost is 3× handshakes + per-hop tunnel state.
+- **(b) Tor-style onion cells**: per-hop symmetric keys from ephemeral X25519 ECDH
+  (distributed via the control plane), payload wrapped in nested ChaCha20-Poly1305 layers;
+  each hop peels one. Lighter on the wire; uses **only established primitives** (no novel
+  crypto), but it's a new protocol to get right (replay, key rotation, teardown).
+- Control plane: path selection (entry/middle/exit, distinct operators), per-hop key
+  material, circuit lifecycle.
+
+**Acceptance.** A 3-hop circuit where a packet goes client→entry→middle→exit and back; a
+capstone with 3 in-process hops on loopback asserts each hop sees only its neighbors (e.g.
+the exit never learns the client's address; the entry never learns the destination). Likely
+split into sub-sprints: 1C-1 circuit crypto + key agreement (pure, unit-tested); 1C-2
+per-hop forwarding; 1C-3 control-plane path selection + client `--onion`.
+
+#### Sprint 1D — Verifiable no-logs
+**Goal.** Cryptographically **prove** the no-logs posture instead of asserting it. Layered;
+ship the tractable layers, document hardware attestation as a stretch.
+- **1D-1 seccomp-enforced no-logs**: run `oxide-serverd` under a public, auditable seccomp
+  profile that **denies disk writes** on the data path — so the server *cannot* log even if
+  compromised. A test proves a disk write is killed. This is the strongest concrete,
+  verifiable deliverable — enforcement, not a promise.
+- **1D-2 reproducible builds + signed build manifest**: pin toolchain, `--locked`,
+  document/verify a byte-reproducible server binary; `oxide-serverd` exposes a
+  release-key-**signed** manifest (binary hash + git commit + build time); the client
+  verifies it at connect and can refuse unknown builds.
+- **1D-3 transparency log**: publish an append-only signed log of deployed binary hashes +
+  config digests; clients check the server they reached runs a logged, audited build.
+- **1D-4 (stretch) remote attestation**: TPM/DICE or SGX binding the *running process* to the
+  logged hash. Infra-heavy; scope later.
+
+**Acceptance.** Seccomp profile + a test that a write() to disk is denied/killed; a
+reproducible-build script emitting a stable hash; a signed-manifest endpoint + client-side
+signature verification; a minimal transparency-log format + verifier. No root needed for the
+crypto/format parts; seccomp test runs in CI.
+
+### WAVE 2 — Productization & scale (make it a real product)
+
+- [ ] **2A Transport selector** — config + control-plane field so daemons choose
+  `plain|obfs|mimic|quic|daita`, distributed like the obfs key. *Small, high-leverage —
+  unblocks actually using every stealth transport. Consider pulling before/after 1B.*
+- [ ] **2B Postgres backend** — control plane on Postgres (already designed for: it's a
+  connection-string + dialect change). Enables multi-node.
+- [ ] **2C HA & lifecycle** — control-plane redundancy, client re-selection on server death,
+  server-token rotation, versioned zero-downtime API.
+- [ ] **2D Provisioning automation** — stand up a server (keys, config, control-plane
+  registration, NAT/sysctl) from one command / IaC; **CAP_NET_ADMIN non-root deploy**.
+- [ ] **2E Receiver-index peer demux** — replace the O(peers) source-addr fallback for busy
+  servers.
+- [ ] **2F net-linux polish** — nftables via netlink lib (drop `nft` shell-out);
+  `systemd-resolved`-aware DNS backend; idempotent teardown/crash recovery.
+- [ ] **2G WG-over-IPv6 transport** + control-plane v6 IP allocation.
+- [ ] **2H Observability** — dashboards/alerting on `/metrics`; PSK/DAITA/onion counters.
+
+### WAVE 3 — Clients & reach
+
+- [ ] **3A Desktop GUI** — a graphical client (e.g. Tauri) over the agent Unix socket; the
+  agent is already the privileged helper. Server browser, connect toggle, live stats.
+- [ ] **3B Cross-platform data plane** — `net-macos` / `net-windows` siblings to `net-linux`
+  (the trait split was designed for this); `wg-core` is already OS-agnostic.
+- [ ] **3C Mobile** — expose `wg-core` as a library via UniFFI; integrate with
+  iOS NetworkExtension / Android VpnService.
+- [ ] **3D Split tunnelling** — per-app / per-destination routing policy.
+- [ ] **3E "New identity"** — one action for ephemeral keys + exit rotation (per-session
+  unlinkability).
+
+### WAVE 4 — Advanced privacy / research bets
+
+- [ ] **4A Adaptive DAITA** — maybenot-style learned/state-machine defenses; bidirectional +
+  per-hop cover; constant-rate across the fleet toward a mix-net.
+- [ ] **4B Continuous rekey / PSK rotation** — forward secrecy beyond WG defaults; rotate the
+  PQ-derived PSK on a schedule.
+- [ ] **4C Decentralized / community exits** — bring-your-own-exit with reputation; a
+  federated relay marketplace.
+- [ ] **4D Developer SDK** — embeddable ephemeral tunnels (the data plane as a library others
+  build on).
+- [ ] **4E Target mimicry** — shape a flow to look like a *specific* app (Zoom/Netflix), the
+  far end of DAITA.
+
+---
+
+## Part 3 — Rough 6-month mapping
+
+At agent pace, a "sprint" is hours, but calendar-anchored so progress is legible. Order is
+the contract; dates are a guide.
+
+- **Month 1 — Wave 1 moonshots I:** 1A DAITA, 2A transport selector (pulled early, it's
+  small and makes DAITA usable), 1B undetectable server. *Milestone: censorship-resistance
+  and traffic-analysis stories both closed and selectable.*
+- **Month 2 — Wave 1 moonshots II:** 1C onion multihop (1C-1…1C-3). *Milestone: Tor-grade
+  hop unlinkability at VPN speed.*
+- **Month 3 — Wave 1 close + trust:** 1D verifiable no-logs (1D-1…1D-3). *Milestone:
+  enforced + provable no-logs.*
+- **Month 4 — Wave 2 scale:** 2B Postgres, 2C HA, 2D provisioning, 2E demux. *Milestone:
+  multi-node fleet you can actually operate.*
+- **Month 5 — Wave 2 finish + Wave 3 start:** 2F/2G/2H; 3A desktop GUI, 3B cross-platform
+  data plane. *Milestone: a real client on >1 OS.*
+- **Month 6 — Wave 3/4:** 3C mobile, 3D split tunnelling, 3E new-identity; begin 4A adaptive
+  DAITA / 4B rekey. *Milestone: shippable multi-platform product with a research edge.*
+
+Re-baseline at each milestone: update this file's checkboxes, the SKILL Changelog, and the
+memory pointer.
+
+---
+
+## Part 4 — Open design forks (decide when you reach them, flag to the user)
+
+1. **Onion crypto (Sprint 1C):** nested-WireGuard (reuses audited crypto, heavier) vs
+   Tor-style ChaCha20-Poly1305 onion cells (lighter, new protocol from established
+   primitives). Leaning (b) for wire efficiency *if* the protocol is kept minimal and
+   reviewed; (a) if we want zero new protocol surface. **Ask the user before building.**
+2. **Verifiable no-logs depth (Sprint 1D):** how far into hardware attestation (TPM/SGX)?
+   v1 = seccomp + signed manifest + transparency log (all in-repo, testable). HW attestation
+   needs real hardware/infra — **confirm appetite before 1D-4.**
+3. **DAITA layer placement (Sprint 1A):** shaper as a `Transport` wrapper vs an engine-level
+   queue. Pick whichever keeps the peer-generic engine and the `Transport` enum cleanest;
+   prototype both interfaces briefly.
+4. **DAITA + stealth requirement:** cover cells ride the obfs frame (need the shared key), so
+   DAITA v1 implies stealth is on. Fine, but note it in the selector (2A).
+
+---
+
+## Part 5 — Standing risks / invariants (don't regress)
+
+- **boringtun contracts:** call `update_timers` on a ticker; loop `decapsulate(None,…)` until
+  `Done`. Never hold the `Tunn` `std::sync::Mutex` across `.await`.
+- **MTU:** every new wrapping layer (obfs, mimic, DAITA padding, onion) *reduces* effective
+  MTU — keep MSS clamping honest and document the per-feature overhead.
+- **No-logs invariant:** the data plane writes nothing to disk; secrets never logged (the
+  `SecretKey` type refuses to print). Any persistence lives only in the control plane.
+- **Load-bearing architecture:** nothing should force a breaking change to the `wg-core`
+  public API — the runtime-mutable peer table + `net-linux` syscall isolation + `Transport`
+  enum are what keep options open. Onion/DAITA should extend, not rewrite, them.
+- **Verify-without-root** stays the default; root-only paths are CI/netns-tested.
+
+---
+
+*Keep this file honest. When a sprint lands, check its box, add the SKILL Changelog entry,
+and note any new fork or debt discovered. This is the map we navigate by after every context
+reset.*

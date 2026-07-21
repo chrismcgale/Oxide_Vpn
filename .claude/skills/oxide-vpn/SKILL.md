@@ -6,8 +6,13 @@ description: Operational runbook for the Oxide VPN — a WireGuard-based (boring
 # Oxide VPN runbook
 
 A WireGuard data plane (via **boringtun**) with an Oxide-built control/privacy/ops
-layer on top. Modeled on Mullvad / NordLynx. Linux-first. See the plan at
-`/home/archriso/.claude/plans/wobbly-splashing-puddle.md` for the full M1–M6 roadmap.
+layer on top. Modeled on Mullvad / NordLynx. Linux-first.
+
+**Forward plan:** the M1–M4 rearchitecture is done. The active execution plan — current
+state, working conventions, and ~6 months of ordered work (Wave 1 moonshots: DAITA →
+undetectable server → onion multihop → verifiable no-logs; then scale, clients, research)
+— lives in the repo at **`PLAN.md`**. Read that to know what to build next; read this file
+to build/run/debug. (Historical M1–M6 plan: `~/.claude/plans/wobbly-splashing-puddle.md`.)
 
 Toolchain note: Rust is installed via **rustup** in `~/.cargo` (not a system package).
 Run `. "$HOME/.cargo/env"` first in a fresh shell, or use `~/.cargo/bin/cargo`.
