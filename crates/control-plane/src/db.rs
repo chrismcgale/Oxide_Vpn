@@ -63,6 +63,13 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             tunnel_ip      TEXT NOT NULL,
             created_at     INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS relays (
+            entry_id    TEXT NOT NULL REFERENCES servers(id),
+            exit_id     TEXT NOT NULL REFERENCES servers(id),
+            listen_port INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (entry_id, exit_id)
+        );
         "#,
     )
     .execute(pool)

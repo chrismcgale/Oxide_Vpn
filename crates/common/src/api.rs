@@ -58,6 +58,18 @@ pub struct RegisterDeviceRequest {
     pub server_id: String,
 }
 
+/// Register a device for a multihop path: the tunnel terminates at `exit_id`, but
+/// traffic is sent via `entry_id`, which relays it. The returned
+/// [`RegisterDeviceResponse`] has the exit's public key and tunnel IP but the entry's
+/// relay endpoint, so the client's single WireGuard session runs exit-keyed through the
+/// entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultihopRegisterRequest {
+    pub public_key: PublicKey,
+    pub entry_id: String,
+    pub exit_id: String,
+}
+
 /// Everything a client needs to build a working tunnel config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterDeviceResponse {
@@ -88,6 +100,19 @@ pub struct PeerEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerListResponse {
     pub peers: Vec<PeerEntry>,
+}
+
+/// One relay this (entry) server should run: listen on `listen_port` and forward to the
+/// exit server's WireGuard endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEntry {
+    pub listen_port: u16,
+    pub exit_endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayListResponse {
+    pub relays: Vec<RelayEntry>,
 }
 
 /// Standard JSON error body.

@@ -170,6 +170,31 @@ async fn best_server_selection_balances_by_load_and_location() {
     // No server in the requested country -> error.
     assert!(cc.best_server(&account, Some("FR"), None).await.is_err());
 
+    // Multihop registration: the connection is exit-keyed but points at the entry relay,
+    // and the entry server sees a relay route to the exit.
+    let device = public_from_secret(&generate_secret());
+    let mh = cc
+        .register_device_multihop(&account, device, "us-a", "de-a")
+        .await
+        .unwrap();
+    // Exit is de-a: its subnet is 10.9.0.0/24, so the assigned IP is in it.
+    // (us-a/us-b/de-a were all created with 10.8.0.0/24 above — same subnet here.)
+    assert!(mh.assigned_ip.ends_with("/24"));
+    // Endpoint host is the entry (us-a) with a relay port in the 519xx range.
+    let mh_ep: std::net::SocketAddr = mh.server.endpoint.parse().unwrap();
+    assert!(mh_ep.port() >= 51900);
+    // The entry server's relay list now contains a route (with the exit's endpoint).
+    let relays = cc.fetch_relays("us-a", &tokens["us-a"]).await.unwrap();
+    assert_eq!(relays.len(), 1);
+    assert_eq!(relays[0].listen_port, mh_ep.port());
+
+    // entry == exit is rejected.
+    let d2 = public_from_secret(&generate_secret());
+    assert!(cc
+        .register_device_multihop(&account, d2, "us-a", "us-a")
+        .await
+        .is_err());
+
     // The enriched server list carries location + load.
     let servers = cc.list_servers(&account).await.unwrap();
     assert_eq!(servers.len(), 3);

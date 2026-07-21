@@ -37,6 +37,8 @@ target/debug/oxide-client account --control-plane http://cp:8080          # new 
 # Explicit server, or auto-select the least-loaded (optionally by location):
 sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --server us-1
 sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --country US
+# Multihop: tunnel to the exit through an entry relay (entry auto-picked if omitted):
+sudo target/debug/oxide-client connect --control-plane http://cp:8080 --account <n> --exit se-1 --entry de-1
 ```
 
 Config templates: `configs/server.toml.example`, `configs/client.toml.example`.
@@ -52,6 +54,8 @@ cargo test --workspace                                  # everything (19 tests)
 cargo test -p oxide-wg-core --test tunnel               # real handshake over loopback
 cargo test -p oxide-control-plane --test api            # account/device/IP/peer API + server selection
 cargo test -p oxide-serverd --test control_plane_flow   # CP -> reconcile -> tunnel (capstone)
+cargo test -p oxide-serverd --test multihop_flow        # client -> entry relay -> exit (multihop capstone)
+cargo test -p oxide-relay                               # UDP relay forwarding + flow isolation
 ```
 
 Fastest full (privileged) test — two network namespaces on one host, real handshake +
@@ -86,6 +90,7 @@ Cargo workspace, `crates/`:
 - **`net-linux`** — privileged Linux bits: TUN `ioctl` + `AsyncFd`; `ip`/`nft`/`sysctl` wrappers; **kill switch** (`killswitch.rs`, nft output-drop) and **DNS leak protection** (`dns.rs`, resolv.conf swap/restore). (Shell-outs now; netlink/nftables libs are M5.)
 - **`control-plane`** — axum + sqlx(SQLite) service: accounts (anonymous numbers), devices (pubkey + assigned tunnel IP), servers (with location + capacity), IP allocation, **load-based server selection** (`GET /v1/servers/best`) fed by **server heartbeats**. Never depends on `wg-core`. `add_server` CLI + `serve`.
 - **`control-client`** — thin reqwest client for the control-plane API, shared by both daemons.
+- **`relay`** — a pure-tokio UDP relay used by **multihop** entry servers: forwards a client's WireGuard ciphertext to the exit server (per-client upstream flows), so no single server sees both the client's IP and its destination. No root; unit-tested over loopback.
 - **`oxide-serverd` / `oxide-client`** — thin daemons: config → engine → net-linux; Ctrl-C tears down host state. Server optionally polls the control plane and reconciles peers live; client can `connect` via the control plane (register device → assigned IP → tunnel).
 
 Control-plane <-> server sync: the server **polls** `GET /v1/internal/servers/{id}/peers` (token-authed) and reconciles into the live engine. The data plane keeps peer state in RAM only; the DB lives solely in the control plane.
@@ -107,6 +112,10 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 - **No-logs / RAM-only (audited 2026-07-21):** the data plane (`wg-core`, `oxide-serverd`, `net-linux`) performs **no disk writes** — peers live in RAM only. The engine logs no client PII at the default level (pubkeys/endpoints are `debug`-only). The control-plane DB stores only routing essentials (account numbers, device pubkeys, IP assignments) — no traffic/activity logs. Client-side disk writes are limited to the device key (0600) and the resolv.conf swap, both intentional and local.
 
 ## Changelog / Decisions (newest first)
+
+- **2026-07-21 — Multihop built.** New `relay` crate (tokio UDP proxy). The client runs a single WireGuard session keyed to the **exit** but sends ciphertext to the **entry**, which relays it — so no single server sees both ends, and the client engine/`wg-core` needed **zero changes**. Control plane: `relays` table + per-entry port allocation, `POST /v1/devices/multihop` (registers device on exit, ensures relay route, returns exit-key + entry-relay-endpoint), `GET /v1/internal/servers/:id/relays`. `oxide-serverd` runs a relay per route (fetched on poll); `oxide-client connect --exit/--entry`. Verified without root: relay forwarding + flow isolation, control-plane multihop registration, and a capstone `multihop_flow` test driving a real tunnel client→relay→exit. 27 tests, clippy clean.
+  - Decision: **WireGuard-native multihop (entry relays ciphertext), not onion encryption.** Matches Mullvad; keeps the data plane single-encryption and untouched. The entry is a dumb UDP forwarder that can't read the traffic (it's encrypted to the exit).
+  - Decision: entry auto-picks the least-loaded server ≠ exit when `--entry` is omitted.
 
 - **2026-07-21 — M4 privacy (leak prevention) built.** Kill switch + DNS leak protection in `net-linux` (pure ruleset/resolv.conf builders, unit-tested; applied via nft/resolv.conf, needs root). Control plane hands out a per-server DNS in device registration. `oxide-client` gains `--kill-switch` and applies/tears down DNS + kill switch around the tunnel in the right order. No-logs posture audited (data plane keeps nothing on disk, no info-level PII). 24 tests, clippy clean. Multihop deferred to its own milestone (nested tunnels + entry/exit pairing is substantial).
   - Decision: kill switch is **opt-in** (`--kill-switch`) in v0 to avoid surprising lockouts from a CLI; a real client would default it on with a toggle.

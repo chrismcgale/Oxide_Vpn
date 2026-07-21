@@ -31,8 +31,9 @@ use tokio::sync::Mutex;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
 use oxide_common::api::{
-    CreateAccountResponse, HeartbeatRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
-    RegisterDeviceResponse, ServerConnection, ServerInfo, ServerListResponse,
+    CreateAccountResponse, HeartbeatRequest, MultihopRegisterRequest, PeerEntry, PeerListResponse,
+    RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerConnection,
+    ServerInfo, ServerListResponse,
 };
 use oxide_common::PublicKey;
 
@@ -70,7 +71,9 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/servers", get(list_servers))
         .route("/v1/servers/best", get(best_server))
         .route("/v1/devices", post(register_device))
+        .route("/v1/devices/multihop", post(register_device_multihop))
         .route("/v1/internal/servers/:id/peers", get(list_peers))
+        .route("/v1/internal/servers/:id/relays", get(list_relays))
         .route(
             "/v1/internal/servers/:id/heartbeat",
             post(server_heartbeat),
@@ -224,15 +227,60 @@ async fn register_device(
     Json(req): Json<RegisterDeviceRequest>,
 ) -> ApiResult<Json<RegisterDeviceResponse>> {
     let account = auth_account(&state, &headers).await?;
+    let resp = register_core(&state, &account, &req.public_key, &req.server_id).await?;
+    Ok(Json(resp))
+}
 
-    // Load the target server.
+// POST /v1/devices/multihop
+// Register the device on the EXIT server, ensure a relay route on the ENTRY, and return
+// a connection whose key/tunnel-IP are the exit's but whose endpoint is the entry relay.
+async fn register_device_multihop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<MultihopRegisterRequest>,
+) -> ApiResult<Json<RegisterDeviceResponse>> {
+    let account = auth_account(&state, &headers).await?;
+    if req.entry_id == req.exit_id {
+        return Err(AppError::BadRequest(
+            "entry and exit must be different servers".into(),
+        ));
+    }
+
+    // The tunnel terminates at the exit, so the device is a peer of the exit.
+    let mut resp = register_core(&state, &account, &req.public_key, &req.exit_id).await?;
+
+    // The entry's public host, on which it relays. Reuse its stored endpoint's host.
+    let entry_endpoint: String =
+        sqlx::query_scalar("SELECT endpoint FROM servers WHERE id = ?")
+            .bind(&req.entry_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("no such server: {}", req.entry_id)))?;
+    let entry_host = host_of(&entry_endpoint);
+
+    // Ensure a relay route entry->exit and learn its listen port.
+    let listen_port = ensure_relay(&state, &req.entry_id, &req.exit_id).await?;
+
+    // Point the client at the entry relay instead of the exit directly.
+    resp.server.endpoint = format!("{entry_host}:{listen_port}");
+    Ok(Json(resp))
+}
+
+/// Core device registration on `server_id`: idempotent by public key, allocates a tunnel
+/// IP, returns the connection details (with the server's own endpoint).
+async fn register_core(
+    state: &AppState,
+    account: &str,
+    public_key: &PublicKey,
+    server_id: &str,
+) -> ApiResult<RegisterDeviceResponse> {
     let server = sqlx::query(
         "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns FROM servers WHERE id = ?",
     )
-    .bind(&req.server_id)
+    .bind(server_id)
     .fetch_optional(&state.pool)
     .await?
-    .ok_or_else(|| AppError::NotFound(format!("no such server: {}", req.server_id)))?;
+    .ok_or_else(|| AppError::NotFound(format!("no such server: {server_id}")))?;
 
     let server_pk: String = server.get("public_key");
     let server_endpoint: String = server.get("endpoint");
@@ -243,36 +291,28 @@ async fn register_device(
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored cidr")))?;
 
-    let device_pk = req.public_key.to_base64();
+    let device_pk = public_key.to_base64();
 
     // Serialize allocation + insert so two registrations can't grab the same IP.
     let _guard = state.reg_lock.lock().await;
 
-    // Idempotent re-registration: same pubkey already registered.
-    if let Some(existing) = sqlx::query(
-        "SELECT account_number, tunnel_ip FROM devices WHERE public_key = ?",
-    )
-    .bind(&device_pk)
-    .fetch_optional(&state.pool)
-    .await?
+    // Idempotent re-registration: same pubkey already registered on this server.
+    if let Some(existing) =
+        sqlx::query("SELECT account_number, tunnel_ip, server_id FROM devices WHERE public_key = ?")
+            .bind(&device_pk)
+            .fetch_optional(&state.pool)
+            .await?
     {
         let owner: String = existing.get("account_number");
         if owner != account {
             return Err(AppError::Conflict("device key already registered".into()));
         }
         let ip: String = existing.get("tunnel_ip");
-        return Ok(Json(response_for(
-            ip,
-            cidr,
-            server_pk,
-            server_endpoint,
-            server_tunnel_ip,
-            server_dns,
-        )?));
+        return response_for(ip, cidr, server_pk, server_endpoint, server_tunnel_ip, server_dns);
     }
 
     // Allocate the lowest free host in the subnet.
-    let used = used_ips(&state.pool, &req.server_id).await?;
+    let used = used_ips(&state.pool, server_id).await?;
     let server_ip: IpAddr = server_tunnel_ip
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored server ip")))?;
@@ -283,22 +323,68 @@ async fn register_device(
         "INSERT INTO devices (account_number, public_key, server_id, tunnel_ip, created_at)
          VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(&account)
+    .bind(account)
     .bind(&device_pk)
-    .bind(&req.server_id)
+    .bind(server_id)
     .bind(assigned.to_string())
     .bind(db::now_unix())
     .execute(&state.pool)
     .await?;
 
-    Ok(Json(response_for(
+    response_for(
         assigned.to_string(),
         cidr,
         server_pk,
         server_endpoint,
         server_tunnel_ip,
         server_dns,
-    )?))
+    )
+}
+
+/// Base UDP port for relay listeners on an entry server.
+const RELAY_PORT_BASE: i64 = 51900;
+
+/// Ensure a relay route entry->exit exists; return its listen port. Allocates the next
+/// free port on the entry if the route is new.
+async fn ensure_relay(state: &AppState, entry_id: &str, exit_id: &str) -> ApiResult<u16> {
+    let _guard = state.reg_lock.lock().await;
+
+    if let Some(port) = sqlx::query_scalar::<_, i64>(
+        "SELECT listen_port FROM relays WHERE entry_id = ? AND exit_id = ?",
+    )
+    .bind(entry_id)
+    .bind(exit_id)
+    .fetch_optional(&state.pool)
+    .await?
+    {
+        return Ok(port as u16);
+    }
+
+    let max: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(listen_port) FROM relays WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_one(&state.pool)
+            .await?;
+    let port = max.map(|m| m + 1).unwrap_or(RELAY_PORT_BASE);
+
+    sqlx::query(
+        "INSERT INTO relays (entry_id, exit_id, listen_port, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(entry_id)
+    .bind(exit_id)
+    .bind(port)
+    .bind(db::now_unix())
+    .execute(&state.pool)
+    .await?;
+    Ok(port as u16)
+}
+
+/// Split `host:port` (or `[v6]:port`) into just the host part.
+fn host_of(endpoint: &str) -> String {
+    match endpoint.rsplit_once(':') {
+        Some((host, _port)) => host.trim_matches(['[', ']']).to_string(),
+        None => endpoint.to_string(),
+    }
 }
 
 /// Require the correct server auth token for `server_id`.
@@ -339,6 +425,31 @@ async fn list_peers(
         })
         .collect();
     Ok(Json(PeerListResponse { peers }))
+}
+
+// GET /v1/internal/servers/:id/relays  (server-authenticated: the entry server)
+async fn list_relays(
+    State(state): State<AppState>,
+    Path(entry_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<RelayListResponse>> {
+    auth_server(&state, &entry_id, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT r.listen_port AS listen_port, s.endpoint AS exit_endpoint
+         FROM relays r JOIN servers s ON s.id = r.exit_id
+         WHERE r.entry_id = ?",
+    )
+    .bind(&entry_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let relays = rows
+        .iter()
+        .map(|row| RelayEntry {
+            listen_port: row.get::<i64, _>("listen_port") as u16,
+            exit_endpoint: row.get("exit_endpoint"),
+        })
+        .collect();
+    Ok(Json(RelayListResponse { relays }))
 }
 
 // POST /v1/internal/servers/:id/heartbeat  (server-authenticated)

@@ -6,6 +6,7 @@ members = [
     "crates/net-linux",
     "crates/control-plane",
     "crates/control-client",
+    "crates/relay",
     "crates/oxide-serverd",
     "crates/oxide-client",
 ]

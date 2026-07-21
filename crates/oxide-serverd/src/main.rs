@@ -7,12 +7,14 @@
 //! Requires `CAP_NET_ADMIN` (run as root in M1): it creates a TUN device, edits
 //! routes/sysctls, and installs an nftables masquerade table.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
+use oxide_relay::Relay;
 use tracing::{info, warn};
 
 use oxide_common::api::PeerEntry;
@@ -134,6 +136,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
 async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPlaneConfig) {
     let client = ControlClient::new(&cp.url);
     let mut tick = tokio::time::interval(Duration::from_secs(cp.poll_interval_secs.max(1)));
+    // Relay listen ports we've already started (this server acting as a multihop entry).
+    let mut running_relays: HashSet<u16> = HashSet::new();
     loop {
         tick.tick().await;
         match client.fetch_peers(&cp.server_id, &cp.token).await {
@@ -145,6 +149,18 @@ async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPla
             Err(e) => warn!(error = %e, "failed to fetch peers from control plane"),
         }
 
+        // Start any new relay routes for which this server is the entry.
+        match client.fetch_relays(&cp.server_id, &cp.token).await {
+            Ok(relays) => {
+                for r in relays {
+                    if running_relays.insert(r.listen_port) {
+                        spawn_relay(r.listen_port, r.exit_endpoint).await;
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to fetch relay routes"),
+        }
+
         // Report live load so the control plane can balance new clients across servers.
         let stats = handle.stats();
         if let Err(e) = client
@@ -153,6 +169,28 @@ async fn poll_control_plane<T: TunQueue>(handle: EngineHandle<T>, cp: ControlPla
         {
             warn!(error = %e, "heartbeat failed");
         }
+    }
+}
+
+/// Bind and spawn a relay forwarding `listen_port` to `exit_endpoint` (host:port).
+async fn spawn_relay(listen_port: u16, exit_endpoint: String) {
+    let exit = match tokio::net::lookup_host(&exit_endpoint).await.ok().and_then(|mut a| a.next()) {
+        Some(addr) => addr,
+        None => {
+            warn!(exit = %exit_endpoint, "relay: cannot resolve exit endpoint");
+            return;
+        }
+    };
+    match Relay::bind(("0.0.0.0", listen_port), exit).await {
+        Ok(relay) => {
+            info!(listen_port, exit = %exit, "relay started (multihop entry)");
+            tokio::spawn(async move {
+                if let Err(e) = relay.run().await {
+                    warn!(listen_port, error = %e, "relay stopped");
+                }
+            });
+        }
+        Err(e) => warn!(listen_port, error = %e, "relay: failed to bind"),
     }
 }
 

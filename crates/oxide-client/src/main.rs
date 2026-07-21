@@ -53,10 +53,17 @@ enum Cmd {
         /// Account number (16 digits, spaces ignored).
         #[arg(long)]
         account: String,
-        /// Explicit server id. If omitted, the least-loaded server is auto-selected
-        /// (optionally filtered by --country/--city).
+        /// Explicit server id (single-hop). If omitted, the least-loaded server is
+        /// auto-selected (optionally filtered by --country/--city).
         #[arg(long)]
         server: Option<String>,
+        /// Exit server id for MULTIHOP. When set, traffic tunnels to this exit through
+        /// an entry relay, so no single server sees both your IP and your destination.
+        #[arg(long)]
+        exit: Option<String>,
+        /// Entry server id for multihop (defaults to an auto-selected server != exit).
+        #[arg(long)]
+        entry: Option<String>,
         /// Auto-select only servers in this country.
         #[arg(long)]
         country: Option<String>,
@@ -119,6 +126,8 @@ async fn main() -> Result<()> {
             control_plane,
             account,
             server,
+            exit,
+            entry,
             country,
             city,
             key_file,
@@ -127,6 +136,8 @@ async fn main() -> Result<()> {
         } => {
             let sel = ServerSelection {
                 server,
+                exit,
+                entry,
                 country,
                 city,
             };
@@ -135,10 +146,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// How the client chooses a server: an explicit id, or auto (least-loaded) with
-/// optional location filters.
+/// How the client chooses a server: an explicit id, a multihop exit (+ optional entry),
+/// or auto (least-loaded) with optional location filters.
 struct ServerSelection {
     server: Option<String>,
+    exit: Option<String>,
+    entry: Option<String>,
     country: Option<String>,
     city: Option<String>,
 }
@@ -163,31 +176,59 @@ async fn connect(
     let device_pub = keys::public_from_secret(&device_key);
 
     let cc = ControlClient::new(cp_url);
-    let chosen = match &sel.server {
-        // Explicit server id.
-        Some(id) => cc
-            .list_servers(&account)
-            .await
-            .context("listing servers")?
-            .into_iter()
-            .find(|s| &s.id == id)
-            .with_context(|| format!("no such server: {id}"))?,
-        // Auto-select the least-loaded server, optionally filtered by location.
-        None => cc
-            .best_server(&account, sel.country.as_deref(), sel.city.as_deref())
-            .await
-            .context("selecting best server")?,
-    };
-    info!(server = %chosen.id, endpoint = %chosen.endpoint, active_peers = chosen.active_peers, "selected server");
 
-    let reg = cc
-        .register_device(&account, device_pub, &chosen.id)
-        .await
-        .context("registering device")?;
-    info!(assigned_ip = %reg.assigned_ip, "device registered");
+    let reg = if let Some(exit_id) = &sel.exit {
+        // Multihop: tunnel to the exit through an entry relay.
+        let entry_id = match &sel.entry {
+            Some(e) => e.clone(),
+            None => pick_entry(&cc, &account, exit_id).await?,
+        };
+        info!(entry = %entry_id, exit = %exit_id, "multihop path");
+        cc.register_device_multihop(&account, device_pub, &entry_id, exit_id)
+            .await
+            .context("registering device (multihop)")?
+    } else {
+        // Single-hop.
+        let chosen = match &sel.server {
+            Some(id) => cc
+                .list_servers(&account)
+                .await
+                .context("listing servers")?
+                .into_iter()
+                .find(|s| &s.id == id)
+                .with_context(|| format!("no such server: {id}"))?,
+            None => cc
+                .best_server(&account, sel.country.as_deref(), sel.city.as_deref())
+                .await
+                .context("selecting best server")?,
+        };
+        info!(server = %chosen.id, endpoint = %chosen.endpoint, active_peers = chosen.active_peers, "selected server");
+        cc.register_device(&account, device_pub, &chosen.id)
+            .await
+            .context("registering device")?
+    };
+    info!(assigned_ip = %reg.assigned_ip, endpoint = %reg.server.endpoint, "device registered");
 
     let (iface, peer) = resolve_registration(device_key, &reg, mtu)?;
     run_tunnel(&iface, vec![peer], kill_switch).await
+}
+
+/// Auto-pick an entry server for multihop: the least-loaded server that isn't the exit.
+async fn pick_entry(cc: &ControlClient, account: &str, exit_id: &str) -> Result<String> {
+    let best = cc.best_server(account, None, None).await.ok();
+    if let Some(b) = best {
+        if b.id != exit_id {
+            return Ok(b.id);
+        }
+    }
+    // Best was the exit (or unavailable): fall back to the first different server.
+    cc.list_servers(account)
+        .await
+        .context("listing servers for entry selection")?
+        .into_iter()
+        .find(|s| s.id != exit_id)
+        .map(|s| s.id)
+        .context("no server available to act as a multihop entry")
 }
 
 /// Turn a control-plane registration into a local interface config + server peer.

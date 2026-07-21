@@ -8,8 +8,9 @@ use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
 
 use oxide_common::api::{
-    CreateAccountResponse, HeartbeatRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
-    RegisterDeviceResponse, ServerInfo, ServerListResponse,
+    CreateAccountResponse, HeartbeatRequest, MultihopRegisterRequest, PeerEntry, PeerListResponse,
+    RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerInfo,
+    ServerListResponse,
 };
 use oxide_common::PublicKey;
 
@@ -118,6 +119,46 @@ impl ControlClient {
             .context("POST /v1/devices")?;
         let resp = check(resp).await?;
         Ok(resp.json().await?)
+    }
+
+    /// Register this device for a multihop path (tunnel to `exit_id`, via `entry_id`).
+    /// The returned connection has the exit's key/tunnel-IP but the entry's relay endpoint.
+    pub async fn register_device_multihop(
+        &self,
+        account: &str,
+        public_key: PublicKey,
+        entry_id: &str,
+        exit_id: &str,
+    ) -> Result<RegisterDeviceResponse> {
+        let req = MultihopRegisterRequest {
+            public_key,
+            entry_id: entry_id.to_string(),
+            exit_id: exit_id.to_string(),
+        };
+        let resp = self
+            .http
+            .post(self.url("/v1/devices/multihop"))
+            .bearer_auth(account)
+            .json(&req)
+            .send()
+            .await
+            .context("POST /v1/devices/multihop")?;
+        let resp = check(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Server-facing: fetch the relay routes this (entry) server should run.
+    pub async fn fetch_relays(&self, server_id: &str, server_token: &str) -> Result<Vec<RelayEntry>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/internal/servers/{server_id}/relays")))
+            .bearer_auth(server_token)
+            .send()
+            .await
+            .context("GET relay list")?;
+        let resp = check(resp).await?;
+        let body: RelayListResponse = resp.json().await?;
+        Ok(body.relays)
     }
 
     /// Server-facing: fetch the peer list for `server_id` (authenticated with the

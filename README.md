@@ -28,8 +28,12 @@ non-tunnel traffic (so nothing leaks if the tunnel drops), DNS leak protection p
 the resolver at the tunnel DNS while connected, and the data plane is audited to keep
 nothing on disk and log no client PII.
 
-Roadmap: multihop (nested tunnels), desktop clients, and fleet ops (Postgres,
-provisioning, DoS hardening).
+**Multihop complete:** the client runs one WireGuard session keyed to an *exit* server
+but sends it through an *entry* server that relays the (still-encrypted) traffic — so no
+single server sees both your IP and your destination. Done the WireGuard-native way (the
+entry is a UDP relay), not onion encryption, so the tunnel stays single-encryption.
+
+Roadmap: desktop/mobile clients, and fleet ops (Postgres, provisioning, DoS hardening).
 
 ## Quick start
 
@@ -54,7 +58,8 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/common` | Key types, TOML config, error, `TunQueue`, account numbers, API DTOs |
 | `crates/wg-core` | The boringtun-based tunnel engine, runtime-mutable peers (OS-agnostic) |
 | `crates/net-linux` | Linux TUN device, routing, NAT, sysctls |
-| `crates/control-plane` | Accounts/devices/servers API (axum + SQLite) |
+| `crates/control-plane` | Accounts/devices/servers API, selection, multihop (axum + SQLite) |
 | `crates/control-client` | HTTP client for the control-plane API |
+| `crates/relay` | UDP relay for multihop entry servers |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |
 | `crates/oxide-client` | Client daemon (static config or control-plane connect) |

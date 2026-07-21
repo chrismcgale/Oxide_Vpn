@@ -1193,6 +1193,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-relay"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "oxide-serverd"
 version = "0.1.0"
 dependencies = [
@@ -1203,6 +1211,7 @@ dependencies = [
  "oxide-control-client",
  "oxide-control-plane",
  "oxide-net-linux",
+ "oxide-relay",
  "oxide-wg-core",
  "tokio",
  "tracing",
