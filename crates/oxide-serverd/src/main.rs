@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use oxide_common::api::PeerEntry;
 use oxide_common::{keys, Config, ControlPlaneConfig, SecretKey};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::{bring_up_interface, nat, netlink, sysctl, Netlink};
+use oxide_net_linux::{bring_up_interface, nat, netlink, shutdown_signal, sysctl, Netlink};
 use oxide_wg_core::{Engine, EngineHandle, PeerParams, Transport, TunQueue};
 
 const IFNAME: &str = "oxide0";
@@ -138,10 +138,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
         tokio::spawn(poll_control_plane(handle, cp));
     }
 
-    // Run until Ctrl-C, then tear down host state (leave-no-trace).
+    // Run until Ctrl-C / SIGTERM, then tear down host state (leave-no-trace).
     tokio::select! {
         r = engine.run() => { r.context("engine stopped")?; }
-        _ = tokio::signal::ctrl_c() => { info!("shutting down"); }
+        _ = shutdown_signal() => { info!("shutting down"); }
     }
 
     if nat_egress.is_some() {

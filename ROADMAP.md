@@ -82,6 +82,7 @@ rotation).
 - [x] Migrate `net-linux` link/addr/route to real **netlink** (rtnetlink). (nftables still
       shells out to `nft`; the one default-route *read* still uses `ip route show`.)
 - [x] **IPv6 inside the tunnel**: dual-stack addresses (`address6`) + `::/0` routing.
-      Remaining: WG-over-IPv6 *transport*, control-plane v6 IP allocation, MSS clamping.
+      Remaining: WG-over-IPv6 *transport*, control-plane v6 IP allocation.
+- [x] MSS clamping (NAT forward chain) + graceful `SIGTERM` shutdown.
 
 Then the first signature bet: **stealth mode** (censorship resistance in the relay).

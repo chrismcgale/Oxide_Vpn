@@ -12,6 +12,12 @@ use crate::cmd::{apply_nft_ruleset, run};
 const TABLE: &str = "oxide";
 
 /// The masquerade + forward ruleset for tunnel `tun_if` egressing via `egress`.
+///
+/// The forward chain also clamps TCP MSS to the path MTU on SYN packets. Without this,
+/// a TCP connection through the tunnel negotiates an MSS for a 1500-byte path but the
+/// tunnel MTU is smaller (1420, or lower under stealth), so large segments get dropped
+/// and connections stall — the classic "ping works, curl hangs" PMTU black hole. `rt
+/// mtu` adapts automatically to whatever the tunnel MTU is set to.
 pub fn build_ruleset(tun_if: &str, egress: &str) -> String {
     format!(
         "table inet {TABLE} {{
@@ -21,6 +27,7 @@ pub fn build_ruleset(tun_if: &str, egress: &str) -> String {
             }}
             chain forward {{
                 type filter hook forward priority filter; policy accept;
+                tcp flags syn tcp option maxseg size set rt mtu
                 iifname \"{tun_if}\" accept
                 oifname \"{tun_if}\" accept
             }}
@@ -40,4 +47,18 @@ pub fn disable_masquerade() -> io::Result<()> {
     // Best-effort: deleting a non-existent table is not an error we care about.
     let _ = run("nft", &["delete", "table", "inet", TABLE]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ruleset_masquerades_and_clamps_mss() {
+        let rs = build_ruleset("oxide0", "eth0");
+        assert!(rs.contains("oifname \"eth0\" masquerade"));
+        assert!(rs.contains("iifname \"oxide0\" accept"));
+        // MSS clamp adapts to the route (tunnel) MTU.
+        assert!(rs.contains("tcp flags syn tcp option maxseg size set rt mtu"));
+    }
 }

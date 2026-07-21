@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use oxide_common::api::RegisterDeviceResponse;
 use oxide_common::{keys, Config, InterfaceConfig, SecretKey};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink};
+use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, shutdown_signal, Netlink};
 use oxide_wg_core::{Engine, PeerParams, Transport};
 
 const IFNAME: &str = "oxide0";
@@ -378,7 +378,7 @@ async fn run_tunnel(
 
     tokio::select! {
         r = engine.run() => { r.context("engine stopped")?; }
-        _ = tokio::signal::ctrl_c() => { info!("shutting down"); }
+        _ = shutdown_signal() => { info!("shutting down"); }
     }
 
     // Teardown in reverse order.

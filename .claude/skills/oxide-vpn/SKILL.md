@@ -77,7 +77,7 @@ Manual two-host verification (Milestone 1 definition of done):
 
 - **`Operation not permitted` bringing up tun** — not root / missing `CAP_NET_ADMIN`. Run under `sudo`.
 - **Handshake never completes** — check the timer task is ticking (boringtun needs `update_timers` on a cadence — see `wg-core/src/engine.rs::timer_loop`). Confirm UDP reaches `:51820` (firewall). Confirm keys: client's `[[peer]].public_key` must be the server's public key and vice-versa.
-- **Ping works but curl/large transfers hang** — MTU. Interface MTU must be 1420; if a path is smaller, lower it. Classic PMTU black hole; MSS clamping is an M5 item.
+- **Ping works but curl/large transfers hang** — MTU / PMTU black hole. The NAT ruleset now MSS-clamps forwarded TCP to the route MTU (`nat.rs`), which fixes the common case. If it persists, lower the tunnel MTU (and lower it further under stealth).
 - **Full tunnel connects then the connection dies** — the encrypted UDP is routing into the tunnel. The client pins a `/32` host route to the server endpoint via the original gateway *before* swinging the default (`netlink::add_host_route_via`). Verify with `ip route get <server-ip>`.
 - **NAT egress silently drops replies** — strict `rp_filter`. We set it to loose (2); confirm `sysctl net.ipv4.conf.all.rp_filter`.
 - **`nft` table left behind after a crash** — `sudo nft delete table inet oxide` (NAT) or `sudo nft delete table inet oxide-ks` (kill switch).
@@ -115,6 +115,8 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 - **No-logs / RAM-only (audited 2026-07-21):** the data plane (`wg-core`, `oxide-serverd`, `net-linux`) performs **no disk writes** — peers live in RAM only. The engine logs no client PII at the default level (pubkeys/endpoints are `debug`-only). The control-plane DB stores only routing essentials (account numbers, device pubkeys, IP assignments) — no traffic/activity logs. Client-side disk writes are limited to the device key (0600) and the resolv.conf swap, both intentional and local.
 
 ## Changelog / Decisions (newest first)
+
+- **2026-07-21 — Hardening: SIGTERM + MSS clamping.** Daemons now shut down cleanly on `SIGTERM` (systemd/docker), not just Ctrl-C (`net-linux::shutdown_signal`). The NAT forward chain MSS-clamps forwarded TCP to the route MTU (`tcp flags syn ... maxseg size set rt mtu`), fixing the PMTU black-hole "ping works, curl hangs" bug — and it adapts to the lower MTU used under stealth. 36 tests, clippy + fmt clean.
 
 - **2026-07-21 — Stealth mode (signature feature).** New `obfs` crate (ChaCha20 obfuscation codec) + `wg-core` `Transport` enum (`Plain` | `Obfuscated`). The engine now sends/receives over `Transport` instead of a raw `UdpSocket`; with an `obfuscation_key` set (config field, shared client/server), every datagram is wrapped so there's no WireGuard fingerprint on the wire and undecodable probes are silently dropped. `Engine::build`/`build_server` take a `Transport`. Verified without root: codec tests + a capstone that runs a real WireGuard tunnel entirely over the obfuscated transport. 34 tests, clippy + fmt clean.
   - Decision: **obfs4/Shadowsocks-style keystream obfuscation** (defeats fingerprint-based blocking, which is how WG gets blocked), not protocol mimicry yet. Full TLS/QUIC mimicry is the next stealth tier. It's obfuscation, not AEAD — the real security is the WireGuard layer underneath.
