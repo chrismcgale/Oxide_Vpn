@@ -53,9 +53,10 @@ rotation).
 
 ### Scale & ops
 - **Postgres** for the control plane (already designed for). Server **provisioning
-  automation**. **Observability** (Prometheus metrics, dashboards, alerting). **HA**
-  (control-plane redundancy, DB replication, client re-selection on server death).
-  Token rotation; zero-downtime, versioned-API deploys.
+  automation**. **Observability** — *`/metrics` DONE* (Prometheus text: account/server/
+  device totals + per-server load); dashboards/alerting next. **HA** (control-plane
+  redundancy, DB replication, client re-selection on server death). Token rotation;
+  zero-downtime, versioned-API deploys.
 
 ### Security hardening
 - **Auth rate-limiting** (account number = bearer with no brute-force protection today).

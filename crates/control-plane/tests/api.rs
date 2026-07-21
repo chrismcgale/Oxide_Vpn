@@ -248,3 +248,49 @@ async fn per_ip_rate_limit_kicks_in() {
         "expected a 429 after exceeding the per-IP rate limit"
     );
 }
+
+#[tokio::test]
+async fn metrics_report_counts_and_load() {
+    use oxide_control_plane::render_metrics;
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let server_pub = public_from_secret(&generate_secret()).to_base64();
+    add_server(
+        &pool,
+        NewServer {
+            id: "m-1",
+            public_key: &server_pub,
+            endpoint: "203.0.113.9:51820",
+            cidr: "10.8.0.0/24".parse().unwrap(),
+            country: Some("US"),
+            city: None,
+            capacity: 250,
+            dns: None,
+            obfuscation_key: None,
+            pq_public_key: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { serve(listener, state).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    // Seed some state: one account + one device.
+    let account = cc.create_account().await.unwrap();
+    let dev = public_from_secret(&generate_secret());
+    cc.register_device(&account, dev, "m-1", None)
+        .await
+        .unwrap();
+
+    let text = render_metrics(&pool).await.unwrap();
+    assert!(text.contains("oxide_accounts_total 1"));
+    assert!(text.contains("oxide_servers_total 1"));
+    assert!(text.contains("oxide_devices_total 1"));
+    assert!(text.contains("oxide_server_capacity{server=\"m-1\"} 250"));
+    assert!(text.contains("oxide_server_active_peers{server=\"m-1\"}"));
+    // Prometheus format sanity: HELP/TYPE headers present.
+    assert!(text.contains("# TYPE oxide_accounts_total gauge"));
+}

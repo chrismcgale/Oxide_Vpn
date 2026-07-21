@@ -117,6 +117,8 @@ Data flow and boringtun contracts are documented at the top of `crates/wg-core/s
 
 ## Changelog / Decisions (newest first)
 
+- **2026-07-21 — Observability: `/metrics`.** The control plane exposes a Prometheus text endpoint (`GET /metrics`): `oxide_accounts_total`, `oxide_servers_total`, `oxide_devices_total`, and per-server `oxide_server_active_peers{server=…}` / `oxide_server_capacity{…}`. Rendering is a testable function (`render_metrics`). Unauthenticated aggregate counts (no secrets) — firewall/scrape internally in production. 42 tests, clippy + fmt clean.
+
 - **2026-07-21 — Post-quantum handshake (signature feature, core).** New `pq` crate wrapping ML-KEM-768. The KEM shared secret becomes the WireGuard PSK, so the tunnel is protected by x25519 **and** ML-KEM — quantum-resistant, and strictly additive (hybrid). Verified: KEM round-trip tests + a capstone running a real WireGuard tunnel keyed by the PQ-derived PSK. 40 tests, clippy + fmt clean.
   - Decision: **hybrid via the PSK slot**, not replacing x25519 — matches Mullvad's approach and means the not-yet-audited ML-KEM impl can only add security, never subtract. ML-KEM-768 = NIST category 3. Private key stored/transported as its 64-byte seed.
   - **Control-plane distribution (done, single-hop):** `oxide-serverd pq-genkey` prints a seed + public key; put the seed in the server config (`pq_private_seed`) and register the public key (`add-server --pq-public-key`). The client fetches the server's PQ key, encapsulates, sends the ciphertext at registration; the server decapsulates from its peer list — both derive the same PSK. Capstone test `pq_flow` proves a real tunnel over the CP-negotiated PQ PSK. Multihop PQ is the remaining follow-up.

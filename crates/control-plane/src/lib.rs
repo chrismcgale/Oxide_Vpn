@@ -127,6 +127,7 @@ async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> 
 /// Build the API router.
 pub fn app(state: AppState) -> Router {
     Router::new()
+        .route("/metrics", get(metrics))
         .route("/v1/accounts", post(create_account))
         .route("/v1/servers", get(list_servers))
         .route("/v1/servers/best", get(best_server))
@@ -154,6 +155,73 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
+}
+
+// GET /metrics — Prometheus text format. Unauthenticated aggregate counts (no secrets);
+// firewall/scrape it internally in production.
+async fn metrics(State(state): State<AppState>) -> ApiResult<String> {
+    render_metrics(&state.pool).await
+}
+
+/// Render the Prometheus metrics text from the database. Separated out so it's testable
+/// without an HTTP round-trip.
+pub async fn render_metrics(pool: &SqlitePool) -> ApiResult<String> {
+    let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(pool)
+        .await?;
+    let servers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
+        .fetch_one(pool)
+        .await?;
+    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(pool)
+        .await?;
+
+    let mut out = String::new();
+    let gauge = |out: &mut String, name: &str, help: &str, value: i64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+        ));
+    };
+    gauge(
+        &mut out,
+        "oxide_accounts_total",
+        "Registered accounts.",
+        accounts,
+    );
+    gauge(
+        &mut out,
+        "oxide_servers_total",
+        "Registered servers.",
+        servers,
+    );
+    gauge(
+        &mut out,
+        "oxide_devices_total",
+        "Registered devices.",
+        devices,
+    );
+
+    // Per-server live load (last heartbeat) and capacity.
+    let rows = sqlx::query("SELECT id, active_peers, capacity FROM servers ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    out.push_str("# HELP oxide_server_active_peers Live peers per server (last heartbeat).\n");
+    out.push_str("# TYPE oxide_server_active_peers gauge\n");
+    for row in &rows {
+        let id: String = row.get("id");
+        let ap: i64 = row.get("active_peers");
+        out.push_str(&format!(
+            "oxide_server_active_peers{{server=\"{id}\"}} {ap}\n"
+        ));
+    }
+    out.push_str("# HELP oxide_server_capacity Soft capacity per server (0 = unlimited).\n");
+    out.push_str("# TYPE oxide_server_capacity gauge\n");
+    for row in &rows {
+        let id: String = row.get("id");
+        let cap: i64 = row.get("capacity");
+        out.push_str(&format!("oxide_server_capacity{{server=\"{id}\"}} {cap}\n"));
+    }
+    Ok(out)
 }
 
 /// A random opaque token (server auth). base64 of 24 random bytes.
