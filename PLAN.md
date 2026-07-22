@@ -18,7 +18,7 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 17-crate Cargo workspace. ~96 tests, all green, verified **without root**
+Linux-first, as a 17-crate Cargo workspace. ~97 tests, all green, verified **without root**
 (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged; the
 control plane runs on SQLite or Postgres — the Postgres flow test is gated on a live DB).
 The live-kernel path is verified by the CI netns job.
@@ -57,9 +57,10 @@ The live-kernel path is verified by the CI netns job.
   job.
 
 **Known gaps / debt (fold into the waves below):**
-- **Transport selector: local config done (2A), control-plane distribution not** — daemons
-  now build the configured transport (`plain|obfs|quic|mimic` + `daita`), but the choice
-  isn't yet distributed via the control plane like the obfs key (2A-2).
+- **Transport selector done (2A + 2A-2)** — daemons build the configured transport
+  (`plain|obfs|quic|mimic` + `daita`) and the control plane distributes the choice per-server
+  (`add-server --transport/--daita`), so CP clients auto-pick. *Remaining stealth-CP wiring:*
+  distribute the attest signed manifest/log for at-connect build verification.
 - Peer demux is an O(peers) source-address fallback, not a receiver-index table.
 - `nft`/`sysctl` still shell out; DNS backend isn't `systemd-resolved`-aware.
 - WG **transport** is IPv4-only (IPv6 *inside* the tunnel works).
@@ -218,11 +219,13 @@ crypto/format parts; seccomp test runs in CI.
 
 ### WAVE 2 — Productization & scale (make it a real product)
 
-- [x] **2A Transport selector (local config)** — *DONE 2026-07-21.* `common::TransportKind`
-  + `interface.transport`/`daita`; daemons build the selected transport. Back-compat:
-  `obfuscation_key` alone = `obfs`. **Remaining (2A-2):** distribute the choice via the
-  control plane (servers-table column + `add-server` flags + registration-response field),
-  like the obfs key, so clients auto-pick per-server.
+- [x] **2A Transport selector** — *DONE (2A local 2026-07-21, 2A-2 CP distribution
+  2026-07-22).* `common::TransportKind` + `interface.transport`/`daita`; daemons build the
+  selected transport (back-compat: `obfuscation_key` alone = `obfs`). **2A-2:** `servers.transport`
+  /`servers.daita` columns + `add-server --transport/--daita` + `RegisterDeviceResponse`
+  fields + `client-core::resolve_registration` mapping — a CP client now auto-picks the
+  server's transport (QUIC/DAITA/mimic), verified on SQLite + live PG. *Still open:* distribute
+  the **attest** signed manifest/log so the client verifies the build at connect (1D wiring).
 - [x] **2B Postgres backend** — *DONE 2026-07-22.* Control plane runs on SQLite (default) or
   Postgres, chosen by the connection string. Took the **`Db` dialect-enum** approach (user's
   call over sqlx `Any`): `db.rs` `Db`/`DbRow`/`Val` layer — SQL written once (`?`→`$n` for PG),

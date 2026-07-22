@@ -96,6 +96,15 @@ pub struct RegisterDeviceResponse {
     /// tunnel terminates there; the entry relays the obfuscated bytes untouched).
     #[serde(default)]
     pub obfuscation_key: Option<String>,
+    /// Wire transport the server expects (`plain`|`obfs`|`quic`|`mimic`). Absent means the
+    /// client applies the back-compat rule (obfs if an `obfuscation_key` is present, else
+    /// plain). For multihop this is the *exit's* transport.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Whether the server runs DAITA (traffic-analysis defense); the client then shapes its
+    /// egress and frames cells to match. Requires a stealth transport.
+    #[serde(default)]
+    pub daita: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

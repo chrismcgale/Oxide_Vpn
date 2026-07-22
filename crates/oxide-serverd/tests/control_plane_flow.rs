@@ -69,6 +69,8 @@ async fn control_plane_provisions_a_working_tunnel() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await

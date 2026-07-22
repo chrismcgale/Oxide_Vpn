@@ -57,6 +57,8 @@ async fn post_quantum_negotiated_through_control_plane() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: Some(&pq_public_b64),
+            transport: None,
+            daita: false,
         },
     )
     .await

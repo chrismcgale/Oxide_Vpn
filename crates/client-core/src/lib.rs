@@ -265,6 +265,15 @@ pub fn resolve_registration(
         ),
         None => None,
     };
+    // The server tells us which transport it expects; an unknown/absent value falls back to
+    // the config back-compat rule (obfs if a key is present, else plain) via `transport_kind`.
+    let transport = match reg.transport.as_deref() {
+        Some("plain") => TransportKind::Plain,
+        Some("obfs") => TransportKind::Obfs,
+        Some("quic") => TransportKind::Quic,
+        Some("mimic") => TransportKind::Mimic,
+        _ => TransportKind::default(),
+    };
     let iface = InterfaceConfig {
         private_key: device_key,
         address,
@@ -275,8 +284,8 @@ pub fn resolve_registration(
         obfuscation_key,
         pq_private_seed: None,
         decoy_backend: None,
-        transport: TransportKind::default(),
-        daita: false,
+        transport,
+        daita: reg.daita,
     };
     let peer = PeerParams {
         public_key: reg.server.public_key,
@@ -489,6 +498,8 @@ mod tests {
             },
             dns: Some("10.8.0.1".into()),
             obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+            transport: Some("quic".into()),
+            daita: true,
         };
 
         let (iface, peer) =
@@ -497,6 +508,9 @@ mod tests {
         assert_eq!(iface.address.to_string(), "10.8.0.5/24");
         assert_eq!(iface.mtu(), 1400);
         assert!(iface.obfuscation_key.is_some());
+        // 2A-2: the control-plane transport choice flows into the interface config.
+        assert_eq!(iface.transport_kind(), TransportKind::Quic);
+        assert!(iface.daita);
         assert_eq!(peer.endpoint.unwrap().to_string(), "203.0.113.7:51820");
         assert!(peer
             .allowed_ips

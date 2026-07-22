@@ -438,7 +438,8 @@ async fn register_core(
     let server = state
         .pool
         .fetch_optional(
-            "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns, obfuscation_key
+            "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns, obfuscation_key,
+                    transport, daita
              FROM servers WHERE id = ?",
             &[Val::from(server_id)],
         )
@@ -451,6 +452,8 @@ async fn register_core(
     let server_tunnel_ip = server.text("tunnel_ip");
     let server_dns = server.opt_text("dns");
     let server_obfs = server.opt_text("obfuscation_key");
+    let server_transport = server.opt_text("transport");
+    let server_daita = server.int("daita") != 0;
     let cidr: IpNet = tunnel_cidr
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored cidr")))?;
@@ -487,6 +490,8 @@ async fn register_core(
                 server_tunnel_ip,
                 server_dns,
                 server_obfs,
+                server_transport,
+                server_daita,
             );
         }
 
@@ -520,6 +525,8 @@ async fn register_core(
                     server_tunnel_ip,
                     server_dns,
                     server_obfs,
+                    server_transport,
+                    server_daita,
                 );
             }
             // Lost the race (this IP or this pubkey was just taken): loop to re-check/re-pick.
@@ -827,6 +834,8 @@ fn response_for(
     server_tunnel_ip: String,
     dns: Option<String>,
     obfuscation_key: Option<String>,
+    transport: Option<String>,
+    daita: bool,
 ) -> ApiResult<RegisterDeviceResponse> {
     let public_key = PublicKey::from_str(&server_pk)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored key: {e}")))?;
@@ -839,6 +848,8 @@ fn response_for(
         },
         dns,
         obfuscation_key,
+        transport,
+        daita,
     })
 }
 
@@ -857,6 +868,10 @@ pub struct NewServer<'a> {
     pub obfuscation_key: Option<&'a str>,
     /// Post-quantum public (ML-KEM) key (base64) this server runs; handed to clients.
     pub pq_public_key: Option<&'a str>,
+    /// Wire transport this server expects (`plain`|`obfs`|`quic`|`mimic`); handed to clients.
+    pub transport: Option<&'a str>,
+    /// Whether this server runs DAITA; handed to clients so they shape to match.
+    pub daita: bool,
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.
@@ -871,8 +886,9 @@ pub async fn add_server(pool: &Db, s: NewServer<'_>) -> anyhow::Result<String> {
     pool.execute(
         "INSERT INTO servers
             (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token, country, city,
-             capacity, active_peers, last_heartbeat, dns, obfuscation_key, pq_public_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
+             capacity, active_peers, last_heartbeat, dns, obfuscation_key, pq_public_key,
+             transport, daita, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?)",
         &[
             Val::from(s.id),
             Val::from(s.public_key),
@@ -886,6 +902,8 @@ pub async fn add_server(pool: &Db, s: NewServer<'_>) -> anyhow::Result<String> {
             Val::from(s.dns),
             Val::from(s.obfuscation_key),
             Val::from(s.pq_public_key),
+            Val::from(s.transport),
+            Val::from(s.daita as i64),
             Val::from(db::now_unix()),
         ],
     )

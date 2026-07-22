@@ -58,6 +58,8 @@ async fn multihop_client_relay_exit_carries_a_packet() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: Some(&exit_pq_pub_b64),
+            transport: None,
+            daita: false,
         },
     )
     .await
@@ -76,6 +78,8 @@ async fn multihop_client_relay_exit_carries_a_packet() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await

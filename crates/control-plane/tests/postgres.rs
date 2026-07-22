@@ -47,6 +47,8 @@ async fn full_flow_on_postgres() {
             dns: Some("10.9.0.1"),
             obfuscation_key: Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="),
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await
@@ -119,6 +121,8 @@ async fn full_flow_on_postgres() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await

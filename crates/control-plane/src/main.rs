@@ -24,6 +24,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// The `add-server` variant carries many optional flags; boxing a one-shot CLI command
+// buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Run the API server.
     Serve {
@@ -61,6 +64,14 @@ enum Cmd {
         /// Post-quantum public key (base64) this server runs (from `oxide-serverd pq-genkey`).
         #[arg(long)]
         pq_public_key: Option<String>,
+        /// Wire transport this server expects: plain | obfs | quic | mimic. Handed to
+        /// clients so they connect with the matching transport (stealth kinds need
+        /// `--obfuscation-key`). Defaults to the client's back-compat rule when omitted.
+        #[arg(long)]
+        transport: Option<String>,
+        /// This server runs DAITA (traffic-analysis defense); clients shape egress to match.
+        #[arg(long)]
+        daita: bool,
     },
     /// Create an account from the CLI (handy for testing/seeding).
     NewAccount,
@@ -97,6 +108,8 @@ async fn main() -> Result<()> {
             dns,
             obfuscation_key,
             pq_public_key,
+            transport,
+            daita,
         } => {
             let cidr: IpNet = cidr.parse().context("invalid --cidr")?;
             let token = add_server(
@@ -112,6 +125,8 @@ async fn main() -> Result<()> {
                     dns: dns.as_deref(),
                     obfuscation_key: obfuscation_key.as_deref(),
                     pq_public_key: pq_public_key.as_deref(),
+                    transport: transport.as_deref(),
+                    daita,
                 },
             )
             .await?;

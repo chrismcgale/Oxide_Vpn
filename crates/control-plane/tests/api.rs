@@ -34,6 +34,8 @@ async fn full_account_device_flow() {
             dns: Some("10.8.0.1"),
             obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await
@@ -112,6 +114,8 @@ async fn auth_is_enforced() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await
@@ -152,6 +156,8 @@ async fn best_server_selection_balances_by_load_and_location() {
                 dns: None,
                 obfuscation_key: None,
                 pq_public_key: None,
+                transport: None,
+                daita: false,
             },
         )
         .await
@@ -267,6 +273,8 @@ async fn metrics_report_counts_and_load() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await
@@ -316,6 +324,8 @@ async fn concurrent_registrations_get_distinct_ips() {
             dns: None,
             obfuscation_key: None,
             pq_public_key: None,
+            transport: None,
+            daita: false,
         },
     )
     .await
@@ -360,4 +370,55 @@ async fn concurrent_registrations_get_distinct_ips() {
         n,
         "each concurrent device must get a distinct tunnel IP"
     );
+}
+
+#[tokio::test]
+async fn transport_choice_is_distributed_to_clients() {
+    // 2A-2: a server registered as quic + daita must tell the client so, in the
+    // registration response — the client then builds the matching transport (not just obfs).
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let server_pub = public_from_secret(&generate_secret()).to_base64();
+    add_server(
+        &pool,
+        NewServer {
+            id: "q-1",
+            public_key: &server_pub,
+            endpoint: "203.0.113.5:51820",
+            cidr: "10.8.0.0/24".parse().unwrap(),
+            country: None,
+            city: None,
+            capacity: 100,
+            dns: None,
+            obfuscation_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            pq_public_key: None,
+            transport: Some("quic"),
+            daita: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    let account = cc.create_account().await.unwrap();
+    let dev = public_from_secret(&generate_secret());
+    let reg = cc
+        .register_device(&account, dev, "q-1", None)
+        .await
+        .unwrap();
+    assert_eq!(reg.transport.as_deref(), Some("quic"));
+    assert!(reg.daita);
+    assert!(reg.obfuscation_key.is_some()); // quic needs the shared key too
+
+    // Re-registration (idempotent path) carries the same transport metadata.
+    let reg2 = cc
+        .register_device(&account, dev, "q-1", None)
+        .await
+        .unwrap();
+    assert_eq!(reg2.transport.as_deref(), Some("quic"));
+    assert!(reg2.daita);
 }

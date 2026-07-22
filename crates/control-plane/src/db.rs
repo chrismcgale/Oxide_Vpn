@@ -332,6 +332,8 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
             dns            TEXT,
             obfuscation_key TEXT,
             pq_public_key  TEXT,
+            transport      TEXT,
+            daita          INTEGER NOT NULL DEFAULT 0,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
@@ -375,6 +377,8 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN dns TEXT",
         "ALTER TABLE servers ADD COLUMN obfuscation_key TEXT",
         "ALTER TABLE servers ADD COLUMN pq_public_key TEXT",
+        "ALTER TABLE servers ADD COLUMN transport TEXT",
+        "ALTER TABLE servers ADD COLUMN daita INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
         // Concurrency-safe allocation constraints (2C), added idempotently so existing
         // databases pick them up. On a legacy DB that already holds duplicates, index
@@ -410,6 +414,8 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
             dns            TEXT,
             obfuscation_key TEXT,
             pq_public_key  TEXT,
+            transport      TEXT,
+            daita          BIGINT NOT NULL DEFAULT 0,
             created_at     BIGINT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS devices (
@@ -440,6 +446,9 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
         // pick them up on the next start (a real multi-node deployment relies on these).
         "CREATE UNIQUE INDEX IF NOT EXISTS devices_server_ip_uniq ON devices (server_id, tunnel_ip)",
         "CREATE UNIQUE INDEX IF NOT EXISTS relays_entry_port_uniq ON relays (entry_id, listen_port)",
+        // 2A-2: transport selection distributed to clients (idempotent for existing DBs).
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS transport TEXT",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita BIGINT NOT NULL DEFAULT 0",
     ];
     for stmt in statements {
         sqlx::query(stmt)
