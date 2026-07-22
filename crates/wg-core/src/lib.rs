@@ -8,6 +8,8 @@
 //! Peers are runtime-mutable via [`EngineHandle`], so a control plane can add and
 //! remove them on a live server.
 
+pub mod daita;
+pub mod decoy;
 pub mod engine;
 pub mod mimic;
 pub mod peer;
@@ -18,6 +20,7 @@ pub mod transport;
 #[cfg(feature = "test-util")]
 pub mod testutil;
 
+pub use daita::Daita;
 pub use engine::{Engine, EngineHandle, EngineStats, PeerParams};
 pub use mimic::MimicTransport;
 pub use table::PeerId;

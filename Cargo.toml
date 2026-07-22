@@ -8,6 +8,7 @@ members = [
     "crates/control-client",
     "crates/relay",
     "crates/obfs",
+    "crates/daita",
     "crates/pq",
     "crates/mimicry",
     "crates/client-core",

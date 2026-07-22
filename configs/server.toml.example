@@ -16,6 +16,19 @@ mtu = 1420
 # use the SAME key. Generate one with `oxide-serverd genkey`. Lower `mtu` (~1380) when
 # enabled, since obfuscation adds overhead.
 # obfuscation_key = "BASE64_32_BYTE_KEY"
+# Wire transport selector (all stealth kinds need obfuscation_key, shared with the client):
+#   "plain" (default) · "obfs" (anti-DPI) · "quic" (HTTP/3 mimicry, UDP-native, preferred)
+#   · "mimic" (HTTPS mimicry over TCP, for UDP-hostile networks).
+# (For back-compat, setting only obfuscation_key with no transport = "obfs".)
+# transport = "quic"
+# Decoy-forwarding (quic only): proxy unauthenticated first-contact probes to a real
+# TLS/QUIC backend so the port answers like an ordinary web server under active probing.
+# Point it at a real co-hosted service for the strongest disguise.
+# decoy_backend = "127.0.0.1:8443"
+# DAITA (traffic-analysis defense): constant-rate cells + cover traffic. Requires a
+# stealth transport. Big, constant bandwidth cost — see the daita crate docs. Both ends
+# set daita = true.
+# daita = true
 # Post-quantum: this server's ML-KEM private seed (from `oxide-serverd pq-genkey`).
 # Register the matching public key with `add-server --pq-public-key`. The server then
 # derives a per-device quantum-resistant PSK, layered on x25519.

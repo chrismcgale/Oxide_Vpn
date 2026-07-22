@@ -1566,6 +1566,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-daita"
+version = "0.1.0"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "oxide-mimicry"
 version = "0.1.0"
 dependencies = [
@@ -1653,6 +1660,7 @@ dependencies = [
  "boringtun",
  "ipnet",
  "oxide-common",
+ "oxide-daita",
  "oxide-mimicry",
  "oxide-obfs",
  "oxide-pq",

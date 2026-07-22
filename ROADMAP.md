@@ -25,14 +25,22 @@ Ranked by differentiation × real-world impact. All leverage owning the stack.
    DONE (active-probe resistance):* the QUIC Initial is **authenticated** (token =
    timestamp + nonce + keyed BLAKE2 MAC over version/CIDs); the server silently drops
    forged, stale, or replayed Initials (replay cache + ±120s window), so the port looks
-   dead to an active prober, not just a passive one. *Next:* config/CP transport selector
-   so daemons choose the stealth transport; mimicry in the `relay`; **decoy-forwarding**
-   (proxy unauthenticated first-contact traffic to a real TLS/QUIC backend so the *absence*
-   of a normal response isn't itself a signal).
-2. **Traffic-analysis defense (DAITA-style).** — *size dimension DONE:* obfs pads every
-   datagram up to size buckets, so packet sizes normalize into an anonymity set. *Next:*
-   constant-rate cover traffic + timing normalization in `wg-core`, so even the multihop
-   entry sees only shaped volume.
+   dead to an active prober, not just a passive one. *tier 4 DONE (decoy-forwarding):*
+   `wg-core::decoy` — those failed Initials are instead **proxied to a real TLS/QUIC
+   backend** (`Transport::quic_mimic_with_decoy`, `interface.decoy_backend`) and its response
+   returned through the server's own port, so even the *absence* of a normal response can't
+   be a probe signal; the port answers like an ordinary web server. *Transport selector
+   DONE (local config):* `interface.transport` (`plain|obfs|quic|mimic`) + `daita`; daemons
+   build the selected transport. *Next:* distribute the transport choice via the control
+   plane (like the obfs key); TLS-mimic decoy; mimicry in the `relay`.
+2. **Traffic-analysis defense (DAITA-style).** — *size + rate + cover DONE:* obfs
+   normalizes packet *size* into buckets; the `daita` crate + `wg-core` shaper add the
+   *rate* and *cover* dimensions — the client drains a queue at a fixed slot cadence,
+   emitting one constant-size cell per slot and filling idle slots with cover cells (a
+   1-byte REAL/COVER tag inside the obfs frame; cover is dropped before boringtun). So even
+   the multihop entry sees only steady, contentless volume. Honest cost: a constant
+   bandwidth floor/ceiling (`cell_size * 8 / slot`). *Next (4A):* adaptive/learned
+   (maybenot-style) machines + bidirectional/per-hop shaping.
 3. **Post-quantum handshake.** — *DONE:* `pq` crate (ML-KEM-768); the KEM shared secret
    feeds the WireGuard PSK (hybrid X25519 + ML-KEM), negotiated through the control plane
    for both single-hop and **multihop** (keyed to the exit). Three capstone tunnels prove

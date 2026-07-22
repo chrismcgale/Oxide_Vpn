@@ -44,7 +44,18 @@ overlay *and* an anonymous exit at once, which no incumbent offers.
 ChaCha20 keystream (random nonce + size-bucket padding) so deep-packet inspection can't
 fingerprint or block it. On top of that, protocol mimicry makes the flow look like
 ordinary web traffic — **TLS-over-TCP** (looks like HTTPS) or **QUIC-over-UDP** (looks
-like HTTP/3, UDP-native and preferred) — for use where WireGuard is censored.
+like HTTP/3, UDP-native and preferred) — for use where WireGuard is censored. Under active
+probing the QUIC server goes further: an unauthenticated probe isn't dropped (a dead port
+is itself a signal) but **decoy-forwarded** to a real TLS/QUIC backend, so the port answers
+exactly like the ordinary web server it pretends to be. Pick the transport per interface
+(`transport = "plain" | "obfs" | "quic" | "mimic"`).
+
+**Traffic-analysis defense (DAITA):** on top of size-bucket padding, an optional shaper
+turns the client's egress into a constant-rate stream of fixed-size **cells** — one per
+fixed slot, with **cover** cells filling idle slots — so a passive/ML observer (or even
+our own multihop entry) sees only steady, contentless volume, no bursts or gaps. It's an
+honest padding+rate defense with a constant bandwidth cost (`cell_size × 8 / slot`), not a
+learned framework; cover rides inside the obfs frame and is dropped before WireGuard.
 
 **Post-quantum (core):** an ML-KEM (Kyber) exchange derives a shared secret used as the
 WireGuard preshared key, so the tunnel is protected by x25519 *and* a quantum-resistant
@@ -79,6 +90,7 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/control-client` | HTTP client for the control-plane API |
 | `crates/relay` | UDP relay for multihop entry servers |
 | `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
+| `crates/daita` | Traffic-analysis defense: constant-rate cell shaper + cover traffic |
 | `crates/mimicry` | Protocol mimicry: TLS-over-TCP (HTTPS) + QUIC-over-UDP (HTTP/3) |
 | `crates/pq` | Post-quantum (ML-KEM) key agreement for a hybrid PSK |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |

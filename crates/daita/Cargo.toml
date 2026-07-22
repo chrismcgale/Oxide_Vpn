@@ -1,0 +1,11 @@
+[package]
+name = "oxide-daita"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oxide_daita"
+path = "src/lib.rs"
+
+[dependencies]
+rand_core = { workspace = true }

@@ -64,6 +64,30 @@ fn default_poll_interval() -> u64 {
     15
 }
 
+/// Which wire transport the tunnel runs over. `plain` is standard WireGuard UDP; the rest
+/// are stealth transports that all require an `obfuscation_key` shared by both ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    /// Standard WireGuard on the wire.
+    #[default]
+    Plain,
+    /// ChaCha20 keystream obfuscation (anti-DPI), size-bucket padding.
+    Obfs,
+    /// QUIC/HTTP-3 mimicry over UDP with an authenticated Initial (and optional
+    /// decoy-forwarding via `decoy_backend`). UDP-native; the preferred stealth transport.
+    Quic,
+    /// TLS/HTTPS mimicry over TCP. The fallback for UDP-hostile networks.
+    Mimic,
+}
+
+impl TransportKind {
+    /// Whether this transport carries the obfuscation layer (and so needs the shared key).
+    pub fn is_stealth(&self) -> bool {
+        !matches!(self, TransportKind::Plain)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InterfaceConfig {
     pub private_key: SecretKey,
@@ -99,6 +123,26 @@ pub struct InterfaceConfig {
     /// Generate with `oxide-serverd pq-genkey`.
     #[serde(default)]
     pub pq_private_seed: Option<String>,
+
+    /// Decoy-forwarding backend (`host:port`), server-side, for the QUIC-mimicry transport.
+    /// When set, a datagram that fails the authenticated-Initial check is proxied to this
+    /// backend instead of being dropped, so the port answers like an ordinary QUIC/HTTP-3
+    /// server under active probing. Point it at a real co-hosted TLS/QUIC service for the
+    /// strongest disguise. Applies when the QUIC-mimicry transport is in use.
+    #[serde(default)]
+    pub decoy_backend: Option<String>,
+
+    /// Which wire transport to use. Defaults to `plain`, except that for backward
+    /// compatibility an unset `transport` with an `obfuscation_key` present means `obfs`
+    /// (use [`InterfaceConfig::transport_kind`] to resolve the effective kind).
+    #[serde(default)]
+    pub transport: TransportKind,
+
+    /// Layer DAITA traffic-analysis defense (constant-rate cells + cover) on top of the
+    /// stealth transport. Requires a stealth transport (any non-`plain`). On a client this
+    /// shapes egress; on a server it frames replies and drops inbound cover.
+    #[serde(default)]
+    pub daita: bool,
 }
 
 impl InterfaceConfig {
@@ -106,6 +150,16 @@ impl InterfaceConfig {
 
     pub fn mtu(&self) -> u32 {
         self.mtu.unwrap_or(Self::DEFAULT_MTU)
+    }
+
+    /// The effective transport kind, applying the backward-compatible rule that a config
+    /// which only sets `obfuscation_key` (and leaves `transport` at its `plain` default)
+    /// means `obfs` — how stealth was selected before the `transport` field existed.
+    pub fn transport_kind(&self) -> TransportKind {
+        match self.transport {
+            TransportKind::Plain if self.obfuscation_key.is_some() => TransportKind::Obfs,
+            other => other,
+        }
     }
 }
 
@@ -163,6 +217,19 @@ impl Config {
                 ));
             }
         }
+        if self.interface.daita && !self.interface.transport_kind().is_stealth() {
+            return Err(Error::Config(
+                "daita = true requires a stealth transport (set transport = \
+                 \"obfs\"/\"quic\"/\"mimic\" and an obfuscation_key)"
+                    .into(),
+            ));
+        }
+        if self.interface.transport_kind().is_stealth() && self.interface.obfuscation_key.is_none()
+        {
+            return Err(Error::Config(
+                "a stealth transport requires interface.obfuscation_key".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -191,6 +258,93 @@ mod tests {
         assert_eq!(cfg.interface.mtu(), 1420);
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.nat.unwrap().egress.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn transport_kind_backcompat_and_explicit() {
+        // No transport field + no key = plain.
+        let plain = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.1/24"
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.2/32"]
+        "#;
+        assert_eq!(
+            Config::from_toml_str(plain)
+                .unwrap()
+                .interface
+                .transport_kind(),
+            TransportKind::Plain
+        );
+
+        // Back-compat: an obfuscation_key with no transport field still means obfs.
+        let legacy_obfs = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.1/24"
+            obfuscation_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.2/32"]
+        "#;
+        assert_eq!(
+            Config::from_toml_str(legacy_obfs)
+                .unwrap()
+                .interface
+                .transport_kind(),
+            TransportKind::Obfs
+        );
+
+        // Explicit quic + daita.
+        let quic = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.1/24"
+            transport = "quic"
+            daita = true
+            obfuscation_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            decoy_backend = "127.0.0.1:443"
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.2/32"]
+        "#;
+        let cfg = Config::from_toml_str(quic).unwrap();
+        assert_eq!(cfg.interface.transport_kind(), TransportKind::Quic);
+        assert!(cfg.interface.daita);
+        assert_eq!(
+            cfg.interface.decoy_backend.as_deref(),
+            Some("127.0.0.1:443")
+        );
+    }
+
+    #[test]
+    fn daita_without_stealth_is_rejected() {
+        let toml = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.1/24"
+            daita = true
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.2/32"]
+        "#;
+        assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn stealth_transport_without_key_is_rejected() {
+        let toml = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.1/24"
+            transport = "quic"
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.2/32"]
+        "#;
+        assert!(Config::from_toml_str(toml).is_err());
     }
 
     #[test]

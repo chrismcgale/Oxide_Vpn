@@ -16,6 +16,13 @@ dns = "10.8.0.1"
 
 # Stealth mode (censorship resistance): must match the server's obfuscation_key.
 # obfuscation_key = "BASE64_32_BYTE_KEY"
+# Wire transport — must match the server's choice:
+#   "plain" (default) · "obfs" · "quic" (preferred) · "mimic" (TCP fallback).
+# (Back-compat: obfuscation_key with no transport = "obfs".)
+# transport = "quic"
+# DAITA traffic-analysis defense (constant-rate cells + cover). Requires a stealth
+# transport and must match the server. Shapes this client's egress. Costs bandwidth.
+# daita = true
 
 # Kill switch is a runtime flag, not a config field:
 #   sudo oxide-client up --config client.toml --kill-switch

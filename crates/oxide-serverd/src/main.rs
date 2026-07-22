@@ -20,10 +20,10 @@ use oxide_relay::Relay;
 use tracing::{info, warn};
 
 use oxide_common::api::PeerEntry;
-use oxide_common::{keys, Config, ControlPlaneConfig, SecretKey};
+use oxide_common::{keys, Config, ControlPlaneConfig, InterfaceConfig, SecretKey, TransportKind};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, nat, netlink, shutdown_signal, sysctl, Netlink};
-use oxide_wg_core::{Engine, EngineHandle, PeerParams, Transport, TunQueue};
+use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport, TunQueue};
 
 const IFNAME: &str = "oxide0";
 
@@ -118,20 +118,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
         nat_egress = Some(egress);
     }
 
-    // UDP listener + engine.
-    let udp = tokio::net::UdpSocket::bind(("0.0.0.0", listen_port))
-        .await
-        .with_context(|| format!("binding UDP :{listen_port}"))?;
+    // Build the selected wire transport (plain / obfs / quic[+decoy] / mimic).
+    let transport = build_server_transport(&cfg.interface, listen_port).await?;
     info!(port = listen_port, peers = cfg.peers.len(), "listening");
-
-    // Stealth mode: wrap the socket in the obfuscation transport if a key is configured.
-    let transport = match &cfg.interface.obfuscation_key {
-        Some(k) => {
-            info!("stealth mode enabled (obfuscated transport)");
-            Transport::obfuscated(udp, *k.as_bytes())
-        }
-        None => Transport::plain(udp),
-    };
 
     // Server-side handshake rate limit (DoS defense): cookie challenges engage above
     // this many handshake messages/second across all peers.
@@ -144,6 +133,14 @@ async fn run(config_path: PathBuf) -> Result<()> {
         tun,
         HANDSHAKE_LIMIT,
     );
+    // DAITA (traffic-analysis defense): the server frames replies as cells and drops
+    // inbound cover; the client drives the constant rate. Requires a stealth transport.
+    let engine = if cfg.interface.daita {
+        info!("DAITA enabled (server framing mode)");
+        engine.with_daita(Daita::server())
+    } else {
+        engine
+    };
 
     // Decode the post-quantum private seed (if any) so we can decapsulate each device's
     // ciphertext into its PSK during reconcile.
@@ -177,6 +174,64 @@ async fn run(config_path: PathBuf) -> Result<()> {
     }
     // TUN device is dropped here, removing the interface and its routes.
     Ok(())
+}
+
+/// Build the server-side [`Transport`] the config selects, binding/listening on
+/// `listen_port`. Stealth transports require `obfuscation_key`; DAITA (`daita = true`)
+/// requires a stealth transport. The QUIC transport enables decoy-forwarding when
+/// `decoy_backend` is set.
+async fn build_server_transport(iface: &InterfaceConfig, listen_port: u16) -> Result<Transport> {
+    let kind = iface.transport_kind();
+    if iface.daita && !kind.is_stealth() {
+        anyhow::bail!("daita = true requires a stealth transport (obfs / quic / mimic)");
+    }
+    let key = || -> Result<[u8; 32]> {
+        iface
+            .obfuscation_key
+            .as_ref()
+            .map(|k| *k.as_bytes())
+            .context("this transport requires interface.obfuscation_key")
+    };
+    let bind_udp = || async {
+        tokio::net::UdpSocket::bind(("0.0.0.0", listen_port))
+            .await
+            .with_context(|| format!("binding UDP :{listen_port}"))
+    };
+
+    match kind {
+        TransportKind::Plain => Ok(Transport::plain(bind_udp().await?)),
+        TransportKind::Obfs => {
+            info!("stealth: obfuscated transport");
+            Ok(Transport::obfuscated(bind_udp().await?, key()?))
+        }
+        TransportKind::Quic => {
+            let udp = bind_udp().await?;
+            let k = key()?;
+            match &iface.decoy_backend {
+                Some(b) => {
+                    let backend = tokio::net::lookup_host(b)
+                        .await
+                        .ok()
+                        .and_then(|mut a| a.next())
+                        .with_context(|| format!("resolving decoy_backend {b}"))?;
+                    info!(%backend, "stealth: QUIC mimicry with decoy-forwarding");
+                    Ok(Transport::quic_mimic_with_decoy(udp, k, backend))
+                }
+                None => {
+                    info!("stealth: QUIC mimicry");
+                    Ok(Transport::quic_mimic(udp, k))
+                }
+            }
+        }
+        TransportKind::Mimic => {
+            info!("stealth: TLS mimicry (TCP)");
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
+            let m = MimicTransport::bind(addr, key()?)
+                .await
+                .context("binding TLS-mimicry listener")?;
+            Ok(Transport::mimic(m))
+        }
+    }
 }
 
 /// Periodically fetch this server's peer list from the control plane, reconcile it into

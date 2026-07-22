@@ -11,7 +11,9 @@ pub mod error;
 pub mod keys;
 pub mod tun;
 
-pub use config::{Config, ControlPlaneConfig, InterfaceConfig, NatConfig, PeerConfig};
+pub use config::{
+    Config, ControlPlaneConfig, InterfaceConfig, NatConfig, PeerConfig, TransportKind,
+};
 pub use error::{Error, Result};
 pub use keys::{PublicKey, SecretKey};
 pub use tun::TunQueue;

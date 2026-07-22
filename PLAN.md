@@ -18,7 +18,7 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 14-crate Cargo workspace. ~70 tests, all green, all verified **without
+Linux-first, as a 15-crate Cargo workspace. ~83 tests, all green, all verified **without
 root** (mock TUN + loopback UDP + in-process control plane); the live-kernel path is
 verified by the CI netns job.
 
@@ -36,7 +36,12 @@ verified by the CI netns job.
   2 protocol mimicry — TLS-over-TCP (`Transport::Mimic`) and QUIC-over-UDP
   (`Transport::QuicMimic`); tier 3 **active-probe resistance** — the QUIC Initial is
   authenticated (timestamp + nonce + keyed BLAKE2 MAC), forged/stale/replayed Initials
-  dropped in silence.
+  dropped in silence; tier 4 **decoy-forwarding** (`wg-core::decoy`) — those failed Initials
+  are proxied to a real backend so the port answers like an ordinary web server. Daemons
+  pick the transport via `interface.transport` (`plain|obfs|quic|mimic`).
+- **Traffic-analysis defense** (`daita` + `wg-core` shaper): DAITA v1 — client egress
+  shaped to a constant rate of fixed-size cells with cover traffic filling idle slots
+  (`Engine::with_daita`); finishes the size/rate/cover story obfs began.
 - **Post-quantum** (`pq`): ML-KEM-768 → WireGuard PSK, hybrid, single-hop + multihop.
 - **Mesh hybrid**: control-plane-coordinated private WireGuard P2P overlay of the account's
   own devices (`resolve_mesh`, `oxide-client mesh`); composes with a full-tunnel exit.
@@ -47,8 +52,9 @@ verified by the CI netns job.
   job.
 
 **Known gaps / debt (fold into the waves below):**
-- No config/control-plane **transport selector** — the stealth transports exist but daemons
-  can't yet be told which to use (obfs key is wired; mimic/quic/daita are not).
+- **Transport selector: local config done (2A), control-plane distribution not** — daemons
+  now build the configured transport (`plain|obfs|quic|mimic` + `daita`), but the choice
+  isn't yet distributed via the control plane like the obfs key (2A-2).
 - Peer demux is an O(peers) source-address fallback, not a receiver-index table.
 - `nft`/`sysctl` still shell out; DNS backend isn't `systemd-resolved`-aware.
 - WG **transport** is IPv4-only (IPv6 *inside* the tunnel works).
@@ -86,7 +92,15 @@ leverage but can be re-prioritized. Each sprint is a self-contained, committable
 
 ### WAVE 1 — Signature moonshots (agreed order)
 
-#### Sprint 1A — DAITA: traffic-analysis defense  ⟶ *start here*
+#### Sprint 1A — DAITA: traffic-analysis defense  ✅ **DONE (2026-07-21)**
+> Landed as the `daita` crate + an engine-level queue in `wg-core` (`Engine::with_daita`,
+> `Daita::{shaping,framing}`). Client egress → one fixed-size cell per slot (REAL or COVER);
+> cover rides inside the obfs frame and is dropped before boringtun. Chose the **engine-level
+> queue** over a `Transport` wrapper (fork #3); framing is bidirectional, shaping client-only;
+> DAITA implies stealth (fork #4). 10 unit tests + `tunnel_works_with_daita_shaping` capstone.
+> *Still open:* the transport selector (2A) to enable DAITA per-deployment; bidirectional/
+> adaptive shaping (4A). See the SKILL Changelog for the full decision record.
+
 **Goal.** A passive/ML observer (and even our own multihop entry) sees only shaped,
 contentless volume — constant packet **rate**, constant **size**, with **cover traffic**
 filling idle slots. Finishes the traffic-analysis story begun by obfs (which already did the
@@ -114,7 +128,15 @@ WireGuard tunnel with DAITA on, packet crosses, wire trace shows constant-size c
 steady rate. **Honesty in docs:** this is a padding+rate defense with a real
 bandwidth/latency cost, not a learned framework; quantify overhead.
 
-#### Sprint 1B — Undetectable server (decoy-forwarding)
+#### Sprint 1B — Undetectable server (decoy-forwarding)  ✅ **DONE (2026-07-21)**
+> Landed as `wg-core::decoy::DecoyForwarder` + `Transport::quic_mimic_with_decoy`. A forged/
+> stale/replayed QUIC Initial (the active-probe vector) is spliced to a real `decoy_backend`
+> and its response relayed back through the server's listen socket, so the port answers like
+> an ordinary QUIC server. **Trigger = failed Initial only** (preserves roaming; short-header
+> junk stays silently dropped, which is QUIC-realistic). QUIC path only for v1 — TLS-mimic
+> decoy is a follow-up. 2 transport tests (probe answered from server port; genuine tunnels
+> concurrently). See the SKILL Changelog for the decision record + threat model.
+
 **Goal.** The server is byte-for-byte indistinguishable from an ordinary web server. Today
 unauthenticated first-contact is *silently dropped* (port looks dead). Instead, **proxy it
 to a real TLS/QUIC backend** so the port looks alive and boring — even the *absence* of a
@@ -135,7 +157,7 @@ response returns to the prober; a genuine authenticated Initial still tunnels; b
 (loopback backend, no root). Docs: threat model — strongest when the decoy is a real service
 you host; note timing/behavioral caveats.
 
-#### Sprint 1C — True onion multihop
+#### Sprint 1C — True onion multihop  ⟶ *next Wave-1 moonshot*
 **Goal.** Upgrade multihop from "entry blindly relays exit-keyed ciphertext" to **nested
 per-hop encryption**: each relay peels exactly one layer and knows only its previous and next
 hop — never both your IP and your destination, even if a single hop is compromised.
@@ -181,11 +203,16 @@ crypto/format parts; seccomp test runs in CI.
 
 ### WAVE 2 — Productization & scale (make it a real product)
 
-- [ ] **2A Transport selector** — config + control-plane field so daemons choose
-  `plain|obfs|mimic|quic|daita`, distributed like the obfs key. *Small, high-leverage —
-  unblocks actually using every stealth transport. Consider pulling before/after 1B.*
-- [ ] **2B Postgres backend** — control plane on Postgres (already designed for: it's a
-  connection-string + dialect change). Enables multi-node.
+- [x] **2A Transport selector (local config)** — *DONE 2026-07-21.* `common::TransportKind`
+  + `interface.transport`/`daita`; daemons build the selected transport. Back-compat:
+  `obfuscation_key` alone = `obfs`. **Remaining (2A-2):** distribute the choice via the
+  control plane (servers-table column + `add-server` flags + registration-response field),
+  like the obfs key, so clients auto-pick per-server.
+- [ ] **2B Postgres backend** — control plane on Postgres. ⚠️ **Bigger than "connection-string
+  + dialect change":** `db.rs` + `lib.rs` use concrete `SqlitePool`/`SqliteRow` (830 lines),
+  `?` placeholders, and `AUTOINCREMENT`. Needs an approach decision (sqlx `Any` driver vs a
+  `Db` dialect enum) **and a running Postgres to verify** — flagged to the user; see the
+  "when I'm back" steps. Not started (avoided a blind, unverifiable rewrite).
 - [ ] **2C HA & lifecycle** — control-plane redundancy, client re-selection on server death,
   server-token rotation, versioned zero-downtime API.
 - [ ] **2D Provisioning automation** — stand up a server (keys, config, control-plane

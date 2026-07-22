@@ -36,6 +36,7 @@ use tracing::{debug, trace, warn};
 
 use oxide_common::{PublicKey, SecretKey, TunQueue};
 
+use crate::daita::Daita;
 use crate::peer::Peer;
 use crate::table::{PeerId, PeerTable};
 use crate::transport::Transport;
@@ -82,6 +83,11 @@ struct Shared<T: TunQueue> {
     /// path route directly instead of trying every peer. (A proper receiver-index
     /// table is a later refinement.)
     addr_to_peer: Mutex<HashMap<SocketAddr, PeerId>>,
+    /// Optional DAITA traffic shaping. When set, outbound datagrams are wrapped in
+    /// fixed-size cells (and, on the shaping/client side, drained at a constant rate with
+    /// cover traffic), and inbound cover cells are dropped before boringtun. See
+    /// [`crate::daita`].
+    daita: Option<Arc<Daita>>,
 }
 
 pub struct Engine<T: TunQueue> {
@@ -157,8 +163,22 @@ impl<T: TunQueue> Engine<T> {
                 tun,
                 table: RwLock::new(table),
                 addr_to_peer: Mutex::new(HashMap::new()),
+                daita: None,
             }),
         }
+    }
+
+    /// Enable DAITA traffic shaping on this engine. Must be called before [`Self::run`] or
+    /// [`Self::handle`] (while the engine still uniquely owns its shared state). Use
+    /// [`Daita::shaping`]/[`Daita::client`] on the client to shape egress at a constant
+    /// rate with cover traffic, and [`Daita::framing`]/[`Daita::server`] on the peer that
+    /// only needs to speak the cell framing. DAITA requires a stealth transport (the cells
+    /// ride inside the obfs frame).
+    pub fn with_daita(mut self, daita: Daita) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("with_daita must be called before handle()/run()")
+            .daita = Some(Arc::new(daita));
+        self
     }
 
     /// A handle for adding/removing peers while the engine runs.
@@ -188,6 +208,14 @@ impl<T: TunQueue> Engine<T> {
         // (i.e. the client dialing its server) so the tunnel comes up before user
         // traffic and keepalives start flowing.
         Self::init_handshakes(&shared).await;
+
+        // If DAITA shaping is on (client), drive the constant-rate cell stream: one cell
+        // per slot, cover when idle. Detached like the timer/limiter tasks.
+        if let Some(daita) = shared.daita.clone() {
+            if daita.shape_egress {
+                tokio::spawn(Self::shaper_loop(shared.clone(), daita));
+            }
+        }
 
         let out = tokio::spawn(Self::outbound_loop(shared.clone()));
         let inb = tokio::spawn(Self::inbound_loop(shared.clone()));
@@ -222,8 +250,64 @@ impl<T: TunQueue> Engine<T> {
             };
             if let Some(d) = datagram {
                 debug!(peer = %PublicKey(id).to_base64(), %endpoint, "initiating handshake");
-                let _ = shared.transport.send_to(&d, endpoint).await;
+                let _ = Self::send_egress(shared, d, endpoint).await;
             }
+        }
+    }
+
+    /// Send one WireGuard datagram toward a peer, applying DAITA if enabled:
+    ///   * shaping (client): enqueue for the constant-rate shaper (`endpoint` is ignored;
+    ///     the shaper sends to the single peer's endpoint each slot);
+    ///   * framing (server): wrap as a fixed-size real cell and send now;
+    ///   * no DAITA: send the raw datagram.
+    async fn send_egress(
+        shared: &Arc<Shared<T>>,
+        datagram: Vec<u8>,
+        endpoint: SocketAddr,
+    ) -> std::io::Result<()> {
+        match shared.daita.as_deref() {
+            Some(d) if d.shape_egress => {
+                if !d.shaper.enqueue(datagram) {
+                    trace!("daita: outbound datagram dropped (queue full or oversized)");
+                }
+                Ok(())
+            }
+            Some(d) => match oxide_daita::frame_real(&datagram, d.cell_size) {
+                Some(cell) => shared.transport.send_to(&cell, endpoint).await.map(|_| ()),
+                None => {
+                    trace!("daita: datagram too large for a cell; dropping");
+                    Ok(())
+                }
+            },
+            None => shared
+                .transport
+                .send_to(&datagram, endpoint)
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    /// The DAITA shaper task (client): every slot, send exactly one cell — a queued real
+    /// datagram if any, else a cover cell — to the single peer's endpoint. This is what
+    /// makes the client→server flow a constant-rate, constant-size, contentless stream.
+    async fn shaper_loop(shared: Arc<Shared<T>>, daita: Arc<Daita>) {
+        let mut tick = interval(daita.slot);
+        loop {
+            tick.tick().await;
+            // v1 targets the single-peer client: find the one peer we have an endpoint for.
+            let endpoint = shared
+                .table
+                .read()
+                .unwrap()
+                .snapshot()
+                .into_iter()
+                .find_map(|(_, p)| p.endpoint());
+            let Some(ep) = endpoint else {
+                // No endpoint yet (not configured/learned) — nothing to send toward.
+                continue;
+            };
+            let cell = daita.shaper.next_cell();
+            let _ = shared.transport.send_to(&cell, ep).await;
         }
     }
 
@@ -261,7 +345,7 @@ impl<T: TunQueue> Engine<T> {
 
             match (datagram, endpoint) {
                 (Some(d), Some(ep)) => {
-                    shared.transport.send_to(&d, ep).await?;
+                    Self::send_egress(&shared, d, ep).await?;
                 }
                 (Some(_), None) => {
                     trace!("have datagram but no endpoint yet; dropping");
@@ -275,7 +359,16 @@ impl<T: TunQueue> Engine<T> {
         let mut buf = [0u8; MAX_PKT];
         loop {
             let (n, src) = shared.transport.recv_from(&mut buf).await?;
-            let datagram = buf[..n].to_vec();
+            // Under DAITA, each datagram is a cell: unwrap a real WireGuard datagram, or
+            // drop a cover cell (and any malformed cell) before boringtun ever sees it.
+            let datagram = match shared.daita.as_deref() {
+                Some(_) => match oxide_daita::parse(&buf[..n]) {
+                    Some(oxide_daita::Cell::Real(wg)) => wg,
+                    Some(oxide_daita::Cell::Cover) => continue,
+                    None => continue,
+                },
+                None => buf[..n].to_vec(),
+            };
             Self::handle_incoming(&shared, datagram, src).await;
         }
     }
@@ -347,7 +440,7 @@ impl<T: TunQueue> Engine<T> {
             shared.addr_to_peer.lock().unwrap().insert(src, id);
 
             for d in to_network {
-                let _ = shared.transport.send_to(&d, src).await;
+                let _ = Self::send_egress(shared, d, src).await;
             }
             if let Some(pkt) = to_tun {
                 if let Err(e) = shared.tun.send(&pkt).await {
@@ -378,7 +471,7 @@ impl<T: TunQueue> Engine<T> {
                 };
                 if let Some(d) = datagram {
                     if let Some(ep) = peer.endpoint() {
-                        let _ = shared.transport.send_to(&d, ep).await;
+                        let _ = Self::send_egress(&shared, d, ep).await;
                     }
                 }
             }

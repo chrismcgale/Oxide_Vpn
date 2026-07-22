@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use oxide_common::keys::{generate_secret, public_from_secret};
 use oxide_common::TunQueue;
-use oxide_wg_core::{Engine, MimicTransport, PeerParams, Transport};
+use oxide_wg_core::{Daita, Engine, MimicTransport, PeerParams, Transport};
 
 /// In-memory stand-in for a TUN device. `recv` yields packets the test injected
 /// (as if the OS wanted to send them out); `send` captures packets the engine wrote
@@ -388,6 +388,84 @@ async fn tunnel_works_over_quic_mimicry() {
         .expect("timed out; QUIC-mimicry tunnel never delivered")
         .expect("server tun channel closed");
     assert_eq!(received, packet);
+}
+
+#[tokio::test]
+async fn tunnel_works_with_daita_shaping() {
+    // DAITA (traffic-analysis defence): the same real WireGuard tunnel, but the client
+    // shapes its egress into a constant-rate stream of fixed-size cells (cover cells fill
+    // idle slots) carried inside the obfs frame. The server speaks the cell framing and
+    // drops cover before boringtun. We assert (1) a real packet still crosses, and (2)
+    // once it has, the steady cover stream does NOT leak anything to the server's tunnel.
+    let obfs_key = [0x7c; 32];
+    let cell_size = oxide_daita::DEFAULT_CELL_SIZE;
+    let slot = Duration::from_millis(2); // fast cadence so the handshake completes quickly
+
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Server: obfs transport + DAITA framing (wrap cells, drop inbound cover).
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::obfuscated(server_udp, obfs_key),
+        server_tun,
+    )
+    .with_daita(Daita::framing(cell_size));
+
+    // Client: obfs transport + DAITA shaping (constant-rate cells + cover).
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::obfuscated(client_udp, obfs_key),
+        client_tun,
+    )
+    .with_daita(Daita::shaping(cell_size, slot));
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"shaped tunnel works",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; DAITA-shaped tunnel never delivered")
+        .expect("server tun channel closed");
+    assert_eq!(received, packet);
+
+    // The client keeps emitting cover cells every slot even with no more real traffic.
+    // The server must recognize and drop them before boringtun, so nothing further should
+    // reach its tunnel side within a window spanning many cover cells.
+    let leaked = tokio::time::timeout(Duration::from_millis(300), srv_capture.recv()).await;
+    assert!(
+        leaked.is_err(),
+        "cover cells must be dropped, not surface on the server's tunnel"
+    );
 }
 
 #[tokio::test]

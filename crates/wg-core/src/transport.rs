@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -15,6 +15,7 @@ use tokio::net::UdpSocket;
 use oxide_mimicry::quic::{self, Nonce, AUTH_WINDOW_SECS};
 use oxide_obfs::{deobfuscate, obfuscate};
 
+use crate::decoy::DecoyForwarder;
 use crate::mimic::MimicTransport;
 
 /// Scratch buffer for an obfuscated datagram (WireGuard max + obfs overhead).
@@ -41,13 +42,17 @@ pub enum Transport {
     /// authentication makes the endpoint resist active probing: forged, stale, or replayed
     /// Initials are dropped in silence, so the port looks dead to a prober.
     QuicMimic {
-        socket: UdpSocket,
+        socket: Arc<UdpSocket>,
         key: [u8; 32],
         sent_initial: Mutex<HashSet<SocketAddr>>,
         /// Anti-replay cache: nonce → the Initial's timestamp. Entries older than the
         /// freshness window are pruned, so a replayed Initial either matches a live entry
         /// (dropped) or has already aged out of the window (also dropped).
         seen_initials: Mutex<HashMap<Nonce, u64>>,
+        /// Optional decoy-forwarding: when set, an unauthenticated first-contact Initial
+        /// (forged/stale/replayed) is spliced to a real backend instead of being dropped,
+        /// so the port answers like an ordinary QUIC server under active probing.
+        decoy: Option<Arc<DecoyForwarder>>,
     },
 }
 
@@ -66,10 +71,30 @@ impl Transport {
 
     pub fn quic_mimic(socket: UdpSocket, key: [u8; 32]) -> Self {
         Transport::QuicMimic {
+            socket: Arc::new(socket),
+            key,
+            sent_initial: Mutex::new(HashSet::new()),
+            seen_initials: Mutex::new(HashMap::new()),
+            decoy: None,
+        }
+    }
+
+    /// QUIC mimicry with **decoy-forwarding**: unauthenticated first-contact Initials are
+    /// proxied to `decoy_backend` (a real TLS/QUIC endpoint) rather than dropped, so the
+    /// port answers like an ordinary web server under active probing. See [`crate::decoy`].
+    pub fn quic_mimic_with_decoy(
+        socket: UdpSocket,
+        key: [u8; 32],
+        decoy_backend: SocketAddr,
+    ) -> Self {
+        let socket = Arc::new(socket);
+        let decoy = DecoyForwarder::new(socket.clone(), decoy_backend);
+        Transport::QuicMimic {
             socket,
             key,
             sent_initial: Mutex::new(HashSet::new()),
             seen_initials: Mutex::new(HashMap::new()),
+            decoy: Some(decoy),
         }
     }
 
@@ -125,14 +150,24 @@ impl Transport {
                 socket,
                 key,
                 seen_initials,
+                decoy,
                 ..
             } => {
                 let mut raw = [0u8; OBFS_BUF];
                 loop {
                     let (n, addr) = socket.recv_from(&mut raw).await?;
                     let dg = &raw[..n];
-                    // A long header must be a well-keyed, fresh, non-replayed Initial;
-                    // anything else (forged/stale/replayed probe) is dropped in silence.
+
+                    // A source already classified as a prober keeps getting spliced to the
+                    // decoy backend for the flow's lifetime — it only ever sees a real server.
+                    if let Some(d) = decoy {
+                        if d.is_decoy(&addr).await {
+                            d.forward(dg, addr).await;
+                            continue;
+                        }
+                    }
+
+                    // A long header must be a well-keyed, fresh, non-replayed Initial.
                     // Short-header packets carry no authenticator — their payload is still
                     // gated by the WireGuard AEAD after deobfuscation.
                     let payload = if dg.first().is_some_and(|b| b & 0x80 != 0) {
@@ -140,7 +175,15 @@ impl Transport {
                             Some((nonce, payload)) if accept_initial(seen_initials, nonce) => {
                                 payload
                             }
-                            _ => continue,
+                            // Unauthenticated Initial (forged/stale/replayed) — the active-
+                            // probe vector. With a decoy configured, splice the source to a
+                            // real backend so the port answers; otherwise drop in silence.
+                            _ => {
+                                if let Some(d) = decoy {
+                                    d.forward(dg, addr).await;
+                                }
+                                continue;
+                            }
                         }
                     } else {
                         match quic::parse_short(dg) {
@@ -232,6 +275,124 @@ mod tests {
         .expect("recv should not hang")
         .unwrap();
         assert_eq!(&buf[..n], b"real");
+    }
+
+    /// A UDP stub standing in for a real co-hosted TLS/QUIC site: it replies to anything
+    /// with a recognizable marker so the test can see the decoy answer come back.
+    async fn spawn_decoy_backend() -> SocketAddr {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, src)) = backend.recv_from(&mut b).await {
+                let mut resp = b"decoy-backend:".to_vec();
+                resp.extend_from_slice(&b[..n]);
+                let _ = backend.send_to(&resp, src).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn forged_probe_is_answered_by_the_decoy_backend() {
+        // With decoy-forwarding on, a prober's forged Initial must not be dropped: it is
+        // spliced to the backend, whose response returns to the prober from the server's
+        // own port — so the port looks alive and ordinary, not dead.
+        let backend_addr = spawn_decoy_backend().await;
+
+        let key = [42u8; 32];
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = Arc::new(Transport::quic_mimic_with_decoy(
+            server_sock,
+            key,
+            backend_addr,
+        ));
+
+        // Drive the server's recv loop; it must never surface the forged probe as a payload.
+        tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut buf = [0u8; 2048];
+                let _ = server.recv_from(&mut buf).await;
+            }
+        });
+
+        // A prober without the key crafts a QUIC Initial and waits for a response.
+        let prober = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forged = quic::initial_packet(&obfuscate(&[9u8; 32], b"probe"), &[9u8; 32], now_secs());
+        prober.send_to(&forged, server_addr).await.unwrap();
+
+        let mut b = [0u8; 2048];
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv_from(&mut b))
+                .await
+                .expect("decoy must answer the probe (the port must look alive)")
+                .unwrap();
+        assert_eq!(
+            from, server_addr,
+            "response must appear to come from the server's port"
+        );
+        assert!(b[..n].starts_with(b"decoy-backend:"));
+    }
+
+    #[tokio::test]
+    async fn genuine_tunnels_while_forged_is_decoyed() {
+        // The acceptance capstone: with decoy on, a genuine authenticated Initial still
+        // tunnels normally *while* a concurrent forged probe is decoy-forwarded.
+        let backend_addr = spawn_decoy_backend().await;
+
+        let key = [42u8; 32];
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = Arc::new(Transport::quic_mimic_with_decoy(
+            server_sock,
+            key,
+            backend_addr,
+        ));
+
+        // Server recv loop pushes any *real* delivered payloads to a channel.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut buf = [0u8; 2048];
+                while let Ok((n, _)) = server.recv_from(&mut buf).await {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Prober: forged Initial (wrong key). Genuine client: correct key.
+        let prober = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forged = quic::initial_packet(&obfuscate(&[9u8; 32], b"probe"), &[9u8; 32], now_secs());
+        prober.send_to(&forged, server_addr).await.unwrap();
+
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Transport::quic_mimic(client_sock, key);
+        client
+            .send_to(b"genuine handshake", server_addr)
+            .await
+            .unwrap();
+
+        // The genuine payload is delivered to the tunnel; the forged probe never surfaces.
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("genuine Initial should still tunnel with decoy on")
+            .expect("channel closed");
+        assert_eq!(delivered, b"genuine handshake");
+
+        // ...and the prober still gets a decoy answer, concurrently.
+        let mut b = [0u8; 2048];
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv_from(&mut b))
+                .await
+                .expect("decoy must answer the probe concurrently")
+                .unwrap();
+        assert_eq!(from, server_addr);
+        assert!(b[..n].starts_with(b"decoy-backend:"));
     }
 
     #[tokio::test]

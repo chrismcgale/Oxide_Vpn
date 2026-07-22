@@ -21,10 +21,10 @@ use ipnet::IpNet;
 use tracing::{info, warn};
 
 use oxide_common::api::RegisterDeviceResponse;
-use oxide_common::{keys, InterfaceConfig, SecretKey};
+use oxide_common::{keys, InterfaceConfig, SecretKey, TransportKind};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink, TunDevice};
-use oxide_wg_core::{Engine, EngineHandle, PeerParams, Transport};
+use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport};
 
 /// The tunnel interface name.
 pub const IFNAME: &str = "oxide0";
@@ -213,6 +213,9 @@ pub async fn resolve_mesh(req: &MeshRequest) -> Result<Resolved> {
         dns: None,
         obfuscation_key: None,
         pq_private_seed: None,
+        decoy_backend: None,
+        transport: TransportKind::default(),
+        daita: false,
     };
     Ok(Resolved {
         iface,
@@ -271,6 +274,9 @@ pub fn resolve_registration(
         dns: reg.dns.as_ref().and_then(|s| s.parse().ok()),
         obfuscation_key,
         pq_private_seed: None,
+        decoy_backend: None,
+        transport: TransportKind::default(),
+        daita: false,
     };
     let peer = PeerParams {
         public_key: reg.server.public_key,
@@ -285,6 +291,45 @@ pub fn resolve_registration(
 /// Bring up the interface, install routing/kill-switch/DNS, run the engine until `stop`
 /// resolves, then tear everything down. `on_ready` receives the engine handle once it's
 /// running (for live stats).
+/// Build the client-side [`Transport`] the config selects. Stealth transports need the
+/// shared `key`; the TLS-mimicry (TCP) transport connects to a peer's endpoint. The QUIC
+/// transport is used without decoy-forwarding client-side (decoy is a server concern).
+async fn build_client_transport(
+    kind: TransportKind,
+    bind_port: u16,
+    peers: &[PeerParams],
+    key: Option<[u8; 32]>,
+) -> Result<Transport> {
+    let req_key = || key.context("this transport requires interface.obfuscation_key");
+    let bind_udp = || async {
+        tokio::net::UdpSocket::bind(("0.0.0.0", bind_port))
+            .await
+            .context("binding client UDP socket")
+    };
+    match kind {
+        TransportKind::Plain => Ok(Transport::plain(bind_udp().await?)),
+        TransportKind::Obfs => {
+            info!("stealth: obfuscated transport");
+            Ok(Transport::obfuscated(bind_udp().await?, req_key()?))
+        }
+        TransportKind::Quic => {
+            info!("stealth: QUIC mimicry");
+            Ok(Transport::quic_mimic(bind_udp().await?, req_key()?))
+        }
+        TransportKind::Mimic => {
+            let server = peers
+                .iter()
+                .find_map(|p| p.endpoint)
+                .context("TLS-mimicry client needs a peer with an endpoint")?;
+            info!(%server, "stealth: TLS mimicry (TCP)");
+            let m = MimicTransport::connect(server, req_key()?)
+                .await
+                .context("connecting TLS-mimicry transport")?;
+            Ok(Transport::mimic(m))
+        }
+    }
+}
+
 pub async fn run_tunnel<Stop, Ready>(
     iface: &InterfaceConfig,
     peers: Vec<PeerParams>,
@@ -366,18 +411,21 @@ where
     }
 
     let bind_port = iface.listen_port.unwrap_or(0);
-    let udp = tokio::net::UdpSocket::bind(("0.0.0.0", bind_port))
-        .await
-        .context("binding client UDP socket")?;
-    let transport = match &iface.obfuscation_key {
-        Some(k) => {
-            info!("stealth mode enabled (obfuscated transport)");
-            Transport::obfuscated(udp, *k.as_bytes())
-        }
-        None => Transport::plain(udp),
-    };
+    let kind = iface.transport_kind();
+    if iface.daita && !kind.is_stealth() {
+        anyhow::bail!("daita = true requires a stealth transport (obfs / quic / mimic)");
+    }
+    let key = iface.obfuscation_key.as_ref().map(|k| *k.as_bytes());
+    let transport = build_client_transport(kind, bind_port, &peers, key).await?;
 
     let engine = Engine::build(&iface.private_key, peers, transport, tun);
+    // DAITA (traffic-analysis defense): shape client egress to a constant rate + cover.
+    let engine = if iface.daita {
+        info!("DAITA enabled (client shaping mode)");
+        engine.with_daita(Daita::client())
+    } else {
+        engine
+    };
     on_ready(engine.handle());
     info!("connecting");
 
