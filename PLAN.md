@@ -18,9 +18,9 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 15-crate Cargo workspace. ~83 tests, all green, all verified **without
-root** (mock TUN + loopback UDP + in-process control plane); the live-kernel path is
-verified by the CI netns job.
+Linux-first, as a 17-crate Cargo workspace. ~94 tests, all green, all verified **without
+root** (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged);
+the live-kernel path is verified by the CI netns job.
 
 **Done (M1–M4 + signature features):**
 - **Data plane** (`wg-core`): boringtun engine, 3 tokio tasks, runtime-mutable peer table
@@ -42,6 +42,10 @@ verified by the CI netns job.
 - **Traffic-analysis defense** (`daita` + `wg-core` shaper): DAITA v1 — client egress
   shaped to a constant rate of fixed-size cells with cover traffic filling idle slots
   (`Engine::with_daita`); finishes the size/rate/cover story obfs began.
+- **Verifiable no-logs** (`seccomp` + `attest`): enforced (a seccomp filter makes the
+  server unable to write to disk, `[hardening] no_disk_writes`) + provable (Ed25519 signed
+  build manifest verified against a pinned key + a hash-chained transparency log). 1D-1..3
+  done; distributing the manifest/log via the control plane (verify at connect) remains.
 - **Post-quantum** (`pq`): ML-KEM-768 → WireGuard PSK, hybrid, single-hop + multihop.
 - **Mesh hybrid**: control-plane-coordinated private WireGuard P2P overlay of the account's
   own devices (`resolve_mesh`, `oxide-client mesh`); composes with a full-tunnel exit.
@@ -200,6 +204,14 @@ ship the tractable layers, document hardware attestation as a stretch.
 reproducible-build script emitting a stable hash; a signed-manifest endpoint + client-side
 signature verification; a minimal transparency-log format + verifier. No root needed for the
 crypto/format parts; seccomp test runs in CI.
+
+> ✅ **1D-1 / 1D-2 / 1D-3 DONE (2026-07-22).** `oxide-seccomp` (no-disk-writes filter,
+> unprivileged fork-test; serverd `[hardening] no_disk_writes`) + `oxide-attest` (Ed25519
+> signed `BuildManifest` verified against a pinned key; hash-chained `TransparencyLog` with a
+> signed head). serverd `attest-genkey`/`manifest` + `build.rs`. 15 tests. **Remaining:**
+> distribute the manifest + log via the control plane so the client verifies **at connect**
+> (overlaps 2A-2); a reproducible-build script; **1D-4 HW attestation (TPM/SGX)** stays out —
+> needs hardware, flagged to the user. See SKILL Changelog for the decision record.
 
 ### WAVE 2 — Productization & scale (make it a real product)
 

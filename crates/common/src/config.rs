@@ -43,8 +43,23 @@ pub struct Config {
     #[serde(default)]
     pub control_plane: Option<ControlPlaneConfig>,
 
+    /// Optional process hardening (server-side). Absent = no extra hardening.
+    #[serde(default)]
+    pub hardening: Option<HardeningConfig>,
+
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+}
+
+/// Server process-hardening switches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct HardeningConfig {
+    /// Enforced no-logs: install a seccomp filter (after setup, before the packet loop)
+    /// that makes the process **unable to create or write files**, so it cannot log to
+    /// disk even if compromised. Read-only opens and sockets keep working. Pairs best with
+    /// a fully static config, since it also forbids runtime file writes. See `oxide-seccomp`.
+    #[serde(default)]
+    pub no_disk_writes: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

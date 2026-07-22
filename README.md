@@ -28,6 +28,13 @@ non-tunnel traffic (so nothing leaks if the tunnel drops), DNS leak protection p
 the resolver at the tunnel DNS while connected, and the data plane is audited to keep
 nothing on disk and log no client PII.
 
+**Verifiable no-logs:** the no-logs claim is *enforced and provable*, not just asserted. An
+optional seccomp filter (`[hardening] no_disk_writes`) makes the server process physically
+**unable to create or write files** — so it can't log to disk even if compromised. And an
+Ed25519 **signed build manifest** (the binary's SHA-256 + git commit, verified against a
+pinned release key) plus a hash-chained **transparency log** of deployed builds let a client
+confirm its server runs the exact audited build — verify the binary, don't trust the promise.
+
 **Multihop complete:** the client runs one WireGuard session keyed to an *exit* server
 but sends it through an *entry* server that relays the (still-encrypted) traffic — so no
 single server sees both your IP and your destination. Done the WireGuard-native way (the
@@ -91,6 +98,8 @@ Config templates live in `configs/`. Operational details are in the project runb
 | `crates/relay` | UDP relay for multihop entry servers |
 | `crates/obfs` | Stealth-mode obfuscation codec (anti-DPI) |
 | `crates/daita` | Traffic-analysis defense: constant-rate cell shaper + cover traffic |
+| `crates/seccomp` | Enforced no-logs: seccomp filter making the process unable to write to disk |
+| `crates/attest` | Verifiable build identity: signed build manifest + transparency log |
 | `crates/mimicry` | Protocol mimicry: TLS-over-TCP (HTTPS) + QUIC-over-UDP (HTTP/3) |
 | `crates/pq` | Post-quantum (ML-KEM) key agreement for a hybrid PSK |
 | `crates/oxide-serverd` | Server daemon (static peers or control-plane-managed) |

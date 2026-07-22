@@ -49,6 +49,16 @@ enum Cmd {
     /// Put the seed in the server config (`pq_private_seed`) and register the public key
     /// with the control plane (`add-server --pq-public-key`).
     PqGenkey,
+    /// Generate an Ed25519 **release key** for signed build manifests. Keep the seed
+    /// offline; pin the public key in clients.
+    AttestGenkey,
+    /// Print a release-key-signed build manifest for THIS binary (version, git commit,
+    /// build time, and the binary's SHA-256). Publish it so clients can verify the build.
+    Manifest {
+        /// Release signing seed (base64), from `attest-genkey`.
+        #[arg(long)]
+        key: String,
+    },
 }
 
 #[tokio::main]
@@ -81,6 +91,30 @@ async fn main() -> Result<()> {
                 "pq_public_key  (add-server):     {}",
                 B64.encode(&public_key)
             );
+            Ok(())
+        }
+        Cmd::AttestGenkey => {
+            let (seed, public_key) = oxide_attest::generate_release_key();
+            println!("attest_signing_seed (keep offline): {}", B64.encode(seed));
+            println!(
+                "attest_public_key   (pin in clients): {}",
+                B64.encode(public_key)
+            );
+            Ok(())
+        }
+        Cmd::Manifest { key } => {
+            let seed: [u8; oxide_attest::KEY_LEN] = B64
+                .decode(key.trim())
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .context("--key must be a base64 32-byte signing seed")?;
+            let manifest = oxide_attest::BuildManifest {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                git_commit: env!("OXIDE_GIT_COMMIT").to_string(),
+                build_time: env!("OXIDE_BUILD_TIME").to_string(),
+                binary_sha256: oxide_attest::self_binary_sha256().context("hashing this binary")?,
+            };
+            println!("{}", oxide_attest::sign_manifest(manifest, &seed).to_json());
             Ok(())
         }
         Cmd::Up { config } => run(config).await,
@@ -159,6 +193,15 @@ async fn run(config_path: PathBuf) -> Result<()> {
     if let Some(cp) = cfg.control_plane {
         let handle = engine.handle();
         tokio::spawn(poll_control_plane(handle, cp, pq_seed));
+    }
+
+    // Enforced no-logs (verifiable): all legitimate file setup (TUN, sockets, config read)
+    // is done, so from here the process can be made *unable* to write to disk. Applied
+    // across all tokio threads and inherited by any spawned later.
+    if cfg.hardening.as_ref().is_some_and(|h| h.no_disk_writes) {
+        oxide_seccomp::apply_no_disk_writes()
+            .context("installing no-disk-writes seccomp filter")?;
+        info!("enforced no-logs: seccomp filter installed (process cannot write to disk)");
     }
 
     // Run until Ctrl-C / SIGTERM, then tear down host state (leave-no-trace).

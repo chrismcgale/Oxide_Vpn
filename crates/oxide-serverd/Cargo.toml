@@ -14,6 +14,8 @@ oxide-net-linux = { path = "../net-linux" }
 oxide-control-client = { path = "../control-client" }
 oxide-relay = { path = "../relay" }
 oxide-pq = { path = "../pq" }
+oxide-seccomp = { path = "../seccomp" }
+oxide-attest = { path = "../attest" }
 base64 = "0.22"
 tokio = { workspace = true }
 clap = { workspace = true }

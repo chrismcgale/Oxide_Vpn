@@ -9,6 +9,8 @@ members = [
     "crates/relay",
     "crates/obfs",
     "crates/daita",
+    "crates/seccomp",
+    "crates/attest",
     "crates/pq",
     "crates/mimicry",
     "crates/client-core",

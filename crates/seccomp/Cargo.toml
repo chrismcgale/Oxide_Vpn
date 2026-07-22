@@ -1,0 +1,13 @@
+[package]
+name = "oxide-seccomp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oxide_seccomp"
+path = "src/lib.rs"
+
+[dependencies]
+seccompiler = "0.5"
+libc = { workspace = true }
+anyhow = { workspace = true }

@@ -12,7 +12,8 @@ pub mod keys;
 pub mod tun;
 
 pub use config::{
-    Config, ControlPlaneConfig, InterfaceConfig, NatConfig, PeerConfig, TransportKind,
+    Config, ControlPlaneConfig, HardeningConfig, InterfaceConfig, NatConfig, PeerConfig,
+    TransportKind,
 };
 pub use error::{Error, Result};
 pub use keys::{PublicKey, SecretKey};

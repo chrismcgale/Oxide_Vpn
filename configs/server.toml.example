@@ -34,6 +34,13 @@ mtu = 1420
 # derives a per-device quantum-resistant PSK, layered on x25519.
 # pq_private_seed = "BASE64_64_BYTE_SEED"
 
+# Enforced no-logs (verifiable): install a seccomp filter, after startup, that makes this
+# process physically UNABLE to create or write files — so it can't log to disk even if
+# compromised. Read-only opens and sockets keep working. Pairs best with a fully static
+# config (it also forbids runtime file writes). Verified in CI without root.
+# [hardening]
+# no_disk_writes = true
+
 # Optional: enable full-tunnel internet egress via NAT masquerade.
 # Omit this whole section for a tunnel-only (no internet egress) server.
 [nat]

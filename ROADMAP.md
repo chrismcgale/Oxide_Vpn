@@ -54,8 +54,14 @@ Ranked by differentiation × real-world impact. All leverage owning the stack.
    that's actually private." *Next:* NAT traversal (STUN-style hole punching + a DERP-style
    relay fallback) so devices behind NAT mesh without a forwarded port.
 
-**Secondary:** verifiable no-logs (remote attestation / reproducible builds / transparency
-log); policy split-tunneling (per-app/per-destination routing); developer API/SDK
+**Verifiable no-logs.** — *DONE (enforced + provable):* `oxide-seccomp` installs a filter
+that makes the server **unable to write to disk** (config `[hardening] no_disk_writes`) —
+enforcement, not a promise; `oxide-attest` gives an Ed25519 **signed build manifest** (binary
+SHA-256 + git commit, verified against a pinned release key) and a hash-chained **transparency
+log** of deployed builds. *Next:* distribute the manifest/log via the control plane so clients
+verify **at connect**; reproducible-build script; remote attestation (TPM/SGX) needs hardware.
+
+**Secondary:** policy split-tunneling (per-app/per-destination routing); developer API/SDK
 (embeddable ephemeral tunnels); "new identity" button (per-session ephemeral keys + exit
 rotation).
 
