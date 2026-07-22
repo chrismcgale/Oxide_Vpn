@@ -18,7 +18,7 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 17-crate Cargo workspace. ~95 tests, all green, verified **without root**
+Linux-first, as a 17-crate Cargo workspace. ~96 tests, all green, verified **without root**
 (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged; the
 control plane runs on SQLite or Postgres — the Postgres flow test is gated on a live DB).
 The live-kernel path is verified by the CI netns job.
@@ -63,8 +63,9 @@ The live-kernel path is verified by the CI netns job.
 - Peer demux is an O(peers) source-address fallback, not a receiver-index table.
 - `nft`/`sysctl` still shell out; DNS backend isn't `systemd-resolved`-aware.
 - WG **transport** is IPv4-only (IPv6 *inside* the tunnel works).
-- Postgres backend done (2B); still single-writer (`reg_lock` in-process) so **one API node**
-  until that lock goes DB-side (2C); no provisioning automation.
+- Postgres backend done (2B) + concurrency-safe/multi-node allocation done (2C core); a fleet
+  now needs only the remaining 2C lifecycle bits (token rotation, re-selection); no
+  provisioning automation yet.
 - No desktop/mobile/cross-platform clients yet.
 
 ---
@@ -229,8 +230,13 @@ crypto/format parts; seccomp test runs in CI.
   Postgres 18.4** (`tests/postgres.rs`, gated on `OXIDE_TEST_PG_URL`) with **zero SQLite
   regression**. *Next for multi-node:* make `reg_lock` DB-side/advisory so multiple API nodes
   can share one Postgres (2C).
-- [ ] **2C HA & lifecycle** — control-plane redundancy, client re-selection on server death,
-  server-token rotation, versioned zero-downtime API.
+- [~] **2C HA & lifecycle** — *core DONE 2026-07-22 (multi-node ready).* Removed the
+  in-process `reg_lock`; correctness is now DB-side (`CREATE UNIQUE INDEX IF NOT EXISTS` on
+  `devices(server_id,tunnel_ip)` + `relays(entry_id,listen_port)`, lock-free insert-retry,
+  portable `is_unique_violation`, SQLite WAL+busy_timeout). 10-way concurrent-registration
+  test passes on **both** SQLite and live Postgres → multiple API nodes can share one PG.
+  **Remaining:** server-token rotation (grace window), client re-selection on server death,
+  versioned zero-downtime API, concurrent schema-init hardening.
 - [ ] **2D Provisioning automation** — stand up a server (keys, config, control-plane
   registration, NAT/sysctl) from one command / IaC; **CAP_NET_ADMIN non-root deploy**.
 - [ ] **2E Receiver-index peer demux** — replace the O(peers) source-addr fallback for busy

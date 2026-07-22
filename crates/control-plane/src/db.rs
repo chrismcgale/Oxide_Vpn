@@ -16,11 +16,11 @@
 //! keys, and IP assignments. No traffic, no timestamps beyond creation, no PII.
 
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{PgPool, Row, SqlitePool};
 
 /// A bind parameter for a query, backend-agnostic.
@@ -295,7 +295,11 @@ pub async fn connect(database_url: &str) -> Result<Db> {
             .unwrap_or(database_url);
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))
             .context("parsing sqlite url")?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // WAL + a busy timeout let concurrent registrations proceed instead of failing
+            // with SQLITE_BUSY — the DB-side uniqueness constraints do the real serialization.
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(opts)
@@ -372,6 +376,11 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN obfuscation_key TEXT",
         "ALTER TABLE servers ADD COLUMN pq_public_key TEXT",
         "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
+        // Concurrency-safe allocation constraints (2C), added idempotently so existing
+        // databases pick them up. On a legacy DB that already holds duplicates, index
+        // creation fails and is ignored (uniqueness simply isn't enforced there yet).
+        "CREATE UNIQUE INDEX IF NOT EXISTS devices_server_ip_uniq ON devices (server_id, tunnel_ip)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS relays_entry_port_uniq ON relays (entry_id, listen_port)",
     ] {
         let _ = sqlx::query(stmt).execute(pool).await;
     }
@@ -427,6 +436,10 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
             created_at  BIGINT NOT NULL,
             PRIMARY KEY (entry_id, exit_id)
         )"#,
+        // Concurrency-safe allocation constraints (2C), idempotent so existing databases
+        // pick them up on the next start (a real multi-node deployment relies on these).
+        "CREATE UNIQUE INDEX IF NOT EXISTS devices_server_ip_uniq ON devices (server_id, tunnel_ip)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS relays_entry_port_uniq ON relays (entry_id, listen_port)",
     ];
     for stmt in statements {
         sqlx::query(stmt)
@@ -435,6 +448,12 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
             .context("initializing postgres schema")?;
     }
     Ok(())
+}
+
+/// Whether an error is a UNIQUE/primary-key violation (portable across SQLite and Postgres).
+/// The concurrency-safe allocators use this to retry when a racing writer took the row first.
+pub fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(e) if e.is_unique_violation())
 }
 
 pub fn now_unix() -> i64 {

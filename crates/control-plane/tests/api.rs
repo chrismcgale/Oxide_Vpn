@@ -294,3 +294,70 @@ async fn metrics_report_counts_and_load() {
     // Prometheus format sanity: HELP/TYPE headers present.
     assert!(text.contains("# TYPE oxide_accounts_total gauge"));
 }
+
+#[tokio::test]
+async fn concurrent_registrations_get_distinct_ips() {
+    // 2C multi-node correctness: with the in-process registration lock removed, N concurrent
+    // device registrations must still each get a distinct tunnel IP — the DB-side
+    // UNIQUE(server_id, tunnel_ip) constraint + insert-retry does the serialization, so this
+    // holds even across separate API nodes sharing one database.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let server_pub = public_from_secret(&generate_secret()).to_base64();
+    add_server(
+        &pool,
+        NewServer {
+            id: "us-1",
+            public_key: &server_pub,
+            endpoint: "203.0.113.1:51820",
+            cidr: "10.8.0.0/28".parse().unwrap(), // .1 server, .2..=.14 assignable
+            country: None,
+            city: None,
+            capacity: 100,
+            dns: None,
+            obfuscation_key: None,
+            pq_public_key: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+
+    let base = format!("http://{addr}");
+    let account = ControlClient::new(&base).create_account().await.unwrap();
+
+    // Fire N concurrent registrations of distinct device keys through the running API.
+    let n = 10usize;
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let account = account.clone();
+        let base = base.clone();
+        handles.push(tokio::spawn(async move {
+            let cc = ControlClient::new(&base);
+            let dev = public_from_secret(&generate_secret());
+            cc.register_device(&account, dev, "us-1", None)
+                .await
+                .map(|r| r.assigned_ip)
+        }));
+    }
+
+    let mut ips = std::collections::HashSet::new();
+    for h in handles {
+        let ip = h
+            .await
+            .unwrap()
+            .expect("concurrent registration should succeed");
+        assert!(
+            ips.insert(ip),
+            "two devices were assigned the same tunnel IP"
+        );
+    }
+    assert_eq!(
+        ips.len(),
+        n,
+        "each concurrent device must get a distinct tunnel IP"
+    );
+}

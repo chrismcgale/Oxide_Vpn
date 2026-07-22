@@ -99,4 +99,58 @@ async fn full_flow_on_postgres() {
     assert!(metrics.contains(&format!(
         "oxide_server_capacity{{server=\"{server_id}\"}} 50"
     )));
+
+    // 2C multi-node correctness against live Postgres: with no cross-node lock, N concurrent
+    // registrations must each get a distinct IP — the UNIQUE(server_id, tunnel_ip) index +
+    // insert-retry is what a real multi-node deployment relies on. Uses a second, small-subnet
+    // server. (Folded into this one test so a single schema init runs on the shared DB.)
+    let conc_server = format!("{server_id}-conc");
+    let conc_pub = public_from_secret(&generate_secret()).to_base64();
+    add_server(
+        &pool,
+        NewServer {
+            id: &conc_server,
+            public_key: &conc_pub,
+            endpoint: "203.0.113.1:51820",
+            cidr: "10.20.0.0/28".parse().unwrap(), // .2..=.14 assignable
+            country: None,
+            city: None,
+            capacity: 100,
+            dns: None,
+            obfuscation_key: None,
+            pq_public_key: None,
+        },
+    )
+    .await
+    .expect("add_server (concurrency)");
+
+    let n = 10usize;
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let (account, base, sid) = (
+            account.clone(),
+            format!("http://{addr}"),
+            conc_server.clone(),
+        );
+        handles.push(tokio::spawn(async move {
+            let cc = ControlClient::new(&base);
+            let dev = public_from_secret(&generate_secret());
+            cc.register_device(&account, dev, &sid, None)
+                .await
+                .map(|r| r.assigned_ip)
+        }));
+    }
+    let mut ips = std::collections::HashSet::new();
+    for h in handles {
+        let ip = h
+            .await
+            .unwrap()
+            .expect("concurrent registration should succeed");
+        assert!(ips.insert(ip), "two devices got the same IP on postgres");
+    }
+    assert_eq!(
+        ips.len(),
+        n,
+        "each concurrent device must get a distinct IP"
+    );
 }

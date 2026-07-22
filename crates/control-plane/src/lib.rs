@@ -28,7 +28,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ipnet::IpNet;
 use rand_core::{OsRng, RngCore};
-use tokio::sync::Mutex;
 use tower_http::timeout::TimeoutLayer;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
@@ -69,8 +68,6 @@ struct RateWindow {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Db,
-    /// Serializes device registration so IP allocation can't race (single-writer safety).
-    reg_lock: Arc<Mutex<()>>,
     /// Fixed-window per-IP request counters.
     rate: Arc<StdMutex<HashMap<IpAddr, RateWindow>>>,
 }
@@ -79,7 +76,6 @@ impl AppState {
     pub fn new(pool: Db) -> Self {
         AppState {
             pool,
-            reg_lock: Arc::new(Mutex::new(())),
             rate: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -460,73 +456,88 @@ async fn register_core(
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored cidr")))?;
 
     let device_pk = public_key.to_base64();
-
-    // Serialize allocation + insert so two registrations can't grab the same IP.
-    let _guard = state.reg_lock.lock().await;
-
-    // Idempotent re-registration: same pubkey already registered on this server.
-    if let Some(existing) = state
-        .pool
-        .fetch_optional(
-            "SELECT account_number, tunnel_ip, server_id FROM devices WHERE public_key = ?",
-            &[Val::from(device_pk.as_str())],
-        )
-        .await?
-    {
-        let owner = existing.text("account_number");
-        if owner != account {
-            return Err(AppError::Conflict("device key already registered".into()));
-        }
-        let ip = existing.text("tunnel_ip");
-        return response_for(
-            ip,
-            cidr,
-            server_pk,
-            server_endpoint,
-            server_tunnel_ip,
-            server_dns,
-            server_obfs,
-        );
-    }
-
-    // Allocate the lowest free host in the subnet.
-    let used = used_ips(&state.pool, server_id).await?;
     let server_ip: IpAddr = server_tunnel_ip
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored server ip")))?;
-    let assigned = ip_alloc::allocate(cidr, server_ip, &used)
-        .ok_or_else(|| AppError::Conflict("server subnet exhausted".into()))?;
 
-    state
-        .pool
-        .execute(
-            "INSERT INTO devices
-                (account_number, public_key, server_id, tunnel_ip, pq_ciphertext, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            &[
-                Val::from(account),
-                Val::from(device_pk.as_str()),
-                Val::from(server_id),
-                Val::from(assigned.to_string()),
-                Val::from(pq_ciphertext),
-                Val::from(db::now_unix()),
-            ],
-        )
-        .await?;
+    // Concurrency-safe allocation with NO cross-node lock: re-check idempotency, allocate
+    // the lowest free host, and try to insert. A UNIQUE(server_id, tunnel_ip) (and the
+    // UNIQUE public_key) turn a race into a violation, which we retry — the loser re-reads
+    // and either returns the winner's row (same device) or allocates the next free IP. This
+    // is what lets multiple API nodes share one database.
+    for _ in 0..ALLOC_RETRIES {
+        // Idempotent re-registration: same pubkey already registered on this server.
+        if let Some(existing) = state
+            .pool
+            .fetch_optional(
+                "SELECT account_number, tunnel_ip, server_id FROM devices WHERE public_key = ?",
+                &[Val::from(device_pk.as_str())],
+            )
+            .await?
+        {
+            let owner = existing.text("account_number");
+            if owner != account {
+                return Err(AppError::Conflict("device key already registered".into()));
+            }
+            return response_for(
+                existing.text("tunnel_ip"),
+                cidr,
+                server_pk,
+                server_endpoint,
+                server_tunnel_ip,
+                server_dns,
+                server_obfs,
+            );
+        }
 
-    response_for(
-        assigned.to_string(),
-        cidr,
-        server_pk,
-        server_endpoint,
-        server_tunnel_ip,
-        server_dns,
-        server_obfs,
-    )
+        let used = used_ips(&state.pool, server_id).await?;
+        let assigned = ip_alloc::allocate(cidr, server_ip, &used)
+            .ok_or_else(|| AppError::Conflict("server subnet exhausted".into()))?;
+
+        match state
+            .pool
+            .execute(
+                "INSERT INTO devices
+                    (account_number, public_key, server_id, tunnel_ip, pq_ciphertext, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                &[
+                    Val::from(account),
+                    Val::from(device_pk.as_str()),
+                    Val::from(server_id),
+                    Val::from(assigned.to_string()),
+                    Val::from(pq_ciphertext),
+                    Val::from(db::now_unix()),
+                ],
+            )
+            .await
+        {
+            Ok(()) => {
+                return response_for(
+                    assigned.to_string(),
+                    cidr,
+                    server_pk,
+                    server_endpoint,
+                    server_tunnel_ip,
+                    server_dns,
+                    server_obfs,
+                );
+            }
+            // Lost the race (this IP or this pubkey was just taken): loop to re-check/re-pick.
+            Err(e) if db::is_unique_violation(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(AppError::Conflict(
+        "could not allocate a tunnel IP under contention".into(),
+    ))
 }
 
 /// Base UDP port for relay listeners on an entry server.
 const RELAY_PORT_BASE: i64 = 51900;
+
+/// How many times an allocator retries when a concurrent writer wins the race for its row
+/// (a fresh candidate is computed each attempt). Comfortably above realistic contention.
+const ALLOC_RETRIES: usize = 16;
 
 /// The mesh overlay subnet (Tailscale-style CGNAT space). Devices get a stable `/32` here.
 const MESH_CIDR: &str = "100.64.0.0/16";
@@ -541,17 +552,17 @@ async fn mesh_register(
     let device_pk = req.public_key.to_base64();
     let cidr: IpNet = MESH_CIDR.parse().unwrap();
 
-    let _guard = state.reg_lock.lock().await;
-
-    let existing = state
-        .pool
-        .fetch_optional(
-            "SELECT account_number, mesh_ip FROM mesh_devices WHERE public_key = ?",
-            &[Val::from(device_pk.as_str())],
-        )
-        .await?;
-    let mesh_ip = match existing {
-        Some(row) => {
+    // Same lock-free, retry-on-conflict allocation as device registration (mesh_ip and
+    // public_key are UNIQUE), so multiple API nodes can register mesh devices concurrently.
+    let mesh_ip = 'alloc: loop {
+        if let Some(row) = state
+            .pool
+            .fetch_optional(
+                "SELECT account_number, mesh_ip FROM mesh_devices WHERE public_key = ?",
+                &[Val::from(device_pk.as_str())],
+            )
+            .await?
+        {
             let owner = row.text("account_number");
             if owner != account {
                 return Err(AppError::Conflict("device already in another mesh".into()));
@@ -567,27 +578,30 @@ async fn mesh_register(
                     ],
                 )
                 .await?;
-            row.text("mesh_ip")
+            break 'alloc row.text("mesh_ip");
         }
-        None => {
-            let used = mesh_used_ips(&state.pool).await?;
-            let assigned = ip_alloc::allocate(cidr, cidr.network(), &used)
-                .ok_or_else(|| AppError::Conflict("mesh subnet exhausted".into()))?;
-            state
-                .pool
-                .execute(
-                    "INSERT INTO mesh_devices (account_number, public_key, mesh_ip, endpoint, created_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                    &[
-                        Val::from(account.as_str()),
-                        Val::from(device_pk.as_str()),
-                        Val::from(assigned.to_string()),
-                        Val::from(req.endpoint.as_str()),
-                        Val::from(db::now_unix()),
-                    ],
-                )
-                .await?;
-            assigned.to_string()
+
+        let used = mesh_used_ips(&state.pool).await?;
+        let assigned = ip_alloc::allocate(cidr, cidr.network(), &used)
+            .ok_or_else(|| AppError::Conflict("mesh subnet exhausted".into()))?;
+        match state
+            .pool
+            .execute(
+                "INSERT INTO mesh_devices (account_number, public_key, mesh_ip, endpoint, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Val::from(account.as_str()),
+                    Val::from(device_pk.as_str()),
+                    Val::from(assigned.to_string()),
+                    Val::from(req.endpoint.as_str()),
+                    Val::from(db::now_unix()),
+                ],
+            )
+            .await
+        {
+            Ok(()) => break 'alloc assigned.to_string(),
+            Err(e) if db::is_unique_violation(&e) => continue 'alloc,
+            Err(e) => return Err(e.into()),
         }
     };
 
@@ -642,41 +656,51 @@ async fn mesh_peers(pool: &Db, account: &str) -> ApiResult<Vec<MeshPeer>> {
 /// Ensure a relay route entry->exit exists; return its listen port. Allocates the next
 /// free port on the entry if the route is new.
 async fn ensure_relay(state: &AppState, entry_id: &str, exit_id: &str) -> ApiResult<u16> {
-    let _guard = state.reg_lock.lock().await;
+    // Lock-free with retry: UNIQUE(entry_id, exit_id) makes a duplicate route idempotent, and
+    // UNIQUE(entry_id, listen_port) prevents two concurrent routes grabbing the same port —
+    // a violation just means re-read (existing route) or re-pick the next free port.
+    for _ in 0..ALLOC_RETRIES {
+        if let Some(port) = state
+            .pool
+            .scalar_opt_i64(
+                "SELECT listen_port FROM relays WHERE entry_id = ? AND exit_id = ?",
+                &[Val::from(entry_id), Val::from(exit_id)],
+            )
+            .await?
+        {
+            return Ok(port as u16);
+        }
 
-    if let Some(port) = state
-        .pool
-        .scalar_opt_i64(
-            "SELECT listen_port FROM relays WHERE entry_id = ? AND exit_id = ?",
-            &[Val::from(entry_id), Val::from(exit_id)],
-        )
-        .await?
-    {
-        return Ok(port as u16);
+        let max = state
+            .pool
+            .scalar_nullable_i64(
+                "SELECT MAX(listen_port) FROM relays WHERE entry_id = ?",
+                &[Val::from(entry_id)],
+            )
+            .await?;
+        let port = max.map(|m| m + 1).unwrap_or(RELAY_PORT_BASE);
+
+        match state
+            .pool
+            .execute(
+                "INSERT INTO relays (entry_id, exit_id, listen_port, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    Val::from(entry_id),
+                    Val::from(exit_id),
+                    Val::from(port),
+                    Val::from(db::now_unix()),
+                ],
+            )
+            .await
+        {
+            Ok(()) => return Ok(port as u16),
+            Err(e) if db::is_unique_violation(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
-
-    let max = state
-        .pool
-        .scalar_nullable_i64(
-            "SELECT MAX(listen_port) FROM relays WHERE entry_id = ?",
-            &[Val::from(entry_id)],
-        )
-        .await?;
-    let port = max.map(|m| m + 1).unwrap_or(RELAY_PORT_BASE);
-
-    state
-        .pool
-        .execute(
-            "INSERT INTO relays (entry_id, exit_id, listen_port, created_at) VALUES (?, ?, ?, ?)",
-            &[
-                Val::from(entry_id),
-                Val::from(exit_id),
-                Val::from(port),
-                Val::from(db::now_unix()),
-            ],
-        )
-        .await?;
-    Ok(port as u16)
+    Err(AppError::Conflict(
+        "could not allocate a relay port under contention".into(),
+    ))
 }
 
 /// Split `host:port` (or `[v6]:port`) into just the host part.
