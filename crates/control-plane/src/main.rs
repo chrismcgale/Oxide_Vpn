@@ -131,10 +131,15 @@ async fn main() -> Result<()> {
             let state = AppState::new(pool);
             // Reuse the HTTP handler path via a direct DB insert for simplicity.
             let number = oxide_common::account::generate_account_number();
-            sqlx::query("INSERT INTO accounts (number, created_at) VALUES (?, ?)")
-                .bind(&number)
-                .bind(db::now_unix())
-                .execute(&state.pool)
+            state
+                .pool
+                .execute(
+                    "INSERT INTO accounts (number, created_at) VALUES (?, ?)",
+                    &[
+                        db::Val::from(number.as_str()),
+                        db::Val::from(db::now_unix()),
+                    ],
+                )
                 .await?;
             println!("Account: {}", format_grouped(&number));
         }

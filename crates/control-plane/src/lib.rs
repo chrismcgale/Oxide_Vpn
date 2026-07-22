@@ -28,8 +28,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ipnet::IpNet;
 use rand_core::{OsRng, RngCore};
-use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 use tower_http::timeout::TimeoutLayer;
 
@@ -42,6 +40,7 @@ use oxide_common::api::{
 };
 use oxide_common::PublicKey;
 
+use db::{Db, DbRow, Val};
 use error::{ApiResult, AppError};
 
 /// A server is considered unhealthy if its last heartbeat is older than this. A server
@@ -69,15 +68,15 @@ struct RateWindow {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
-    /// Serializes device registration so IP allocation can't race under SQLite.
+    pub pool: Db,
+    /// Serializes device registration so IP allocation can't race (single-writer safety).
     reg_lock: Arc<Mutex<()>>,
     /// Fixed-window per-IP request counters.
     rate: Arc<StdMutex<HashMap<IpAddr, RateWindow>>>,
 }
 
 impl AppState {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: Db) -> Self {
         AppState {
             pool,
             reg_lock: Arc::new(Mutex::new(())),
@@ -168,16 +167,12 @@ async fn metrics(State(state): State<AppState>) -> ApiResult<String> {
 
 /// Render the Prometheus metrics text from the database. Separated out so it's testable
 /// without an HTTP round-trip.
-pub async fn render_metrics(pool: &SqlitePool) -> ApiResult<String> {
-    let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
-        .fetch_one(pool)
+pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
+    let accounts = pool
+        .scalar_i64("SELECT COUNT(*) FROM accounts", &[])
         .await?;
-    let servers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
-        .fetch_one(pool)
-        .await?;
-    let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices")
-        .fetch_one(pool)
-        .await?;
+    let servers = pool.scalar_i64("SELECT COUNT(*) FROM servers", &[]).await?;
+    let devices = pool.scalar_i64("SELECT COUNT(*) FROM devices", &[]).await?;
 
     let mut out = String::new();
     let gauge = |out: &mut String, name: &str, help: &str, value: i64| {
@@ -205,14 +200,17 @@ pub async fn render_metrics(pool: &SqlitePool) -> ApiResult<String> {
     );
 
     // Per-server live load (last heartbeat) and capacity.
-    let rows = sqlx::query("SELECT id, active_peers, capacity FROM servers ORDER BY id")
-        .fetch_all(pool)
+    let rows = pool
+        .fetch_all(
+            "SELECT id, active_peers, capacity FROM servers ORDER BY id",
+            &[],
+        )
         .await?;
     out.push_str("# HELP oxide_server_active_peers Live peers per server (last heartbeat).\n");
     out.push_str("# TYPE oxide_server_active_peers gauge\n");
     for row in &rows {
-        let id: String = row.get("id");
-        let ap: i64 = row.get("active_peers");
+        let id = row.text("id");
+        let ap = row.int("active_peers");
         out.push_str(&format!(
             "oxide_server_active_peers{{server=\"{id}\"}} {ap}\n"
         ));
@@ -220,8 +218,8 @@ pub async fn render_metrics(pool: &SqlitePool) -> ApiResult<String> {
     out.push_str("# HELP oxide_server_capacity Soft capacity per server (0 = unlimited).\n");
     out.push_str("# TYPE oxide_server_capacity gauge\n");
     for row in &rows {
-        let id: String = row.get("id");
-        let cap: i64 = row.get("capacity");
+        let id = row.text("id");
+        let cap = row.int("capacity");
         out.push_str(&format!("oxide_server_capacity{{server=\"{id}\"}} {cap}\n"));
     }
     Ok(out)
@@ -249,9 +247,12 @@ async fn auth_account(state: &AppState, headers: &HeaderMap) -> ApiResult<String
     if !is_valid_account_number(&token) {
         return Err(AppError::Unauthorized);
     }
-    let exists: Option<String> = sqlx::query_scalar("SELECT number FROM accounts WHERE number = ?")
-        .bind(&token)
-        .fetch_optional(&state.pool)
+    let exists = state
+        .pool
+        .scalar_opt_string(
+            "SELECT number FROM accounts WHERE number = ?",
+            &[Val::from(token.as_str())],
+        )
         .await?;
     exists.ok_or(AppError::Unauthorized)
 }
@@ -261,10 +262,12 @@ async fn create_account(State(state): State<AppState>) -> ApiResult<Json<CreateA
     // Collisions are astronomically unlikely; retry a few times to be safe.
     for _ in 0..5 {
         let number = generate_account_number();
-        let res = sqlx::query("INSERT INTO accounts (number, created_at) VALUES (?, ?)")
-            .bind(&number)
-            .bind(db::now_unix())
-            .execute(&state.pool)
+        let res = state
+            .pool
+            .execute(
+                "INSERT INTO accounts (number, created_at) VALUES (?, ?)",
+                &[Val::from(number.as_str()), Val::from(db::now_unix())],
+            )
             .await;
         match res {
             Ok(_) => {
@@ -338,29 +341,29 @@ fn eq_ci(field: &Option<String>, want: &str) -> bool {
 
 async fn load_servers(state: &AppState) -> ApiResult<Vec<ServerInfo>> {
     let sql = format!("SELECT {SERVER_COLUMNS} FROM servers ORDER BY id");
-    let rows = sqlx::query(&sql).fetch_all(&state.pool).await?;
+    let rows = state.pool.fetch_all(&sql, &[]).await?;
     rows.iter().map(server_info_from_row).collect()
 }
 
-fn server_info_from_row(row: &SqliteRow) -> ApiResult<ServerInfo> {
-    let pk: String = row.get("public_key");
+fn server_info_from_row(row: &DbRow) -> ApiResult<ServerInfo> {
+    let pk = row.text("public_key");
     let public_key = PublicKey::from_str(&pk)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("bad stored key: {e}")))?;
-    let last_hb: Option<i64> = row.get("last_heartbeat");
-    let healthy = match last_hb {
+    let healthy = match row.opt_int("last_heartbeat") {
+        // Never heartbeated → treat as healthy; otherwise apply the staleness window.
         None => true,
         Some(t) => db::now_unix() - t <= SERVER_STALE_SECS,
     };
     Ok(ServerInfo {
-        id: row.get("id"),
+        id: row.text("id"),
         public_key,
-        endpoint: row.get("endpoint"),
-        country: row.get("country"),
-        city: row.get("city"),
-        active_peers: row.get::<i64, _>("active_peers") as u32,
-        capacity: row.get::<i64, _>("capacity") as u32,
+        endpoint: row.text("endpoint"),
+        country: row.opt_text("country"),
+        city: row.opt_text("city"),
+        active_peers: row.int("active_peers") as u32,
+        capacity: row.int("capacity") as u32,
         healthy,
-        pq_public_key: row.get("pq_public_key"),
+        pq_public_key: row.opt_text("pq_public_key"),
     })
 }
 
@@ -409,9 +412,12 @@ async fn register_device_multihop(
     .await?;
 
     // The entry's public host, on which it relays. Reuse its stored endpoint's host.
-    let entry_endpoint: String = sqlx::query_scalar("SELECT endpoint FROM servers WHERE id = ?")
-        .bind(&req.entry_id)
-        .fetch_optional(&state.pool)
+    let entry_endpoint = state
+        .pool
+        .scalar_opt_string(
+            "SELECT endpoint FROM servers WHERE id = ?",
+            &[Val::from(req.entry_id.as_str())],
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("no such server: {}", req.entry_id)))?;
     let entry_host = host_of(&entry_endpoint);
@@ -433,21 +439,22 @@ async fn register_core(
     server_id: &str,
     pq_ciphertext: Option<&str>,
 ) -> ApiResult<RegisterDeviceResponse> {
-    let server = sqlx::query(
-        "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns, obfuscation_key
-         FROM servers WHERE id = ?",
-    )
-    .bind(server_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("no such server: {server_id}")))?;
+    let server = state
+        .pool
+        .fetch_optional(
+            "SELECT public_key, endpoint, tunnel_cidr, tunnel_ip, dns, obfuscation_key
+             FROM servers WHERE id = ?",
+            &[Val::from(server_id)],
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no such server: {server_id}")))?;
 
-    let server_pk: String = server.get("public_key");
-    let server_endpoint: String = server.get("endpoint");
-    let tunnel_cidr: String = server.get("tunnel_cidr");
-    let server_tunnel_ip: String = server.get("tunnel_ip");
-    let server_dns: Option<String> = server.get("dns");
-    let server_obfs: Option<String> = server.get("obfuscation_key");
+    let server_pk = server.text("public_key");
+    let server_endpoint = server.text("endpoint");
+    let tunnel_cidr = server.text("tunnel_cidr");
+    let server_tunnel_ip = server.text("tunnel_ip");
+    let server_dns = server.opt_text("dns");
+    let server_obfs = server.opt_text("obfuscation_key");
     let cidr: IpNet = tunnel_cidr
         .parse()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("bad stored cidr")))?;
@@ -458,17 +465,19 @@ async fn register_core(
     let _guard = state.reg_lock.lock().await;
 
     // Idempotent re-registration: same pubkey already registered on this server.
-    if let Some(existing) =
-        sqlx::query("SELECT account_number, tunnel_ip, server_id FROM devices WHERE public_key = ?")
-            .bind(&device_pk)
-            .fetch_optional(&state.pool)
-            .await?
+    if let Some(existing) = state
+        .pool
+        .fetch_optional(
+            "SELECT account_number, tunnel_ip, server_id FROM devices WHERE public_key = ?",
+            &[Val::from(device_pk.as_str())],
+        )
+        .await?
     {
-        let owner: String = existing.get("account_number");
+        let owner = existing.text("account_number");
         if owner != account {
             return Err(AppError::Conflict("device key already registered".into()));
         }
-        let ip: String = existing.get("tunnel_ip");
+        let ip = existing.text("tunnel_ip");
         return response_for(
             ip,
             cidr,
@@ -488,19 +497,22 @@ async fn register_core(
     let assigned = ip_alloc::allocate(cidr, server_ip, &used)
         .ok_or_else(|| AppError::Conflict("server subnet exhausted".into()))?;
 
-    sqlx::query(
-        "INSERT INTO devices
-            (account_number, public_key, server_id, tunnel_ip, pq_ciphertext, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(account)
-    .bind(&device_pk)
-    .bind(server_id)
-    .bind(assigned.to_string())
-    .bind(pq_ciphertext)
-    .bind(db::now_unix())
-    .execute(&state.pool)
-    .await?;
+    state
+        .pool
+        .execute(
+            "INSERT INTO devices
+                (account_number, public_key, server_id, tunnel_ip, pq_ciphertext, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Val::from(account),
+                Val::from(device_pk.as_str()),
+                Val::from(server_id),
+                Val::from(assigned.to_string()),
+                Val::from(pq_ciphertext),
+                Val::from(db::now_unix()),
+            ],
+        )
+        .await?;
 
     response_for(
         assigned.to_string(),
@@ -531,40 +543,50 @@ async fn mesh_register(
 
     let _guard = state.reg_lock.lock().await;
 
-    let existing =
-        sqlx::query("SELECT account_number, mesh_ip FROM mesh_devices WHERE public_key = ?")
-            .bind(&device_pk)
-            .fetch_optional(&state.pool)
-            .await?;
+    let existing = state
+        .pool
+        .fetch_optional(
+            "SELECT account_number, mesh_ip FROM mesh_devices WHERE public_key = ?",
+            &[Val::from(device_pk.as_str())],
+        )
+        .await?;
     let mesh_ip = match existing {
         Some(row) => {
-            let owner: String = row.get("account_number");
+            let owner = row.text("account_number");
             if owner != account {
                 return Err(AppError::Conflict("device already in another mesh".into()));
             }
             // Refresh the reachable endpoint.
-            sqlx::query("UPDATE mesh_devices SET endpoint = ? WHERE public_key = ?")
-                .bind(&req.endpoint)
-                .bind(&device_pk)
-                .execute(&state.pool)
+            state
+                .pool
+                .execute(
+                    "UPDATE mesh_devices SET endpoint = ? WHERE public_key = ?",
+                    &[
+                        Val::from(req.endpoint.as_str()),
+                        Val::from(device_pk.as_str()),
+                    ],
+                )
                 .await?;
-            row.get::<String, _>("mesh_ip")
+            row.text("mesh_ip")
         }
         None => {
             let used = mesh_used_ips(&state.pool).await?;
             let assigned = ip_alloc::allocate(cidr, cidr.network(), &used)
                 .ok_or_else(|| AppError::Conflict("mesh subnet exhausted".into()))?;
-            sqlx::query(
-                "INSERT INTO mesh_devices (account_number, public_key, mesh_ip, endpoint, created_at)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(&account)
-            .bind(&device_pk)
-            .bind(assigned.to_string())
-            .bind(&req.endpoint)
-            .bind(db::now_unix())
-            .execute(&state.pool)
-            .await?;
+            state
+                .pool
+                .execute(
+                    "INSERT INTO mesh_devices (account_number, public_key, mesh_ip, endpoint, created_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                    &[
+                        Val::from(account.as_str()),
+                        Val::from(device_pk.as_str()),
+                        Val::from(assigned.to_string()),
+                        Val::from(req.endpoint.as_str()),
+                        Val::from(db::now_unix()),
+                    ],
+                )
+                .await?;
             assigned.to_string()
         }
     };
@@ -586,32 +608,32 @@ async fn mesh_list(
     }))
 }
 
-async fn mesh_used_ips(pool: &SqlitePool) -> ApiResult<HashSet<IpAddr>> {
-    let rows = sqlx::query("SELECT mesh_ip FROM mesh_devices")
-        .fetch_all(pool)
+async fn mesh_used_ips(pool: &Db) -> ApiResult<HashSet<IpAddr>> {
+    let rows = pool
+        .fetch_all("SELECT mesh_ip FROM mesh_devices", &[])
         .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|r| r.get::<String, _>("mesh_ip").parse().ok())
+        .filter_map(|r| r.text("mesh_ip").parse().ok())
         .collect())
 }
 
 /// All devices in an account's mesh. The client filters out its own key.
-async fn mesh_peers(pool: &SqlitePool, account: &str) -> ApiResult<Vec<MeshPeer>> {
-    let rows = sqlx::query(
-        "SELECT public_key, mesh_ip, endpoint FROM mesh_devices WHERE account_number = ?",
-    )
-    .bind(account)
-    .fetch_all(pool)
-    .await?;
+async fn mesh_peers(pool: &Db, account: &str) -> ApiResult<Vec<MeshPeer>> {
+    let rows = pool
+        .fetch_all(
+            "SELECT public_key, mesh_ip, endpoint FROM mesh_devices WHERE account_number = ?",
+            &[Val::from(account)],
+        )
+        .await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
-            let pk: String = row.get("public_key");
+            let pk = row.text("public_key");
             Some(MeshPeer {
                 public_key: PublicKey::from_str(&pk).ok()?,
-                mesh_ip: row.get("mesh_ip"),
-                endpoint: row.get("endpoint"),
+                mesh_ip: row.text("mesh_ip"),
+                endpoint: row.text("endpoint"),
             })
         })
         .collect())
@@ -622,33 +644,38 @@ async fn mesh_peers(pool: &SqlitePool, account: &str) -> ApiResult<Vec<MeshPeer>
 async fn ensure_relay(state: &AppState, entry_id: &str, exit_id: &str) -> ApiResult<u16> {
     let _guard = state.reg_lock.lock().await;
 
-    if let Some(port) = sqlx::query_scalar::<_, i64>(
-        "SELECT listen_port FROM relays WHERE entry_id = ? AND exit_id = ?",
-    )
-    .bind(entry_id)
-    .bind(exit_id)
-    .fetch_optional(&state.pool)
-    .await?
+    if let Some(port) = state
+        .pool
+        .scalar_opt_i64(
+            "SELECT listen_port FROM relays WHERE entry_id = ? AND exit_id = ?",
+            &[Val::from(entry_id), Val::from(exit_id)],
+        )
+        .await?
     {
         return Ok(port as u16);
     }
 
-    let max: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(listen_port) FROM relays WHERE entry_id = ?")
-            .bind(entry_id)
-            .fetch_one(&state.pool)
-            .await?;
+    let max = state
+        .pool
+        .scalar_nullable_i64(
+            "SELECT MAX(listen_port) FROM relays WHERE entry_id = ?",
+            &[Val::from(entry_id)],
+        )
+        .await?;
     let port = max.map(|m| m + 1).unwrap_or(RELAY_PORT_BASE);
 
-    sqlx::query(
-        "INSERT INTO relays (entry_id, exit_id, listen_port, created_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(entry_id)
-    .bind(exit_id)
-    .bind(port)
-    .bind(db::now_unix())
-    .execute(&state.pool)
-    .await?;
+    state
+        .pool
+        .execute(
+            "INSERT INTO relays (entry_id, exit_id, listen_port, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Val::from(entry_id),
+                Val::from(exit_id),
+                Val::from(port),
+                Val::from(db::now_unix()),
+            ],
+        )
+        .await?;
     Ok(port as u16)
 }
 
@@ -663,11 +690,13 @@ fn host_of(endpoint: &str) -> String {
 /// Require the correct server auth token for `server_id`.
 async fn auth_server(state: &AppState, server_id: &str, headers: &HeaderMap) -> ApiResult<()> {
     let token = bearer(headers).ok_or(AppError::Unauthorized)?;
-    let expected: Option<String> =
-        sqlx::query_scalar("SELECT auth_token FROM servers WHERE id = ?")
-            .bind(server_id)
-            .fetch_optional(&state.pool)
-            .await?;
+    let expected = state
+        .pool
+        .scalar_opt_string(
+            "SELECT auth_token FROM servers WHERE id = ?",
+            &[Val::from(server_id)],
+        )
+        .await?;
     match expected {
         Some(t) if t == token => Ok(()),
         _ => Err(AppError::Unauthorized),
@@ -682,20 +711,22 @@ async fn list_peers(
 ) -> ApiResult<Json<PeerListResponse>> {
     auth_server(&state, &server_id, &headers).await?;
 
-    let rows =
-        sqlx::query("SELECT public_key, tunnel_ip, pq_ciphertext FROM devices WHERE server_id = ?")
-            .bind(&server_id)
-            .fetch_all(&state.pool)
-            .await?;
+    let rows = state
+        .pool
+        .fetch_all(
+            "SELECT public_key, tunnel_ip, pq_ciphertext FROM devices WHERE server_id = ?",
+            &[Val::from(server_id.as_str())],
+        )
+        .await?;
     let peers = rows
         .into_iter()
         .map(|row| {
-            let pk: String = row.get("public_key");
-            let ip: String = row.get("tunnel_ip");
+            let pk = row.text("public_key");
+            let ip = row.text("tunnel_ip");
             PeerEntry {
                 public_key: PublicKey::from_str(&pk).expect("stored key valid"),
                 allowed_ips: vec![format!("{ip}/32")],
-                pq_ciphertext: row.get("pq_ciphertext"),
+                pq_ciphertext: row.opt_text("pq_ciphertext"),
             }
         })
         .collect();
@@ -709,19 +740,20 @@ async fn list_relays(
     headers: HeaderMap,
 ) -> ApiResult<Json<RelayListResponse>> {
     auth_server(&state, &entry_id, &headers).await?;
-    let rows = sqlx::query(
-        "SELECT r.listen_port AS listen_port, s.endpoint AS exit_endpoint
-         FROM relays r JOIN servers s ON s.id = r.exit_id
-         WHERE r.entry_id = ?",
-    )
-    .bind(&entry_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let rows = state
+        .pool
+        .fetch_all(
+            "SELECT r.listen_port AS listen_port, s.endpoint AS exit_endpoint
+             FROM relays r JOIN servers s ON s.id = r.exit_id
+             WHERE r.entry_id = ?",
+            &[Val::from(entry_id.as_str())],
+        )
+        .await?;
     let relays = rows
         .iter()
         .map(|row| RelayEntry {
-            listen_port: row.get::<i64, _>("listen_port") as u16,
-            exit_endpoint: row.get("exit_endpoint"),
+            listen_port: row.int("listen_port") as u16,
+            exit_endpoint: row.text("exit_endpoint"),
         })
         .collect();
     Ok(Json(RelayListResponse { relays }))
@@ -735,23 +767,30 @@ async fn server_heartbeat(
     Json(hb): Json<HeartbeatRequest>,
 ) -> ApiResult<StatusCode> {
     auth_server(&state, &server_id, &headers).await?;
-    sqlx::query("UPDATE servers SET active_peers = ?, last_heartbeat = ? WHERE id = ?")
-        .bind(hb.active_peers as i64)
-        .bind(db::now_unix())
-        .bind(&server_id)
-        .execute(&state.pool)
+    state
+        .pool
+        .execute(
+            "UPDATE servers SET active_peers = ?, last_heartbeat = ? WHERE id = ?",
+            &[
+                Val::from(hb.active_peers as i64),
+                Val::from(db::now_unix()),
+                Val::from(server_id.as_str()),
+            ],
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn used_ips(pool: &SqlitePool, server_id: &str) -> ApiResult<HashSet<IpAddr>> {
-    let rows = sqlx::query("SELECT tunnel_ip FROM devices WHERE server_id = ?")
-        .bind(server_id)
-        .fetch_all(pool)
+async fn used_ips(pool: &Db, server_id: &str) -> ApiResult<HashSet<IpAddr>> {
+    let rows = pool
+        .fetch_all(
+            "SELECT tunnel_ip FROM devices WHERE server_id = ?",
+            &[Val::from(server_id)],
+        )
         .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|r| r.get::<String, _>("tunnel_ip").parse().ok())
+        .filter_map(|r| r.text("tunnel_ip").parse().ok())
         .collect())
 }
 
@@ -797,7 +836,7 @@ pub struct NewServer<'a> {
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.
-pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<String> {
+pub async fn add_server(pool: &Db, s: NewServer<'_>) -> anyhow::Result<String> {
     // The server takes the first usable host of its subnet as its own tunnel IP.
     let server_ip = s
         .cidr
@@ -805,26 +844,27 @@ pub async fn add_server(pool: &SqlitePool, s: NewServer<'_>) -> anyhow::Result<S
         .next()
         .ok_or_else(|| anyhow::anyhow!("cidr has no usable hosts"))?;
     let token = random_token();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO servers
             (id, public_key, endpoint, tunnel_cidr, tunnel_ip, auth_token, country, city,
              capacity, active_peers, last_heartbeat, dns, obfuscation_key, pq_public_key, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
+        &[
+            Val::from(s.id),
+            Val::from(s.public_key),
+            Val::from(s.endpoint),
+            Val::from(s.cidr.to_string()),
+            Val::from(server_ip.to_string()),
+            Val::from(token.as_str()),
+            Val::from(s.country),
+            Val::from(s.city),
+            Val::from(s.capacity as i64),
+            Val::from(s.dns),
+            Val::from(s.obfuscation_key),
+            Val::from(s.pq_public_key),
+            Val::from(db::now_unix()),
+        ],
     )
-    .bind(s.id)
-    .bind(s.public_key)
-    .bind(s.endpoint)
-    .bind(s.cidr.to_string())
-    .bind(server_ip.to_string())
-    .bind(&token)
-    .bind(s.country)
-    .bind(s.city)
-    .bind(s.capacity)
-    .bind(s.dns)
-    .bind(s.obfuscation_key)
-    .bind(s.pq_public_key)
-    .bind(db::now_unix())
-    .execute(pool)
     .await?;
     Ok(token)
 }

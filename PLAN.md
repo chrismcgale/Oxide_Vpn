@@ -18,9 +18,10 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 17-crate Cargo workspace. ~94 tests, all green, all verified **without
-root** (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged);
-the live-kernel path is verified by the CI netns job.
+Linux-first, as a 17-crate Cargo workspace. ~95 tests, all green, verified **without root**
+(mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged; the
+control plane runs on SQLite or Postgres — the Postgres flow test is gated on a live DB).
+The live-kernel path is verified by the CI netns job.
 
 **Done (M1–M4 + signature features):**
 - **Data plane** (`wg-core`): boringtun engine, 3 tokio tasks, runtime-mutable peer table
@@ -62,7 +63,8 @@ the live-kernel path is verified by the CI netns job.
 - Peer demux is an O(peers) source-address fallback, not a receiver-index table.
 - `nft`/`sysctl` still shell out; DNS backend isn't `systemd-resolved`-aware.
 - WG **transport** is IPv4-only (IPv6 *inside* the tunnel works).
-- SQLite single-node; no Postgres/HA; no provisioning automation.
+- Postgres backend done (2B); still single-writer (`reg_lock` in-process) so **one API node**
+  until that lock goes DB-side (2C); no provisioning automation.
 - No desktop/mobile/cross-platform clients yet.
 
 ---
@@ -220,11 +222,13 @@ crypto/format parts; seccomp test runs in CI.
   `obfuscation_key` alone = `obfs`. **Remaining (2A-2):** distribute the choice via the
   control plane (servers-table column + `add-server` flags + registration-response field),
   like the obfs key, so clients auto-pick per-server.
-- [ ] **2B Postgres backend** — control plane on Postgres. ⚠️ **Bigger than "connection-string
-  + dialect change":** `db.rs` + `lib.rs` use concrete `SqlitePool`/`SqliteRow` (830 lines),
-  `?` placeholders, and `AUTOINCREMENT`. Needs an approach decision (sqlx `Any` driver vs a
-  `Db` dialect enum) **and a running Postgres to verify** — flagged to the user; see the
-  "when I'm back" steps. Not started (avoided a blind, unverifiable rewrite).
+- [x] **2B Postgres backend** — *DONE 2026-07-22.* Control plane runs on SQLite (default) or
+  Postgres, chosen by the connection string. Took the **`Db` dialect-enum** approach (user's
+  call over sqlx `Any`): `db.rs` `Db`/`DbRow`/`Val` layer — SQL written once (`?`→`$n` for PG),
+  only DDL branches (`BIGINT`/`BIGSERIAL`). ~20 call sites converted. Verified against **live
+  Postgres 18.4** (`tests/postgres.rs`, gated on `OXIDE_TEST_PG_URL`) with **zero SQLite
+  regression**. *Next for multi-node:* make `reg_lock` DB-side/advisory so multiple API nodes
+  can share one Postgres (2C).
 - [ ] **2C HA & lifecycle** — control-plane redundancy, client re-selection on server death,
   server-token rotation, versioned zero-downtime API.
 - [ ] **2D Provisioning automation** — stand up a server (keys, config, control-plane
