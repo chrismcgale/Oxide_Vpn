@@ -357,7 +357,13 @@ impl<T: TunQueue> Engine<T> {
 
             match (datagram, endpoint) {
                 (Some(d), Some(ep)) => {
-                    Self::send_egress(&shared, d, ep).await?;
+                    // A send failure (transient EPERM from a firewall reload, ENOBUFS, a
+                    // route flap) must drop this one packet, NOT tear down the data plane —
+                    // the other loops already tolerate it, and the tunnel should ride
+                    // through blips (esp. under the kill switch / reconnect).
+                    if let Err(e) = Self::send_egress(&shared, d, ep).await {
+                        debug!(?e, "outbound send failed; dropping packet");
+                    }
                 }
                 (Some(_), None) => {
                     trace!("have datagram but no endpoint yet; dropping");
