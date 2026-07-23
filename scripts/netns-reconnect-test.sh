@@ -70,8 +70,26 @@ echo "== connect (always-on) — this will keep retrying the dead 'ghost' for ${
 ip netns exec "$CLI" env RUST_LOG=info "$CLIENT" connect \
     --control-plane "$CPURL" --account "$ACCT" --server ghost >"$DIR/cli.log" 2>&1 &
 CLI_PID=$!
-sleep "$RUN_SECS"
-kill "$CLI_PID" 2>/dev/null; CLI_PID=""
+# Wait up to RUN_SECS, but stop early if the always-on client dies (that's itself a finding).
+EARLY_EXIT=0
+for _ in $(seq 1 "$RUN_SECS"); do
+    if ! kill -0 "$CLI_PID" 2>/dev/null; then EARLY_EXIT=1; break; fi
+    sleep 1
+done
+[ "$EARLY_EXIT" = 0 ] && kill "$CLI_PID" 2>/dev/null || true
+CLI_PID=""
+# Preserve the log outside the temp dir that cleanup() wipes.
+cp "$DIR/cli.log" /tmp/oxide-reconnect-cli.log 2>/dev/null || true
+
+if [ "$EARLY_EXIT" = 1 ]; then
+    echo
+    echo "!! the always-on client EXITED before ${RUN_SECS}s — run_supervised returned an error."
+    echo "== full client log (also at /tmp/oxide-reconnect-cli.log) =="
+    cat "$DIR/cli.log"
+    echo
+    echo "RESULT: FAIL ✗  (supervisor exited instead of looping — see the error above)"
+    exit 1
+fi
 
 echo
 echo "== what the supervisor did (client log) =="

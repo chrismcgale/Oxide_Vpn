@@ -94,6 +94,19 @@ pub struct Engine<T: TunQueue> {
     shared: Arc<Shared<T>>,
 }
 
+/// Aborts a set of spawned tasks when dropped — including when the owning future is
+/// cancelled. Ensures `Engine::run`'s tasks (and the `Arc<Shared>` / TUN device they hold)
+/// don't outlive a tunnel a supervisor tore down.
+struct AbortGuard(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// A peer is counted as "active" if it completed a handshake within this window.
 /// WireGuard rekeys about every 2 minutes, so 3 minutes catches live sessions
 /// without counting long-idle ones.
@@ -200,20 +213,30 @@ impl<T: TunQueue> Engine<T> {
         }
     }
 
-    /// Run the three data-plane tasks until one of them fails.
+    /// Run the three data-plane tasks until one of them fails, this future is dropped
+    /// (e.g. a supervisor tearing the tunnel down on link death), or `.await` returns.
+    ///
+    /// All spawned tasks are registered with an [`AbortGuard`] so they are cancelled the
+    /// moment `run` ends **or is cancelled** — otherwise they keep holding `Arc<Shared>`
+    /// (and the TUN device with it) after the tunnel is gone, which both leaks the tasks
+    /// and stops the interface from being recreated on reconnect (`EBUSY`).
     pub async fn run(self) -> std::io::Result<()> {
         let shared = self.shared;
+        let mut aborts: Vec<tokio::task::AbortHandle> = Vec::new();
 
         // If a handshake rate limiter is configured (server), tick its reset once a
         // second per the WireGuard spec so the cookie challenge window advances.
         if let Some(rl) = shared.table.read().unwrap().rate_limiter() {
-            tokio::spawn(async move {
-                let mut tick = interval(Duration::from_secs(1));
-                loop {
-                    tick.tick().await;
-                    rl.reset_count();
-                }
-            });
+            aborts.push(
+                tokio::spawn(async move {
+                    let mut tick = interval(Duration::from_secs(1));
+                    loop {
+                        tick.tick().await;
+                        rl.reset_count();
+                    }
+                })
+                .abort_handle(),
+            );
         }
 
         // Proactively initiate handshakes toward any peer we have an endpoint for
@@ -222,22 +245,28 @@ impl<T: TunQueue> Engine<T> {
         Self::init_handshakes(&shared).await;
 
         // If DAITA shaping is on (client), drive the constant-rate cell stream: one cell
-        // per slot, cover when idle. Detached like the timer/limiter tasks.
+        // per slot, cover when idle.
         if let Some(daita) = shared.daita.clone() {
             if daita.shape_egress {
-                tokio::spawn(Self::shaper_loop(shared.clone(), daita));
+                aborts.push(tokio::spawn(Self::shaper_loop(shared.clone(), daita)).abort_handle());
             }
         }
 
         let out = tokio::spawn(Self::outbound_loop(shared.clone()));
         let inb = tokio::spawn(Self::inbound_loop(shared.clone()));
         let tim = tokio::spawn(Self::timer_loop(shared.clone()));
+        aborts.push(out.abort_handle());
+        aborts.push(inb.abort_handle());
+        aborts.push(tim.abort_handle());
+        let _guard = AbortGuard(aborts);
 
         let res = tokio::select! {
             r = out => r,
             r = inb => r,
             r = tim => r,
         };
+        // `_guard` drops here (or when this future is cancelled), aborting every task and
+        // releasing `Shared` — and the TUN device — promptly.
         match res {
             Ok(inner) => inner,
             Err(join) => Err(std::io::Error::other(join)),
