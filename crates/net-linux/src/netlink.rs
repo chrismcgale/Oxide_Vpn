@@ -20,8 +20,15 @@ use rtnetlink::{new_connection, Handle, LinkUnspec, RouteMessageBuilder};
 
 use crate::cmd::output;
 
-fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::other(e.to_string())
+/// Map an rtnetlink error to an `io::Error`, **preserving the kernel errno** for netlink
+/// error messages so callers can match on `ErrorKind` — e.g. tolerate `AlreadyExists`
+/// (EEXIST) when re-adding a route the kernel already installed, or `NotFound` (ENOENT) on
+/// idempotent teardown. Without this every failure collapses to `ErrorKind::Other`.
+fn to_io(e: rtnetlink::Error) -> io::Error {
+    match e {
+        rtnetlink::Error::NetlinkError(ref msg) => msg.to_io(),
+        other => io::Error::other(other.to_string()),
+    }
 }
 
 /// A handle to the kernel's routing/addressing via netlink. Cheap to clone.

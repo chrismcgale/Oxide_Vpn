@@ -74,9 +74,12 @@ ip netns exec "$CLI" env RUST_LOG=info "$CLIENT" connect \
     --control-plane "$CPURL" --account "$ACCT" --key-file "$KEYFILE" >"$DIR/cli.log" 2>&1 &
 CLI_PID=$!
 
+# Helper: first exit id in a stream of connecting lines (empty if none; never fails set -e).
+exit_from() { grep -oE 'connecting server=Some\("[^"]+"\)' | head -1 | grep -oE '"[^"]+"' | tr -d '"'; }
+
 sleep 5   # let it select + start attempting the first exit (well under connect_timeout=20s)
 KEY_BEFORE=$(cat "$KEYFILE" 2>/dev/null || true)
-FIRST=$(grep -oE 'connecting server=Some\("[^"]+"\)' "$DIR/cli.log" | head -1 | grep -oE '"[^"]+"' | tr -d '"')
+FIRST=$(exit_from <"$DIR/cli.log" || true)
 echo "  first exit: ${FIRST:-<none>}   key(before)=${KEY_BEFORE:0:12}…"
 
 echo "== send SIGUSR1 = new identity =="
@@ -85,8 +88,7 @@ sleep 5   # rotate key + re-select; still under connect_timeout so no natural fa
 
 KEY_AFTER=$(cat "$KEYFILE" 2>/dev/null || true)
 # The exit chosen AFTER the new-identity marker.
-SECOND=$(awk '/new identity/{f=1} f' "$DIR/cli.log" \
-    | grep -oE 'connecting server=Some\("[^"]+"\)' | head -1 | grep -oE '"[^"]+"' | tr -d '"')
+SECOND=$(awk '/new identity/{f=1} f' "$DIR/cli.log" | exit_from || true)
 echo "  second exit: ${SECOND:-<none>}   key(after)=${KEY_AFTER:0:12}…"
 
 kill "$CLI_PID" 2>/dev/null || true; CLI_PID=""
