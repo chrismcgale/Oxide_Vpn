@@ -61,7 +61,8 @@ The live-kernel path is verified by the CI netns job.
   (`plain|obfs|quic|mimic` + `daita`) and the control plane distributes the choice per-server
   (`add-server --transport/--daita`), so CP clients auto-pick. *Remaining stealth-CP wiring:*
   distribute the attest signed manifest/log for at-connect build verification.
-- Peer demux is an O(peers) source-address fallback, not a receiver-index table.
+- ~~Peer demux is an O(peers) source-address fallback, not a receiver-index table.~~ **Done (2E):**
+  data packets route by receiver index (O(1), roam-safe); scan only for handshakes / first packet.
 - `nft`/`sysctl` still shell out; DNS backend isn't `systemd-resolved`-aware.
 - WG **transport** is IPv4-only (IPv6 *inside* the tunnel works).
 - Postgres backend done (2B) + concurrency-safe/multi-node allocation done (2C core); a fleet
@@ -259,8 +260,13 @@ crypto/format parts; seccomp test runs in CI.
   (`POST /v1/admin/servers`, `serve --admin-token`), and writes a ready `server.toml` (then
   `sudo … up`). Config part needs no root. Pure config renderer + in-process admin-endpoint
   tests; verified live against a running control plane. *Follow-on:* IaC templates / cloud-init.
-- [ ] **2E Receiver-index peer demux** — replace the O(peers) source-addr fallback for busy
-  servers.
+- [x] **2E Receiver-index peer demux** — DONE (2026-07-23). Inbound demux resolves an
+  established session's data packets by the receiver index we assigned (WG data msg bytes
+  `[4..8)` LE), a direct `HashMap` lookup that also survives roaming — falling back to the
+  source-addr cache then the full scan only for handshakes / a session's first packet.
+  `parse_recv_index` (pure, unit-tested) + `recv_index_to_peer` cache in `Shared` (pruned on
+  peer removal). Integration test: with 40 decoy peers, steady-state traffic costs ~1
+  decapsulate probe/packet, not O(peers). 115 tests.
 - [ ] **2F net-linux polish** — nftables via netlink lib (drop `nft` shell-out);
   `systemd-resolved`-aware DNS backend; idempotent teardown/crash recovery.
 - [ ] **2G WG-over-IPv6 transport** + control-plane v6 IP allocation.

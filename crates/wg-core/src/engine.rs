@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -62,6 +63,28 @@ fn private_static(key: &SecretKey) -> StaticSecret {
     StaticSecret::from(*key.as_bytes())
 }
 
+/// WireGuard message-type tag for a transport (data) message. The type is a little-endian
+/// `u32` in bytes `[0..4)`, so type 4 is `[4, 0, 0, 0]`.
+const MSG_TYPE_DATA: u8 = 4;
+
+/// The receiver index carried by a WireGuard **data** message: the index *we* assigned to
+/// the sending peer's session, at bytes `[4..8)` little-endian. Returns `None` for any
+/// non-data message (handshake init/response/cookie carry no index we assigned) or a
+/// datagram too short to hold the field. Handshakes must fall back to the peer scan.
+fn parse_recv_index(datagram: &[u8]) -> Option<u32> {
+    // A data message is type 4 with the upper three type bytes zero, and is at least
+    // 16 bytes (4 type + 4 receiver index + 8 counter) before any payload.
+    if datagram.len() < 8 || datagram[0] != MSG_TYPE_DATA || datagram[1..4] != [0, 0, 0] {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        datagram[4],
+        datagram[5],
+        datagram[6],
+        datagram[7],
+    ]))
+}
+
 impl PeerParams {
     /// Build engine peer parameters from a parsed config peer.
     pub fn from_config(p: &oxide_common::PeerConfig) -> Self {
@@ -80,9 +103,20 @@ struct Shared<T: TunQueue> {
     tun: T,
     table: RwLock<PeerTable>,
     /// Source-address -> peer id cache, learned as datagrams arrive. Lets the inbound
-    /// path route directly instead of trying every peer. (A proper receiver-index
-    /// table is a later refinement.)
+    /// path route directly instead of trying every peer. Handshake messages (which don't
+    /// carry our receiver index) and roamed sources fall back to this / the full scan.
     addr_to_peer: Mutex<HashMap<SocketAddr, PeerId>>,
+    /// Our-receiver-index -> peer id cache. A WireGuard *data* message (type 4) carries,
+    /// at bytes `[4..8)` LE, the receiver index *we* assigned to that peer's session, so
+    /// we can route directly to the right peer without scanning — and, unlike the source
+    /// address, this survives the peer roaming to a new address. Learned on the first data
+    /// packet of a session (which pays the fallback scan) and reused for the rest. Stale
+    /// entries from a superseded session are never hit again: a rekey assigns a fresh
+    /// index that new packets carry, so old indices simply age out (pruned on peer removal).
+    recv_index_to_peer: Mutex<HashMap<u32, PeerId>>,
+    /// Count of per-candidate `decapsulate` attempts in the inbound demux. Lets tests
+    /// prove that index/addr routing resolves a datagram without scanning every peer.
+    decap_probes: AtomicU64,
     /// Optional DAITA traffic shaping. When set, outbound datagrams are wrapped in
     /// fixed-size cells (and, on the shaping/client side, drained at a constant rate with
     /// cover traffic), and inbound cover cells are dropped before boringtun. See
@@ -188,6 +222,8 @@ impl<T: TunQueue> Engine<T> {
                 tun,
                 table: RwLock::new(table),
                 addr_to_peer: Mutex::new(HashMap::new()),
+                recv_index_to_peer: Mutex::new(HashMap::new()),
+                decap_probes: AtomicU64::new(0),
                 daita: None,
             }),
         }
@@ -420,20 +456,38 @@ impl<T: TunQueue> Engine<T> {
         }
     }
 
-    /// Decapsulate one datagram and act on the result. Tries the cached peer for
-    /// `src` first, falling back to every peer (a handshake from a new endpoint has
-    /// no cache entry yet). The first peer that decapsulates without error owns it.
+    /// Decapsulate one datagram and act on the result. Resolves the owning peer in
+    /// O(1) when possible: a **data** message carries our receiver index, which maps
+    /// directly to a peer (and survives roaming); otherwise the source-address cache is
+    /// tried. Both miss on a handshake from a new endpoint / the first packet of a
+    /// session, which falls back to trying every peer. The first peer that decapsulates
+    /// without error owns the datagram.
     async fn handle_incoming(shared: &Arc<Shared<T>>, datagram: Vec<u8>, src: SocketAddr) {
+        let recv_index = parse_recv_index(&datagram);
         let candidates: Vec<(PeerId, Arc<Peer>)> = {
-            let cached = shared.addr_to_peer.lock().unwrap().get(&src).copied();
             let table = shared.table.read().unwrap();
-            match cached.and_then(|id| table.get(&id).map(|p| (id, p))) {
+            // Prefer the receiver index (survives roaming), then the source-address
+            // cache, then a full scan. A resolved hit tries exactly one peer.
+            let by_index = recv_index
+                .and_then(|ix| shared.recv_index_to_peer.lock().unwrap().get(&ix).copied())
+                .and_then(|id| table.get(&id).map(|p| (id, p)));
+            let hit = by_index.or_else(|| {
+                shared
+                    .addr_to_peer
+                    .lock()
+                    .unwrap()
+                    .get(&src)
+                    .copied()
+                    .and_then(|id| table.get(&id).map(|p| (id, p)))
+            });
+            match hit {
                 Some(hit) => vec![hit],
                 None => table.snapshot(),
             }
         };
 
         for (id, peer) in candidates {
+            shared.decap_probes.fetch_add(1, Ordering::Relaxed);
             // Collect boringtun's outputs while holding the lock, then act after
             // releasing it (we must not .await while the Tunn mutex is held).
             let mut to_network: Vec<Vec<u8>> = Vec::new();
@@ -485,6 +539,11 @@ impl<T: TunQueue> Engine<T> {
                 debug!(peer = %PublicKey(id).to_base64(), %src, "learned/updated peer endpoint");
             }
             shared.addr_to_peer.lock().unwrap().insert(src, id);
+            // Data messages carry our receiver index; cache it so the rest of the
+            // session routes directly (and keeps routing across a roam).
+            if let Some(ix) = recv_index {
+                shared.recv_index_to_peer.lock().unwrap().insert(ix, id);
+            }
 
             for d in to_network {
                 let _ = Self::send_egress(shared, d, src).await;
@@ -541,6 +600,19 @@ impl<T: TunQueue> EngineHandle<T> {
             .lock()
             .unwrap()
             .retain(|_, v| *v != id);
+        self.shared
+            .recv_index_to_peer
+            .lock()
+            .unwrap()
+            .retain(|_, v| *v != id);
+    }
+
+    /// Total per-candidate `decapsulate` attempts made by the inbound demux since the
+    /// engine started. Used by tests to assert that index/addr routing resolves a
+    /// datagram without scanning every peer.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn decap_probes(&self) -> u64 {
+        self.shared.decap_probes.load(Ordering::Relaxed)
     }
 
     /// Current load and throughput: peer counts plus total bytes tx/rx across peers.
@@ -589,5 +661,33 @@ impl<T: TunQueue> EngineHandle<T> {
         for p in desired {
             table.add(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_recv_index;
+
+    #[test]
+    fn data_message_yields_le_receiver_index() {
+        // type 4 (data), receiver index 0x04030201 LE, then counter/payload bytes.
+        let dg = [4u8, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0];
+        assert_eq!(parse_recv_index(&dg), Some(0x0403_0201));
+    }
+
+    #[test]
+    fn handshake_and_cookie_messages_have_no_index() {
+        for ty in [1u8, 2, 3] {
+            let dg = [ty, 0, 0, 0, 9, 9, 9, 9];
+            assert_eq!(parse_recv_index(&dg), None, "type {ty} must not resolve");
+        }
+        // A stray high byte in the type word is not a data message either.
+        assert_eq!(parse_recv_index(&[4, 0, 0, 1, 1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn short_datagram_is_rejected() {
+        assert_eq!(parse_recv_index(&[4, 0, 0, 0, 1, 2, 3]), None); // 7 bytes
+        assert_eq!(parse_recv_index(&[]), None);
     }
 }

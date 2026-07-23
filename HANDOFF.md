@@ -38,7 +38,12 @@
 
 ---
 
-## 2E — Receiver-index peer demux
+## 2E — Receiver-index peer demux ✅ DONE (2026-07-23)
+Implemented exactly as designed below: `parse_recv_index` (pure, type-4-only, length-guarded)
++ `Shared.recv_index_to_peer` cache, resolution order index→addr→scan, pruned on `remove_peer`.
+Verified with parse unit tests + a 40-decoy integration test asserting ~1 probe/packet
+(`decap_probes` counter / `EngineHandle::decap_probes`). 115 tests. See SKILL changelog.
+
 **Goal.** Replace the O(peers) inbound demux with a direct index lookup so a busy server
 doesn't try every peer per datagram.
 
@@ -176,6 +181,6 @@ reconnects to a *different* ghost/exit after the action.
 ---
 
 ## Suggested order
-2E (contained, wg-core-only) → 3D (removes a real UX gap + the manual netns route) → 3E
+~~2E (contained, wg-core-only)~~ **✅ done** → **3D next** (removes a real UX gap + the manual netns route) → 3E
 (builds on `exclude`/reconnect) → 2G (dual-stack) → 2F (biggest: new dep + API learning; do
 last or when the user okays the dependency). Reassess after each.

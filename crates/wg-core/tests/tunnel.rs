@@ -541,3 +541,109 @@ async fn peer_added_at_runtime_comes_up() {
     assert_eq!(stats.active_peers, 1);
     assert!(stats.tx_bytes > 0 || stats.rx_bytes > 0);
 }
+
+/// 2E: a busy server must resolve an established session's data packets by receiver
+/// index — a direct lookup — instead of trying every peer per datagram. We stand up a
+/// real tunnel, pad the server with many decoy peers so a full scan would be expensive,
+/// then assert that steady-state traffic costs ~one decapsulate attempt per packet.
+#[tokio::test]
+async fn established_session_routes_by_index_without_scanning_all_peers() {
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::plain(server_udp),
+        server_tun,
+    );
+    let server_handle = server.handle();
+
+    // Pad the server with decoy peers (distinct keys + allowed_ips). A pre-2E full scan
+    // would try these before the real peer on every datagram; index routing never does.
+    const DECOYS: usize = 40;
+    for i in 0..DECOYS {
+        let decoy = public_from_secret(&generate_secret());
+        server_handle.add_peer(PeerParams {
+            public_key: decoy,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec![format!("10.99.{}.{}/32", i / 256, i % 256).parse().unwrap()],
+            persistent_keepalive: None,
+        });
+    }
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            // No keepalive: keeps steady-state inbound to exactly the packets we inject,
+            // so the probe delta is deterministic.
+            persistent_keepalive: None,
+        }],
+        Transport::plain(client_udp),
+        client_tun,
+    );
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let send_and_await = |n: u8| {
+        let inject = client_inject.clone();
+        let packet = ipv4_packet(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::new(10, 8, 0, 1),
+            &[b'x', n],
+        );
+        inject.send(packet.clone()).unwrap();
+        packet
+    };
+
+    // Warm up: the first data packet completes the handshake and pays the one-time
+    // fallback scan that learns index -> peer. Everything after must route directly.
+    let warm = send_and_await(0);
+    let got = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("warmup packet never traversed the tunnel")
+        .expect("server tun channel closed");
+    assert_eq!(got, warm);
+
+    let probes_before = server_handle.decap_probes();
+
+    // Steady state: send K more packets; each should resolve on the first candidate.
+    const K: u8 = 5;
+    for n in 1..=K {
+        let sent = send_and_await(n);
+        let got = tokio::time::timeout(Duration::from_secs(5), srv_capture.recv())
+            .await
+            .expect("steady-state packet never traversed the tunnel")
+            .expect("server tun channel closed");
+        assert_eq!(got, sent);
+    }
+
+    let delta = server_handle.decap_probes() - probes_before;
+    // Each of the K data packets costs exactly one probe (index hit). Allow a tiny slack
+    // for any stray retransmit, but it must be nowhere near the O(peers) scan a broken
+    // demux would incur (~K * DECOYS).
+    assert!(
+        delta >= K as u64 && delta <= K as u64 + 2,
+        "expected ~{K} probes for {K} packets with {DECOYS} decoys, got {delta}"
+    );
+}
