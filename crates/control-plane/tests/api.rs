@@ -567,3 +567,86 @@ async fn unset_optional_server_fields_are_none_not_empty_string() {
     assert_eq!(reg.dns, None);
     assert!(!reg.daita);
 }
+
+#[tokio::test]
+async fn server_token_rotation_keeps_old_token_valid_during_grace() {
+    use oxide_common::api::AdminAddServerRequest;
+
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let state = AppState::new(pool).with_admin_token(Some("adm".into()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let base = format!("http://{addr}");
+    let cc = ControlClient::new(&base);
+
+    // Register a server (admin), capturing its initial token.
+    let old_token = cc
+        .admin_add_server(
+            "adm",
+            &AdminAddServerRequest {
+                id: "s1".into(),
+                public_key: public_from_secret(&generate_secret()).to_base64(),
+                endpoint: "203.0.113.1:51820".into(),
+                cidr: "10.8.0.0/24".into(),
+                country: None,
+                city: None,
+                capacity: 0,
+                dns: None,
+                obfuscation_key: None,
+                pq_public_key: None,
+                transport: None,
+                daita: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    // The old token authenticates a server-only call (fetch peers).
+    assert!(cc.fetch_peers("s1", &old_token).await.is_ok());
+
+    // Rotate.
+    let rot = cc.admin_rotate_token("adm", "s1").await.unwrap();
+    assert_ne!(rot.auth_token, old_token);
+    assert!(rot.previous_valid_secs > 0);
+
+    // Both the NEW token and the OLD token work during the grace window...
+    assert!(cc.fetch_peers("s1", &rot.auth_token).await.is_ok());
+    assert!(
+        cc.fetch_peers("s1", &old_token).await.is_ok(),
+        "the previous token must stay valid during the grace window"
+    );
+    // ...but an unrelated token never does.
+    assert!(cc.fetch_peers("s1", "bogus").await.is_err());
+
+    // Rotate again: the token from *two* rotations ago (old_token) is no longer the
+    // "previous" one, so it stops working immediately.
+    let rot2 = cc.admin_rotate_token("adm", "s1").await.unwrap();
+    assert!(cc.fetch_peers("s1", &rot2.auth_token).await.is_ok());
+    assert!(cc.fetch_peers("s1", &rot.auth_token).await.is_ok()); // now the "previous"
+    assert!(
+        cc.fetch_peers("s1", &old_token).await.is_err(),
+        "a token two rotations old must be rejected"
+    );
+
+    // Rotating an unknown server is a 404.
+    assert!(cc.admin_rotate_token("adm", "nope").await.is_err());
+}
+
+#[tokio::test]
+async fn version_endpoint_reports_api_and_build() {
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let state = AppState::new(pool);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    let v = cc.version().await.unwrap();
+    assert_eq!(v.api, oxide_common::api::API_VERSION);
+    assert_eq!(v.api, "v1");
+    assert!(!v.server.is_empty());
+    assert!(!v.git_commit.is_empty());
+    // A matching client is compatible.
+    assert!(cc.is_compatible().await.unwrap());
+}

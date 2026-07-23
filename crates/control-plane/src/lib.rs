@@ -35,8 +35,8 @@ use oxide_common::api::{
     AdminAddServerRequest, AdminAddServerResponse, ApiError, CreateAccountResponse,
     HeartbeatRequest, MeshListResponse, MeshPeer, MeshRegisterRequest, MeshRegisterResponse,
     MultihopRegisterRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
-    RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerConnection, ServerInfo,
-    ServerListResponse,
+    RegisterDeviceResponse, RelayEntry, RelayListResponse, RotateTokenResponse, ServerConnection,
+    ServerInfo, ServerListResponse, VersionResponse, API_VERSION,
 };
 use oxide_common::PublicKey;
 
@@ -133,6 +133,7 @@ async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> 
 /// Build the API router.
 pub fn app(state: AppState) -> Router {
     Router::new()
+        .route("/version", get(version))
         .route("/metrics", get(metrics))
         .route("/v1/accounts", post(create_account))
         .route("/v1/servers", get(list_servers))
@@ -142,6 +143,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/mesh/register", post(mesh_register))
         .route("/v1/mesh", get(mesh_list))
         .route("/v1/admin/servers", post(admin_add_server))
+        .route(
+            "/v1/admin/servers/:id/rotate-token",
+            post(admin_rotate_token),
+        )
         .route("/v1/internal/servers/:id/peers", get(list_peers))
         .route("/v1/internal/servers/:id/relays", get(list_relays))
         .route("/v1/internal/servers/:id/heartbeat", post(server_heartbeat))
@@ -164,6 +169,16 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
+}
+
+// GET /version — the API contract version + this build (unauthenticated). Lets clients and
+// operators confirm compatibility and see exactly which control-plane build they reached.
+async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse {
+        api: API_VERSION.to_string(),
+        server: env!("CARGO_PKG_VERSION").to_string(),
+        git_commit: env!("OXIDE_GIT_COMMIT").to_string(),
+    })
 }
 
 // GET /metrics — Prometheus text format. Unauthenticated aggregate counts (no secrets);
@@ -557,6 +572,10 @@ const RELAY_PORT_BASE: i64 = 51900;
 /// (a fresh candidate is computed each attempt). Comfortably above realistic contention.
 const ALLOC_RETRIES: usize = 16;
 
+/// How long a server's previous auth token keeps working after a rotation (grace window),
+/// so the server can pick up the new token without its control-plane session dropping.
+const TOKEN_ROTATION_GRACE_SECS: i64 = 3600;
+
 /// The mesh overlay subnet (Tailscale-style CGNAT space). Devices get a stable `/32` here.
 const MESH_CIDR: &str = "100.64.0.0/16";
 
@@ -729,19 +748,32 @@ fn host_of(endpoint: &str) -> String {
     }
 }
 
-/// Require the correct server auth token for `server_id`.
+/// Require the correct server auth token for `server_id` — the current token, or the
+/// previous one while it's still within its rotation grace window (so a token rotation
+/// doesn't drop a server that hasn't picked up the new token yet).
 async fn auth_server(state: &AppState, server_id: &str, headers: &HeaderMap) -> ApiResult<()> {
     let token = bearer(headers).ok_or(AppError::Unauthorized)?;
-    let expected = state
+    let row = state
         .pool
-        .scalar_opt_string(
-            "SELECT auth_token FROM servers WHERE id = ?",
+        .fetch_optional(
+            "SELECT auth_token, prev_auth_token, prev_token_expires_at FROM servers WHERE id = ?",
             &[Val::from(server_id)],
         )
-        .await?;
-    match expected {
-        Some(t) if t == token => Ok(()),
-        _ => Err(AppError::Unauthorized),
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    if row.text("auth_token") == token {
+        return Ok(());
+    }
+    // Accept the previous token only until its grace expiry.
+    let prev_ok = row.opt_text("prev_auth_token").as_deref() == Some(token.as_str())
+        && row
+            .opt_int("prev_token_expires_at")
+            .is_some_and(|exp| db::now_unix() < exp);
+    if prev_ok {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
     }
 }
 
@@ -927,6 +959,59 @@ async fn admin_add_server(
     .await
     .map_err(AppError::Internal)?;
     Ok(Json(AdminAddServerResponse { auth_token: token }))
+}
+
+// POST /v1/admin/servers/:id/rotate-token — issue a fresh server token; the current token
+// becomes the "previous" one and keeps working for the grace window, so the server picks up
+// the new token (config update + reload) without its control-plane session dropping.
+async fn admin_rotate_token(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<RotateTokenResponse>> {
+    auth_admin(&state, &headers)?;
+    match rotate_server_token(&state.pool, &server_id)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        Some((auth_token, previous_valid_secs)) => Ok(Json(RotateTokenResponse {
+            auth_token,
+            previous_valid_secs,
+        })),
+        None => Err(AppError::NotFound(format!("no such server: {server_id}"))),
+    }
+}
+
+/// Rotate a server's auth token in the DB: the current token becomes the previous one (valid
+/// for the grace window) and a fresh token is issued. Returns `(new_token, grace_secs)`, or
+/// `None` if the server doesn't exist. Shared by the admin endpoint and the `rotate-token` CLI.
+pub async fn rotate_server_token(
+    pool: &Db,
+    server_id: &str,
+) -> anyhow::Result<Option<(String, i64)>> {
+    if pool
+        .scalar_opt_string(
+            "SELECT id FROM servers WHERE id = ?",
+            &[Val::from(server_id)],
+        )
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let new_token = random_token();
+    pool.execute(
+        "UPDATE servers
+         SET prev_auth_token = auth_token, prev_token_expires_at = ?, auth_token = ?
+         WHERE id = ?",
+        &[
+            Val::from(db::now_unix() + TOKEN_ROTATION_GRACE_SECS),
+            Val::from(new_token.as_str()),
+            Val::from(server_id),
+        ],
+    )
+    .await?;
+    Ok(Some((new_token, TOKEN_ROTATION_GRACE_SECS)))
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.

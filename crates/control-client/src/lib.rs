@@ -11,7 +11,8 @@ use oxide_common::api::{
     AdminAddServerRequest, AdminAddServerResponse, CreateAccountResponse, HeartbeatRequest,
     MeshListResponse, MeshPeer, MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest,
     PeerEntry, PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry,
-    RelayListResponse, ServerInfo, ServerListResponse,
+    RelayListResponse, RotateTokenResponse, ServerInfo, ServerListResponse, VersionResponse,
+    API_VERSION,
 };
 use oxide_common::PublicKey;
 
@@ -117,6 +118,43 @@ impl ControlClient {
         let resp = check(resp).await?;
         let body: AdminAddServerResponse = resp.json().await.context("parsing admin response")?;
         Ok(body.auth_token)
+    }
+
+    /// The control plane's API version + build (unauthenticated).
+    pub async fn version(&self) -> Result<VersionResponse> {
+        let resp = self
+            .http
+            .get(self.url("/version"))
+            .send()
+            .await
+            .context("GET version")?;
+        check(resp).await?.json().await.context("parsing version")
+    }
+
+    /// Whether this client speaks the same API contract version as the control plane. A
+    /// mismatch means the client is too old/new for that control plane (talk to a matching
+    /// one, or upgrade). Additive changes within a version stay compatible.
+    pub async fn is_compatible(&self) -> Result<bool> {
+        Ok(self.version().await?.api == API_VERSION)
+    }
+
+    /// Rotate a server's auth token (admin-authenticated). Returns the new token and how long
+    /// the previous one stays valid (grace), so the operator can update the server config
+    /// without downtime.
+    pub async fn admin_rotate_token(
+        &self,
+        admin_token: &str,
+        server_id: &str,
+    ) -> Result<RotateTokenResponse> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/admin/servers/{server_id}/rotate-token")))
+            .bearer_auth(admin_token)
+            .send()
+            .await
+            .context("POST rotate-token")?;
+        let resp = check(resp).await?;
+        resp.json().await.context("parsing rotate-token response")
     }
 
     /// Register this device's public key on `server_id`; returns connection details.

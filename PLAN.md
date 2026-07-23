@@ -18,7 +18,7 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 17-crate Cargo workspace. ~108 tests, all green, verified **without root**
+Linux-first, as a 17-crate Cargo workspace. ~111 tests, all green, verified **without root**
 (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged; the
 control plane runs on SQLite or Postgres — the Postgres flow test is gated on a live DB).
 The live-kernel path is verified by the CI netns job.
@@ -247,8 +247,10 @@ crypto/format parts; seccomp test runs in CI.
   test passes on **both** SQLite and live Postgres → multiple API nodes can share one PG.
   **Client re-selection on server death: DONE (2026-07-23, classic-VPN track)** — `client-core::
   reconnect` + `run_supervised` (always-on auto-reconnect + failover), wired into `oxide-client
-  connect` and `oxide-agentd`. **Remaining:** server-token rotation (grace window), versioned
-  zero-downtime API, concurrent schema-init hardening.
+  connect` and `oxide-agentd`. **Server-token rotation DONE (2026-07-23)** — grace window
+  (`rotate-token` CLI + admin endpoint; prev token valid 1h). **Versioned API DONE** —
+  `GET /version` + shared `API_VERSION` (`v1`, additive-only). **Remaining:** concurrent
+  schema-init hardening. → **2C effectively complete.**
 - [x] **2D Provisioning automation** — *DONE 2026-07-23.* `oxide-serverd provision` stands a
   server up in one command: generates WG/PQ/obfs keys, registers remotely via a new admin API
   (`POST /v1/admin/servers`, `serve --admin-token`), and writes a ready `server.toml` (then

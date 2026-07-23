@@ -10,7 +10,7 @@ use ipnet::IpNet;
 use tracing::info;
 
 use oxide_common::account::format_grouped;
-use oxide_control_plane::{add_server, db, serve, AppState, NewServer};
+use oxide_control_plane::{add_server, db, rotate_server_token, serve, AppState, NewServer};
 
 #[derive(Parser)]
 #[command(name = "oxide-control-plane", about = "Oxide VPN control plane")]
@@ -76,6 +76,11 @@ enum Cmd {
         /// This server runs DAITA (traffic-analysis defense); clients shape egress to match.
         #[arg(long)]
         daita: bool,
+    },
+    /// Rotate a server's auth token; the old one stays valid for a grace window (no downtime).
+    RotateToken {
+        #[arg(long)]
+        id: String,
     },
     /// Create an account from the CLI (handy for testing/seeding).
     NewAccount,
@@ -150,6 +155,15 @@ async fn main() -> Result<()> {
             println!("  server_id = \"{id}\"");
             println!("  token = \"{token}\"");
         }
+        Cmd::RotateToken { id } => match rotate_server_token(&pool, &id).await? {
+            Some((token, grace)) => {
+                println!("Rotated auth token for server '{id}'.");
+                println!("  new token:     {token}");
+                println!("  old token valid for another {grace}s (grace) — update the server's");
+                println!("  [control_plane] token and reload within that window for no downtime.");
+            }
+            None => anyhow::bail!("no such server: {id}"),
+        },
         Cmd::NewAccount => {
             let state = AppState::new(pool);
             // Reuse the HTTP handler path via a direct DB insert for simplicity.

@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::keys::PublicKey;
 
+/// The stable control-plane API version. Routes live under `/v1/…`; the contract is
+/// **additive** — new optional fields (all `#[serde(default)]`) and new endpoints only, so
+/// older clients/servers keep working. A breaking change would ship as a new `/v2` alongside
+/// `/v1`, never a mutation of `/v1`.
+pub const API_VERSION: &str = "v1";
+
+/// `GET /version` — what a client/operator is talking to (unauthenticated).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionResponse {
+    /// The API contract version, e.g. `v1` (see [`API_VERSION`]).
+    pub api: String,
+    /// The control-plane build's crate version.
+    pub server: String,
+    /// The git commit the control plane was built from.
+    pub git_commit: String,
+}
+
 /// Response to creating a new anonymous account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAccountResponse {
@@ -211,6 +228,14 @@ pub struct AdminAddServerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminAddServerResponse {
     pub auth_token: String,
+}
+
+/// Response to rotating a server's auth token: the new token (put it in the server's config),
+/// and how long the previous token keeps working (the grace window) so there's no downtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateTokenResponse {
+    pub auth_token: String,
+    pub previous_valid_secs: i64,
 }
 
 /// Standard JSON error body.

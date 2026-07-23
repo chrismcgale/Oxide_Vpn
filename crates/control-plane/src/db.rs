@@ -384,6 +384,9 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN pq_public_key TEXT",
         "ALTER TABLE servers ADD COLUMN transport TEXT",
         "ALTER TABLE servers ADD COLUMN daita INTEGER NOT NULL DEFAULT 0",
+        // Server-token rotation: the previous token stays valid until its expiry (grace).
+        "ALTER TABLE servers ADD COLUMN prev_auth_token TEXT",
+        "ALTER TABLE servers ADD COLUMN prev_token_expires_at INTEGER",
         "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
         // Concurrency-safe allocation constraints (2C), added idempotently so existing
         // databases pick them up. On a legacy DB that already holds duplicates, index
@@ -454,6 +457,9 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
         // 2A-2: transport selection distributed to clients (idempotent for existing DBs).
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS transport TEXT",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita BIGINT NOT NULL DEFAULT 0",
+        // Server-token rotation with a grace window.
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS prev_auth_token TEXT",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS prev_token_expires_at BIGINT",
     ];
     for stmt in statements {
         sqlx::query(stmt)
