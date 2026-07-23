@@ -224,6 +224,9 @@ crypto/format parts; seccomp test runs in CI.
 > (overlaps 2A-2); a reproducible-build script; **1D-4 HW attestation (TPM/SGX)** stays out —
 > needs hardware, flagged to the user. See SKILL Changelog for the decision record.
 
+> **⟶ Next work is queued in `HANDOFF.md`** (repo root): 2E, 2F, 2G, 3D, 3E — each with
+> design, code pointers, and acceptance. 1C onion stays PARKED.
+
 ### WAVE 2 — Productization & scale (make it a real product)
 
 - [x] **2A Transport selector** — *DONE (2A local 2026-07-21, 2A-2 CP distribution
