@@ -422,3 +422,87 @@ async fn transport_choice_is_distributed_to_clients() {
     assert_eq!(reg2.transport.as_deref(), Some("quic"));
     assert!(reg2.daita);
 }
+
+#[tokio::test]
+async fn admin_provisioning_endpoint() {
+    use oxide_common::api::AdminAddServerRequest;
+
+    // Admin API enabled with a token.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let state = AppState::new(pool).with_admin_token(Some("s3cr3t".into()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    let server_pub = public_from_secret(&generate_secret()).to_base64();
+    let req = AdminAddServerRequest {
+        id: "prov-1".into(),
+        public_key: server_pub.clone(),
+        endpoint: "203.0.113.9:51820".into(),
+        cidr: "10.8.0.0/24".into(),
+        country: Some("US".into()),
+        city: None,
+        capacity: 50,
+        dns: Some("10.8.0.1".into()),
+        obfuscation_key: None,
+        pq_public_key: None,
+        transport: Some("quic".into()),
+        daita: true,
+    };
+
+    // Wrong token is rejected.
+    assert!(cc.admin_add_server("wrong", &req).await.is_err());
+
+    // Correct token registers the server and returns its auth token.
+    let token = cc.admin_add_server("s3cr3t", &req).await.unwrap();
+    assert!(!token.is_empty());
+
+    // The server is now selectable, with the transport metadata provisioned.
+    let account = cc.create_account().await.unwrap();
+    let servers = cc.list_servers(&account).await.unwrap();
+    let s = servers
+        .iter()
+        .find(|s| s.id == "prov-1")
+        .expect("registered");
+    assert_eq!(s.public_key.to_base64(), server_pub);
+    let reg = cc
+        .register_device(
+            &account,
+            public_from_secret(&generate_secret()),
+            "prov-1",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg.transport.as_deref(), Some("quic"));
+    assert!(reg.daita);
+}
+
+#[tokio::test]
+async fn admin_endpoint_disabled_without_token() {
+    use oxide_common::api::AdminAddServerRequest;
+    // No admin token configured => the endpoint is forbidden entirely.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let state = AppState::new(pool); // no with_admin_token
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    let req = AdminAddServerRequest {
+        id: "nope".into(),
+        public_key: public_from_secret(&generate_secret()).to_base64(),
+        endpoint: "203.0.113.9:51820".into(),
+        cidr: "10.8.0.0/24".into(),
+        country: None,
+        city: None,
+        capacity: 0,
+        dns: None,
+        obfuscation_key: None,
+        pq_public_key: None,
+        transport: None,
+        daita: false,
+    };
+    assert!(cc.admin_add_server("anything", &req).await.is_err());
+}

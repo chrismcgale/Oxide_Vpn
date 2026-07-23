@@ -32,10 +32,11 @@ use tower_http::timeout::TimeoutLayer;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
 use oxide_common::api::{
-    ApiError, CreateAccountResponse, HeartbeatRequest, MeshListResponse, MeshPeer,
-    MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest, PeerEntry,
-    PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse,
-    ServerConnection, ServerInfo, ServerListResponse,
+    AdminAddServerRequest, AdminAddServerResponse, ApiError, CreateAccountResponse,
+    HeartbeatRequest, MeshListResponse, MeshPeer, MeshRegisterRequest, MeshRegisterResponse,
+    MultihopRegisterRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
+    RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerConnection, ServerInfo,
+    ServerListResponse,
 };
 use oxide_common::PublicKey;
 
@@ -70,6 +71,8 @@ pub struct AppState {
     pub pool: Db,
     /// Fixed-window per-IP request counters.
     rate: Arc<StdMutex<HashMap<IpAddr, RateWindow>>>,
+    /// Admin bearer token gating remote server provisioning. `None` disables the admin API.
+    admin_token: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -77,7 +80,14 @@ impl AppState {
         AppState {
             pool,
             rate: Arc::new(StdMutex::new(HashMap::new())),
+            admin_token: None,
         }
+    }
+
+    /// Enable the admin API (remote `add-server`) with this bearer token.
+    pub fn with_admin_token(mut self, token: Option<String>) -> Self {
+        self.admin_token = token.map(Arc::new);
+        self
     }
 
     /// Fixed-window rate check: true if this IP is under the limit (and counts it).
@@ -131,6 +141,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/devices/multihop", post(register_device_multihop))
         .route("/v1/mesh/register", post(mesh_register))
         .route("/v1/mesh", get(mesh_list))
+        .route("/v1/admin/servers", post(admin_add_server))
         .route("/v1/internal/servers/:id/peers", get(list_peers))
         .route("/v1/internal/servers/:id/relays", get(list_relays))
         .route("/v1/internal/servers/:id/heartbeat", post(server_heartbeat))
@@ -872,6 +883,50 @@ pub struct NewServer<'a> {
     pub transport: Option<&'a str>,
     /// Whether this server runs DAITA; handed to clients so they shape to match.
     pub daita: bool,
+}
+
+/// Require the configured admin bearer token. 403 if the admin API is disabled (no token
+/// configured) or the token is missing/wrong — so the endpoint is invisible without the secret.
+fn auth_admin(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let expected = state.admin_token.as_ref().ok_or(AppError::Forbidden)?;
+    match bearer(headers) {
+        Some(t) if t == **expected => Ok(()),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+// POST /v1/admin/servers — register a server node remotely (admin-authenticated). Lets
+// provisioning stand a server up in one command instead of running `add-server` on the host.
+async fn admin_add_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminAddServerRequest>,
+) -> ApiResult<Json<AdminAddServerResponse>> {
+    auth_admin(&state, &headers)?;
+    let cidr: IpNet = req
+        .cidr
+        .parse()
+        .map_err(|_| AppError::BadRequest(format!("invalid cidr: {}", req.cidr)))?;
+    let token = add_server(
+        &state.pool,
+        NewServer {
+            id: &req.id,
+            public_key: &req.public_key,
+            endpoint: &req.endpoint,
+            cidr,
+            country: req.country.as_deref(),
+            city: req.city.as_deref(),
+            capacity: req.capacity,
+            dns: req.dns.as_deref(),
+            obfuscation_key: req.obfuscation_key.as_deref(),
+            pq_public_key: req.pq_public_key.as_deref(),
+            transport: req.transport.as_deref(),
+            daita: req.daita,
+        },
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    Ok(Json(AdminAddServerResponse { auth_token: token }))
 }
 
 /// Insert a server row (used by the `add-server` CLI). Returns the generated auth token.

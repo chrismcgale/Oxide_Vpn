@@ -8,10 +8,10 @@ use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
 
 use oxide_common::api::{
-    CreateAccountResponse, HeartbeatRequest, MeshListResponse, MeshPeer, MeshRegisterRequest,
-    MeshRegisterResponse, MultihopRegisterRequest, PeerEntry, PeerListResponse,
-    RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse, ServerInfo,
-    ServerListResponse,
+    AdminAddServerRequest, AdminAddServerResponse, CreateAccountResponse, HeartbeatRequest,
+    MeshListResponse, MeshPeer, MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest,
+    PeerEntry, PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry,
+    RelayListResponse, ServerInfo, ServerListResponse,
 };
 use oxide_common::PublicKey;
 
@@ -97,6 +97,26 @@ impl ControlClient {
             .context("POST heartbeat")?;
         check(resp).await?;
         Ok(())
+    }
+
+    /// Register a VPN server node remotely (admin-authenticated); returns its auth token.
+    /// Used by `oxide-serverd provision` to stand a server up in one command.
+    pub async fn admin_add_server(
+        &self,
+        admin_token: &str,
+        req: &AdminAddServerRequest,
+    ) -> Result<String> {
+        let resp = self
+            .http
+            .post(self.url("/v1/admin/servers"))
+            .bearer_auth(admin_token)
+            .json(req)
+            .send()
+            .await
+            .context("POST admin add-server")?;
+        let resp = check(resp).await?;
+        let body: AdminAddServerResponse = resp.json().await.context("parsing admin response")?;
+        Ok(body.auth_token)
     }
 
     /// Register this device's public key on `server_id`; returns connection details.

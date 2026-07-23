@@ -32,6 +32,10 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
+        /// Enable the admin API (remote `add-server` for provisioning) with this bearer
+        /// token. Also read from `OXIDE_ADMIN_TOKEN`. Omit to disable the admin API.
+        #[arg(long, env = "OXIDE_ADMIN_TOKEN")]
+        admin_token: Option<String>,
     },
     /// Register a VPN server node and print its auth token.
     AddServer {
@@ -89,12 +93,16 @@ async fn main() -> Result<()> {
     let pool = db::connect(&cli.db).await?;
 
     match cli.cmd {
-        Cmd::Serve { listen } => {
-            let state = AppState::new(pool);
+        Cmd::Serve {
+            listen,
+            admin_token,
+        } => {
+            let admin_on = admin_token.is_some();
+            let state = AppState::new(pool).with_admin_token(admin_token);
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
                 .with_context(|| format!("binding {listen}"))?;
-            info!(%listen, db = %cli.db, "control plane listening");
+            info!(%listen, db = %cli.db, admin_api = admin_on, "control plane listening");
             serve(listener, state).await?;
         }
         Cmd::AddServer {

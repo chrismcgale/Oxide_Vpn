@@ -18,7 +18,7 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 17-crate Cargo workspace. ~102 tests, all green, verified **without root**
+Linux-first, as a 17-crate Cargo workspace. ~108 tests, all green, verified **without root**
 (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged; the
 control plane runs on SQLite or Postgres — the Postgres flow test is gated on a live DB).
 The live-kernel path is verified by the CI netns job.
@@ -249,8 +249,11 @@ crypto/format parts; seccomp test runs in CI.
   reconnect` + `run_supervised` (always-on auto-reconnect + failover), wired into `oxide-client
   connect` and `oxide-agentd`. **Remaining:** server-token rotation (grace window), versioned
   zero-downtime API, concurrent schema-init hardening.
-- [ ] **2D Provisioning automation** — stand up a server (keys, config, control-plane
-  registration, NAT/sysctl) from one command / IaC; **CAP_NET_ADMIN non-root deploy**.
+- [x] **2D Provisioning automation** — *DONE 2026-07-23.* `oxide-serverd provision` stands a
+  server up in one command: generates WG/PQ/obfs keys, registers remotely via a new admin API
+  (`POST /v1/admin/servers`, `serve --admin-token`), and writes a ready `server.toml` (then
+  `sudo … up`). Config part needs no root. Pure config renderer + in-process admin-endpoint
+  tests; verified live against a running control plane. *Follow-on:* IaC templates / cloud-init.
 - [ ] **2E Receiver-index peer demux** — replace the O(peers) source-addr fallback for busy
   servers.
 - [ ] **2F net-linux polish** — nftables via netlink lib (drop `nft` shell-out);

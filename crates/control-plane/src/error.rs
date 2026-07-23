@@ -9,6 +9,7 @@ use oxide_common::api::ApiError;
 #[derive(Debug)]
 pub enum AppError {
     Unauthorized,
+    Forbidden,
     NotFound(String),
     BadRequest(String),
     Conflict(String),
@@ -19,6 +20,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),

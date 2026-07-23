@@ -176,6 +176,43 @@ pub struct MeshListResponse {
     pub peers: Vec<MeshPeer>,
 }
 
+/// Register a VPN server node remotely (admin-authenticated). Mirrors the `add-server` CLI so
+/// provisioning can stand a server up from one command instead of shelling into the control
+/// plane host. All the server's advertised metadata handed to clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAddServerRequest {
+    pub id: String,
+    /// WireGuard public key (base64).
+    pub public_key: String,
+    /// Public UDP endpoint, `host:port`.
+    pub endpoint: String,
+    /// Tunnel subnet CIDR, e.g. `10.8.0.0/24`.
+    pub cidr: String,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub capacity: u32,
+    #[serde(default)]
+    pub dns: Option<String>,
+    #[serde(default)]
+    pub obfuscation_key: Option<String>,
+    #[serde(default)]
+    pub pq_public_key: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub daita: bool,
+}
+
+/// Response to [`AdminAddServerRequest`]: the server's generated auth token (put in its
+/// `[control_plane] token`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAddServerResponse {
+    pub auth_token: String,
+}
+
 /// Standard JSON error body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
