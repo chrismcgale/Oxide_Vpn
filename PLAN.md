@@ -289,8 +289,15 @@ crypto/format parts; seccomp test runs in CI.
   Pure builder unit-tested (6 cases) + config round-trip; live: `scripts/netns-split-test.sh`
   (FIB assertions for exclude) + `netns-classic-test.sh` now asserts auto-include. Per-**app**
   split (cgroup/fwmark) is a separate v2. 122 tests.
-- [ ] **3E "New identity"** — one action for ephemeral keys + exit rotation (per-session
-  unlinkability).
+- [x] **3E "New identity"** — DONE (2026-07-23). One action → fresh device key (atomic
+  `rotate_device_key`, 0600) + reconnect to a *different* exit (the just-left one excluded).
+  `rotate_identity` (pure-ish; unit-tested) + a new-identity generation channel into
+  `run_supervised` (a `watch::<u64>` alongside `stop`; the tunnel tears down on either, told
+  apart afterward). Triggers: `AgentRequest::NewIdentity` (agent bumps the counter) → TUI `n`
+  keybind; CLI `connect` rotates on **SIGUSR1**. New `ConnEvent::NewIdentity`. Mesh keeps its
+  key (scoped to exit connections). Live: `scripts/netns-newidentity-test.sh` (two ghost exits;
+  asserts key rotated + exit switched, all under connect_timeout so only the action can switch
+  it). 124 tests.
 
 ### WAVE 4 — Advanced privacy / research bets
 

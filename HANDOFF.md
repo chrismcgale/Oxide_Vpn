@@ -161,7 +161,15 @@ excluded one goes via the underlay.
 
 ---
 
-## 3E — "New identity" (ephemeral keys + exit rotation)
+## 3E — "New identity" (ephemeral keys + exit rotation) ✅ DONE (2026-07-23)
+Implemented as designed below: `rotate_device_key` (atomic, 0600) + `rotate_identity`
+(pure-ish, unit-tested), a new-identity generation `watch::<u64>` threaded into
+`run_supervised` (teardown on stop OR new-identity, disambiguated after), `ConnEvent::NewIdentity`,
+`AgentRequest::NewIdentity` (agent bumps the counter) → TUI `n` keybind, and CLI `connect`
+rotates on **SIGUSR1**. Mesh keeps its key (scoped to exit connections). Live:
+`scripts/netns-newidentity-test.sh`. 124 tests. See SKILL changelog.
+
+
 **Goal.** One action → fresh device key + reconnect to a **different** exit, for per-session
 unlinkability (Tor-style "new circuit").
 
@@ -189,6 +197,6 @@ reconnects to a *different* ghost/exit after the action.
 ---
 
 ## Suggested order
-~~2E (contained, wg-core-only)~~ **✅ done** → ~~3D (removes a real UX gap + the manual netns route)~~ **✅ done** → **3E next** (builds on `exclude`/reconnect)
+~~2E (contained, wg-core-only)~~ **✅ done** → ~~3D~~ **✅ done** → ~~3E (builds on `exclude`/reconnect)~~ **✅ done** → **2G next** (dual-stack) → 2F (biggest: new dep + API learning)
 (builds on `exclude`/reconnect) → 2G (dual-stack) → 2F (biggest: new dep + API learning; do
 last or when the user okays the dependency). Reassess after each.

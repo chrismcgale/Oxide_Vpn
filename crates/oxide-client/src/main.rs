@@ -198,11 +198,30 @@ async fn main() -> Result<()> {
                 shutdown_signal().await;
                 let _ = stop_tx.send(true);
             });
+            // SIGUSR1 = "new identity" (Tor-style new circuit): rotate the device key and
+            // reconnect to a different exit. `kill -USR1 <pid>` from a script or shell.
+            let (new_id_tx, new_id_rx) = tokio::sync::watch::channel(0u64);
+            tokio::spawn(async move {
+                let mut usr1 = match tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined1(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "cannot install SIGUSR1 handler; new-identity disabled");
+                        return;
+                    }
+                };
+                while usr1.recv().await.is_some() {
+                    info!("SIGUSR1: new identity requested");
+                    new_id_tx.send_modify(|v| *v += 1);
+                }
+            });
             run_supervised(
                 req,
                 kill_switch,
                 ReconnectPolicy::default(),
                 stop_rx,
+                new_id_rx,
                 |_| {},
                 |ev| match ev {
                     ConnEvent::Selecting => info!("selecting a server"),
@@ -212,6 +231,7 @@ async fn main() -> Result<()> {
                     ConnEvent::Reconnecting { server, wait } => {
                         warn!(server = %server, ?wait, "link dropped; reconnecting")
                     }
+                    ConnEvent::NewIdentity => info!("new identity: rotated key, switching exit"),
                     ConnEvent::Stopped => info!("disconnected"),
                 },
             )

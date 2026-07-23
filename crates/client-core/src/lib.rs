@@ -586,6 +586,7 @@ pub async fn run_supervised<Ready, Event>(
     kill_switch: bool,
     policy: ReconnectPolicy,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    new_identity: tokio::sync::watch::Receiver<u64>,
     on_ready: Ready,
     on_event: Event,
 ) -> Result<()>
@@ -596,13 +597,23 @@ where
     let mut attempt: u32 = 0;
     // Servers that recently failed, with when — avoided until the cooldown lapses.
     let mut failed: Vec<(String, std::time::Instant)> = Vec::new();
+    // The last new-identity generation we acted on, and the exit we left doing so (excluded
+    // from the next selection so a "new identity" always lands on a different server).
+    let mut id_gen = *new_identity.borrow();
+    let mut identity_exclude: Option<String> = None;
 
     loop {
         if *stop.borrow() {
             break;
         }
         failed.retain(|(_, t)| t.elapsed() < policy.server_cooldown);
-        req.exclude = failed.iter().map(|(id, _)| id.clone()).collect();
+        let mut exclude: Vec<String> = failed.iter().map(|(id, _)| id.clone()).collect();
+        if let Some(s) = &identity_exclude {
+            if !exclude.contains(s) {
+                exclude.push(s.clone());
+            }
+        }
+        req.exclude = exclude;
 
         on_event(ConnEvent::Selecting);
         let resolved = match resolve_connection(&req).await {
@@ -630,20 +641,50 @@ where
             post_quantum: resolved.post_quantum(),
         }));
 
+        // Tear the tunnel down on either a stop or a new-identity request; the two are told
+        // apart afterward by re-reading `stop` / the identity generation.
+        let teardown = {
+            let stop = stop.clone();
+            let ni = new_identity.clone();
+            async move {
+                tokio::select! {
+                    _ = reconnect::stopped(stop) => {}
+                    _ = reconnect::signalled(ni, id_gen) => {}
+                }
+            }
+        };
         let outcome = run_tunnel(
             &resolved.iface,
             resolved.peers,
             kill_switch,
             Some(policy),
-            reconnect::stopped(stop.clone()),
+            teardown,
             on_ready.clone(),
         )
         .await?;
 
         match outcome {
             TunnelOutcome::Disconnected => {
-                on_event(ConnEvent::Stopped);
-                break;
+                if *stop.borrow() {
+                    on_event(ConnEvent::Stopped);
+                    break;
+                }
+                // Not a stop: a new-identity request tore the tunnel down. Rotate the device
+                // key, exclude the exit we just left, and loop to reconnect elsewhere.
+                let gen = *new_identity.borrow();
+                if gen == id_gen {
+                    // No stop and no new generation — nothing to reconnect to; treat as stop.
+                    on_event(ConnEvent::Stopped);
+                    break;
+                }
+                id_gen = gen;
+                let (_key, excl) = rotate_identity(
+                    &req.key_file,
+                    (!server.is_empty()).then_some(server.as_str()),
+                )?;
+                identity_exclude = excl.into_iter().next();
+                attempt = 0;
+                on_event(ConnEvent::NewIdentity);
             }
             TunnelOutcome::LinkDead { was_up } => {
                 if !server.is_empty() {
@@ -693,6 +734,42 @@ pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
     Ok(key)
 }
 
+/// Generate a fresh device key and **atomically** replace the key file (0600), returning the
+/// new key. Written to a sibling temp file then renamed, so a crash never leaves a truncated
+/// key. Used by "new identity" to make each session cryptographically unlinkable from the last.
+pub fn rotate_device_key(path: &Path) -> Result<SecretKey> {
+    let key = keys::generate_secret();
+    let tmp = path.with_extension("key.tmp");
+    std::fs::write(&tmp, key.to_base64())
+        .with_context(|| format!("writing new key file {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("replacing key file {}", path.display()))?;
+    info!(path = %path.display(), "rotated device key (new identity)");
+    Ok(key)
+}
+
+/// Perform a "new identity": rotate the device key (see [`rotate_device_key`]) and return the
+/// new key together with the exclude set that forces the *next* server selection onto a
+/// different exit than `current_server`. Only the just-left server is excluded, so repeated
+/// switches can't exhaust the pool. A fresh key means the new device registers as unrelated
+/// to the old one — Tor-style "new circuit" unlinkability.
+pub fn rotate_identity(
+    key_file: &Path,
+    current_server: Option<&str>,
+) -> Result<(SecretKey, Vec<String>)> {
+    let key = rotate_device_key(key_file)?;
+    let excludes = current_server
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default();
+    Ok((key, excludes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,5 +806,46 @@ mod tests {
             .allowed_ips
             .iter()
             .any(|n| matches!(n, IpNet::V4(v) if v.prefix_len() == 0)));
+    }
+
+    #[test]
+    fn new_identity_rotates_key_and_excludes_prior_exit() {
+        let dir = std::env::temp_dir().join(format!("oxide-newid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("device.key");
+
+        // Start from a known device key.
+        let original = load_or_create_key(&key_file).unwrap();
+        let original_pub = keys::public_from_secret(&original);
+
+        // New identity away from exit "us-3".
+        let (new_key, exclude) = rotate_identity(&key_file, Some("us-3")).unwrap();
+        let new_pub = keys::public_from_secret(&new_key);
+
+        // Fresh key (unlinkable), persisted to the file, and the prior exit is excluded.
+        assert_ne!(
+            new_pub.to_base64(),
+            original_pub.to_base64(),
+            "key must change"
+        );
+        let on_disk = load_or_create_key(&key_file).unwrap();
+        assert_eq!(
+            keys::public_from_secret(&on_disk).to_base64(),
+            new_pub.to_base64(),
+            "rotated key must be the one persisted"
+        );
+        assert_eq!(exclude, vec!["us-3".to_string()]);
+
+        // With no current server (never connected), the exclude set is empty.
+        let (_k, empty) = rotate_identity(&key_file, None).unwrap();
+        assert!(empty.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "rotated key file must be 0600");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

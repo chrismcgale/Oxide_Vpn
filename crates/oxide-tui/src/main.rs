@@ -77,6 +77,7 @@ async fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
         KeyCode::Char('r') => refresh_servers(app).await,
         KeyCode::Char('d') => disconnect(app).await,
+        KeyCode::Char('n') => new_identity(app).await,
         KeyCode::Enter | KeyCode::Char('c') => connect_selected(app).await,
         _ => {}
     }
@@ -130,6 +131,17 @@ async fn connect_selected(app: &mut App) {
 async fn disconnect(app: &mut App) {
     match agent_request(&app.socket, &AgentRequest::Disconnect).await {
         Ok(_) => app.message = "disconnected".into(),
+        Err(e) => app.message = format!("agent unreachable: {e}"),
+    }
+    refresh_status(app).await;
+}
+
+/// Ask the agent for a new identity: rotate the device key and switch to a different exit.
+async fn new_identity(app: &mut App) {
+    match agent_request(&app.socket, &AgentRequest::NewIdentity).await {
+        Ok(AgentResponse::Ok) => app.message = "new identity: switching exit…".into(),
+        Ok(AgentResponse::Error { message }) => app.message = format!("new identity: {message}"),
+        Ok(_) => {}
         Err(e) => app.message = format!("agent unreachable: {e}"),
     }
     refresh_status(app).await;
@@ -233,7 +245,7 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, body, &mut list_state);
 
     // --- footer: keys + last message ---
-    let help = "↑/↓ select · Enter connect · d disconnect · r refresh · q quit";
+    let help = "↑/↓ select · Enter connect · d disconnect · n new identity · r refresh · q quit";
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(

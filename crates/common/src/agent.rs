@@ -30,6 +30,9 @@ pub enum AgentRequest {
     },
     /// Tear down the tunnel.
     Disconnect,
+    /// Rotate to a new identity: fresh device key + reconnect to a different exit, for
+    /// per-session unlinkability. No-op error if not connected.
+    NewIdentity,
 }
 
 /// A response from the agent to the UI.
@@ -118,6 +121,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn new_identity_request_roundtrip() {
+        let line = AgentRequest::NewIdentity.to_line();
+        assert_eq!(line.trim(), r#"{"cmd":"new_identity"}"#);
+        let back: AgentRequest = serde_json::from_str(line.trim()).unwrap();
+        assert!(matches!(back, AgentRequest::NewIdentity));
     }
 
     #[test]

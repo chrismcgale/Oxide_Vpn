@@ -50,6 +50,9 @@ struct Active {
     meta: Arc<StdMutex<Option<ConnMeta>>>,
     handle: Arc<StdMutex<Option<EngineHandle<TunDevice>>>>,
     stop: watch::Sender<bool>,
+    /// New-identity generation counter; bumping it makes the supervisor rotate the device
+    /// key and reconnect to a different exit.
+    new_id: watch::Sender<u64>,
     task: JoinHandle<Result<()>>,
 }
 
@@ -114,6 +117,12 @@ async fn dispatch(req: AgentRequest, state: &State, key_file: &Arc<PathBuf>) -> 
     match req {
         AgentRequest::Status => AgentResponse::Status(status(state).await),
         AgentRequest::Disconnect => match disconnect(state).await {
+            Ok(()) => AgentResponse::Ok,
+            Err(e) => AgentResponse::Error {
+                message: e.to_string(),
+            },
+        },
+        AgentRequest::NewIdentity => match new_identity(state).await {
             Ok(()) => AgentResponse::Ok,
             Err(e) => AgentResponse::Error {
                 message: e.to_string(),
@@ -197,6 +206,7 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
     let meta: Arc<StdMutex<Option<ConnMeta>>> = Arc::new(StdMutex::new(None));
     let handle: Arc<StdMutex<Option<EngineHandle<TunDevice>>>> = Arc::new(StdMutex::new(None));
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (new_id_tx, new_id_rx) = watch::channel(0u64);
 
     let meta_task = meta.clone();
     let handle_task = handle.clone();
@@ -206,6 +216,7 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
             kill_switch,
             ReconnectPolicy::default(),
             stop_rx,
+            new_id_rx,
             move |h| *handle_task.lock().unwrap() = Some(h),
             move |ev| match ev {
                 ConnEvent::Connecting(i) => {
@@ -229,8 +240,19 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
         meta,
         handle,
         stop: stop_tx,
+        new_id: new_id_tx,
         task,
     });
+    Ok(())
+}
+
+/// Trigger a "new identity" on the active connection: the supervisor rotates the device key
+/// and reconnects to a different exit. Errors if nothing is connected.
+async fn new_identity(state: &State) -> Result<()> {
+    let guard = state.lock().await;
+    let active = guard.active.as_ref().context("not connected")?;
+    active.new_id.send_modify(|v| *v += 1);
+    info!("new identity requested");
     Ok(())
 }
 

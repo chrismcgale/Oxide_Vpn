@@ -51,6 +51,9 @@ pub enum ConnEvent {
     Connecting(ConnInfo),
     /// The link died; reconnecting after `wait`.
     Reconnecting { server: String, wait: Duration },
+    /// A "new identity" was requested: the device key was rotated and we're reconnecting
+    /// to a *different* exit for per-session unlinkability.
+    NewIdentity,
     /// The user asked to stop.
     Stopped,
 }
@@ -139,6 +142,20 @@ pub async fn stopped(mut stop: tokio::sync::watch::Receiver<bool>) {
     }
     while stop.changed().await.is_ok() {
         if *stop.borrow() {
+            return;
+        }
+    }
+}
+
+/// A future that resolves once `signal`'s value moves away from `last` — a "new identity"
+/// request bumps a generation counter. Created fresh per reconnect attempt so the supervisor
+/// can await it once per connection and compare the new generation afterward.
+pub async fn signalled(mut signal: tokio::sync::watch::Receiver<u64>, last: u64) {
+    if *signal.borrow() != last {
+        return;
+    }
+    while signal.changed().await.is_ok() {
+        if *signal.borrow() != last {
             return;
         }
     }
