@@ -429,8 +429,8 @@ where
 
     let dns_guard = match iface.dns {
         Some(d) => {
-            let guard = dns::set_dns(&[d]).context("setting tunnel DNS")?;
-            info!(dns = %d, "tunnel DNS installed");
+            let guard = dns::set_dns(IFNAME, &[d]).context("setting tunnel DNS")?;
+            info!(dns = %d, backend = ?dns::detect_backend(), "tunnel DNS installed");
             Some(guard)
         }
         None => None,
