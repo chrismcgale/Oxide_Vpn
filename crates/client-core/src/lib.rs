@@ -334,10 +334,12 @@ async fn build_client_transport(
     key: Option<[u8; 32]>,
 ) -> Result<Transport> {
     let req_key = || key.context("this transport requires interface.obfuscation_key");
+    // Dual-stack bind ([::]:port, IPV6_V6ONLY off) so the client can dial a v4 or v6 server
+    // endpoint from one socket (falls back to 0.0.0.0 if IPv6 is disabled).
     let bind_udp = || async {
-        tokio::net::UdpSocket::bind(("0.0.0.0", bind_port))
-            .await
-            .context("binding client UDP socket")
+        let std_sock =
+            oxide_net_linux::bind_dual_stack(bind_port).context("binding client UDP socket")?;
+        tokio::net::UdpSocket::from_std(std_sock).context("binding client UDP socket")
     };
     match kind {
         TransportKind::Plain => Ok(Transport::plain(bind_udp().await?)),
@@ -361,6 +363,24 @@ async fn build_client_transport(
             Ok(Transport::mimic(m))
         }
     }
+}
+
+/// Resolve the original default gateway (and its egress ifindex) for `ip`'s address family,
+/// so a route can be pinned around the tunnel through the correct-family gateway — a v6
+/// endpoint/exclude must pin via the v6 default, not the v4 one.
+async fn default_gw_for(nl: &Netlink, ip: IpAddr) -> Result<(IpAddr, u32)> {
+    let v6 = ip.is_ipv6();
+    let (gw, dev) = netlink::default_route_family(v6)?.with_context(|| {
+        format!(
+            "no {} default route found; cannot pin routes around the tunnel",
+            if v6 { "IPv6" } else { "IPv4" }
+        )
+    })?;
+    let dev_idx = nl
+        .link_index(&dev)
+        .await
+        .context("resolving egress interface index")?;
+    Ok((gw, dev_idx))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,28 +430,15 @@ where
     let mut tunnel_routes: Vec<IpNet> = Vec::new();
     let mut gateway_pins: Vec<(IpNet, IpAddr, u32)> = Vec::new();
 
-    // The original default gateway/egress — needed to pin the server endpoint (full tunnel)
-    // and any exclude CIDRs around the tunnel. Resolved once, only if something needs it.
-    let default_gw = if plan.is_full_tunnel() || !plan.via_gateway.is_empty() {
-        let (gw, dev) = netlink::default_route()?
-            .context("no default route found; cannot pin routes around the tunnel")?;
-        let dev_idx = nl
-            .link_index(&dev)
-            .await
-            .context("resolving egress interface index")?;
-        Some((gw, dev_idx))
-    } else {
-        None
-    };
-
     // Full-tunnel: pin the server endpoint via the current default gateway BEFORE swinging
-    // the default, or the encrypted UDP would recurse into the tunnel.
+    // the default, or the encrypted UDP would recurse into the tunnel. The gateway is
+    // resolved for the endpoint's own family (a v6 endpoint pins via the v6 default).
     if plan.is_full_tunnel() {
         let endpoint = peers
             .iter()
             .find_map(|p| p.endpoint)
             .context("full-tunnel peer must have an endpoint")?;
-        let (gw, dev_idx) = default_gw.expect("gateway resolved for full tunnel");
+        let (gw, dev_idx) = default_gw_for(&nl, endpoint.ip()).await?;
         nl.add_host_route_via(endpoint.ip(), gw, dev_idx)
             .await
             .context("pinning server endpoint route")?;
@@ -469,15 +476,15 @@ where
         }
     }
 
-    // Exclude-mode CIDRs: pin around the tunnel via the original default gateway.
-    if let Some((gw, dev_idx)) = default_gw {
-        for cidr in &plan.via_gateway {
-            nl.add_route_via(*cidr, gw, dev_idx)
-                .await
-                .context("pinning split-exclude route")?;
-            gateway_pins.push((*cidr, gw, dev_idx));
-            info!(%cidr, via = %gw, "pinned around tunnel (split exclude)");
-        }
+    // Exclude-mode CIDRs: pin around the tunnel via the original default gateway of each
+    // CIDR's own family (v6 excludes pin via the v6 default).
+    for cidr in &plan.via_gateway {
+        let (gw, dev_idx) = default_gw_for(&nl, cidr.addr()).await?;
+        nl.add_route_via(*cidr, gw, dev_idx)
+            .await
+            .context("pinning split-exclude route")?;
+        gateway_pins.push((*cidr, gw, dev_idx));
+        info!(%cidr, via = %gw, "pinned around tunnel (split exclude)");
     }
 
     let dns_guard = match iface.dns {

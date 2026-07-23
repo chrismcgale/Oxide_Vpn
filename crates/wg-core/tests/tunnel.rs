@@ -647,3 +647,67 @@ async fn established_session_routes_by_index_without_scanning_all_peers() {
         "expected ~{K} probes for {K} packets with {DECOYS} decoys, got {delta}"
     );
 }
+
+/// 2G: the WireGuard transport must work over an IPv6 underlay — same handshake and data
+/// path, but the client dials the server over a v6 UDP socket (`[::1]`). The inner packet is
+/// still IPv4, proving the tunnel is agnostic to the underlay's address family.
+#[tokio::test]
+async fn tunnel_carries_a_packet_over_ipv6_underlay() {
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    // IPv6 loopback sockets — the underlay is v6 end to end.
+    let server_udp = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    assert!(server_addr.is_ipv6(), "server must bind a v6 socket");
+    let client_udp = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::plain(server_udp),
+        server_tun,
+    );
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr), // a v6 endpoint
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::plain(client_udp),
+        client_tun,
+    );
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"wireguard over ipv6",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; tunnel never delivered over the v6 underlay")
+        .expect("server tun channel closed");
+    assert_eq!(
+        received, packet,
+        "packet must traverse the v6-underlay tunnel unchanged"
+    );
+}

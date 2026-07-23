@@ -103,7 +103,15 @@ over netlink. Decision to flag: `rustables` vs `nftnl` (C dep).
 
 ---
 
-## 2G — WG-over-IPv6 transport (+ control-plane v6)
+## 2G — WG-over-IPv6 transport (+ control-plane v6) ✅ DONE (2026-07-23)
+Dual-stack UDP bind (`net-linux::bind_dual_stack`: `[::]` + `IPV6_V6ONLY` off, `0.0.0.0`
+fallback) on server + client; `host_of` handles bracketed v6 (test added); route pins are
+family-aware (`default_gw_for` → `default_route_family(v6)`). Tests: dual-stack socket
+(v4+v6 on one), v6-underlay loopback handshake, `host_of` v6; live `scripts/netns-ipv6-test.sh`.
+Control-plane v6 IP allocation deferred (inside-tunnel v6 already works via static config).
+127 tests. See SKILL changelog.
+
+
 **Goal.** Let the WireGuard transport bind/serve over IPv6 and clients dial v6 endpoints
 (today the *underlay* transport is IPv4-only; IPv6 **inside** the tunnel already works).
 
@@ -202,6 +210,6 @@ reconnects to a *different* ghost/exit after the action.
 ---
 
 ## Suggested order
-~~2E (contained, wg-core-only)~~ **✅ done** → ~~3D~~ **✅ done** → ~~3E (builds on `exclude`/reconnect)~~ **✅ done** → **2G next** (dual-stack) → 2F (biggest: new dep + API learning)
+~~2E~~ **✅** → ~~3D~~ **✅** → ~~3E~~ **✅** → ~~2G (dual-stack)~~ **✅** → **2F next** (biggest: new dep + API learning)
 (builds on `exclude`/reconnect) → 2G (dual-stack) → 2F (biggest: new dep + API learning; do
 last or when the user okays the dependency). Reassess after each.

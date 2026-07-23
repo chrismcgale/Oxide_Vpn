@@ -269,7 +269,15 @@ crypto/format parts; seccomp test runs in CI.
   decapsulate probe/packet, not O(peers). 115 tests.
 - [ ] **2F net-linux polish** — nftables via netlink lib (drop `nft` shell-out);
   `systemd-resolved`-aware DNS backend; idempotent teardown/crash recovery.
-- [ ] **2G WG-over-IPv6 transport** + control-plane v6 IP allocation.
+- [x] **2G WG-over-IPv6 transport** — DONE (2026-07-23). The UDP underlay binds **dual-stack**
+  (`net-linux::bind_dual_stack`: `[::]:port` with `IPV6_V6ONLY` off, falls back to `0.0.0.0` if
+  v6 is disabled) on both server and client, so a client dials a v4 **or** v6 endpoint from one
+  socket. `host_of` already handles bracketed `[v6]:port` (test added). Full-tunnel/exclude route
+  pins are now **family-aware** (`default_gw_for` → `default_route_family(v6)` runs `ip -6 route`)
+  so a v6 endpoint pins via the v6 gateway. Verified: dual-stack socket unit test (one socket gets
+  v4+v6), v6-underlay loopback handshake (`wg-core`), `host_of` v6 test; live
+  `scripts/netns-ipv6-test.sh`. Inside-tunnel v6 already worked (static config). Control-plane v6
+  *IP allocation* (assigning v6 tunnel addresses) not needed yet — deferred. 127 tests.
 - [ ] **2H Observability** — dashboards/alerting on `/metrics`; PSK/DAITA/onion counters.
 
 ### WAVE 3 — Clients & reach

@@ -186,10 +186,22 @@ impl Netlink {
     }
 }
 
-/// The current default route as `(gateway, egress interface name)`, parsed from
-/// `ip route show default`. (The one read we don't do over netlink — see module docs.)
+/// The current IPv4 default route as `(gateway, egress interface name)`.
 pub fn default_route() -> io::Result<Option<(IpAddr, String)>> {
-    let text = output("ip", &["route", "show", "default"])?;
+    default_route_family(false)
+}
+
+/// The current default route for the given family as `(gateway, egress interface name)`,
+/// parsed from `ip [-6] route show default`. Used to pin a server endpoint (or a split-tunnel
+/// exclude) via the original gateway *of the endpoint's own family* — a v6 endpoint must pin
+/// through the v6 default, not the v4 one. (The one read we don't do over netlink — see docs.)
+pub fn default_route_family(v6: bool) -> io::Result<Option<(IpAddr, String)>> {
+    let args: &[&str] = if v6 {
+        &["-6", "route", "show", "default"]
+    } else {
+        &["route", "show", "default"]
+    };
+    let text = output("ip", args)?;
     for line in text.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
         let via = toks

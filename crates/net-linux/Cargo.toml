@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 ipnet = { workspace = true }
 rtnetlink = "0.21"
 futures = "0.3.33"
+socket2 = "0.5"

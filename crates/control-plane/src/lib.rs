@@ -1050,3 +1050,19 @@ pub async fn add_server(pool: &Db, s: NewServer<'_>) -> anyhow::Result<String> {
     .await?;
     Ok(token)
 }
+
+#[cfg(test)]
+mod host_of_tests {
+    use super::host_of;
+
+    #[test]
+    fn extracts_host_from_v4_and_bracketed_v6_endpoints() {
+        // IPv4 host:port.
+        assert_eq!(host_of("203.0.113.7:51820"), "203.0.113.7");
+        // Bracketed IPv6 host:port — the brackets are trimmed and the inner colons kept.
+        assert_eq!(host_of("[2001:db8::1]:51820"), "2001:db8::1");
+        assert_eq!(host_of("[fe80::1]:80"), "fe80::1");
+        // A bare hostname without a port passes through unchanged.
+        assert_eq!(host_of("relay.example"), "relay.example");
+    }
+}

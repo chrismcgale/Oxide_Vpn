@@ -467,9 +467,12 @@ async fn build_server_transport(iface: &InterfaceConfig, listen_port: u16) -> Re
             .map(|k| *k.as_bytes())
             .context("this transport requires interface.obfuscation_key")
     };
+    // Bind dual-stack ([::]:port, IPV6_V6ONLY off) so the server serves both IPv4 and IPv6
+    // clients on one socket (falls back to 0.0.0.0 if IPv6 is disabled).
     let bind_udp = || async {
-        tokio::net::UdpSocket::bind(("0.0.0.0", listen_port))
-            .await
+        let std_sock = oxide_net_linux::bind_dual_stack(listen_port)
+            .with_context(|| format!("binding UDP :{listen_port}"))?;
+        tokio::net::UdpSocket::from_std(std_sock)
             .with_context(|| format!("binding UDP :{listen_port}"))
     };
 

@@ -14,8 +14,10 @@ pub mod setup;
 pub mod signal;
 pub mod sysctl;
 pub mod tun;
+pub mod udp;
 
 pub use netlink::Netlink;
 pub use setup::bring_up_interface;
 pub use signal::shutdown_signal;
 pub use tun::TunDevice;
+pub use udp::bind_dual_stack;
