@@ -506,3 +506,64 @@ async fn admin_endpoint_disabled_without_token() {
     };
     assert!(cc.admin_add_server("anything", &req).await.is_err());
 }
+
+#[tokio::test]
+async fn unset_optional_server_fields_are_none_not_empty_string() {
+    // Regression: a bare server (no country/city/dns/obfs/pq/transport) must expose those as
+    // None, not Some(""). A Some("") pq_public_key made the client attempt PQ against an
+    // empty key and fail to resolve — so every non-PQ server broke client connects.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let server_pub = public_from_secret(&generate_secret()).to_base64();
+    add_server(
+        &pool,
+        NewServer {
+            id: "bare",
+            public_key: &server_pub,
+            endpoint: "203.0.113.1:51820",
+            cidr: "10.8.0.0/24".parse().unwrap(),
+            country: None,
+            city: None,
+            capacity: 0,
+            dns: None,
+            obfuscation_key: None,
+            pq_public_key: None,
+            transport: None,
+            daita: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    let account = cc.create_account().await.unwrap();
+    let s = cc
+        .list_servers(&account)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == "bare")
+        .unwrap();
+    assert_eq!(s.pq_public_key, None, "unset pq_public_key must be None");
+    assert_eq!(s.country, None);
+    assert_eq!(s.city, None);
+
+    // And a device registers cleanly (no obfs/transport/pq handed back).
+    let reg = cc
+        .register_device(
+            &account,
+            public_from_secret(&generate_secret()),
+            "bare",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg.obfuscation_key, None);
+    assert_eq!(reg.transport, None);
+    assert_eq!(reg.dns, None);
+    assert!(!reg.daita);
+}

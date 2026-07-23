@@ -104,10 +104,15 @@ impl DbRow {
         }
     }
     pub fn opt_text(&self, col: &str) -> Option<String> {
-        match self {
-            DbRow::Sqlite(r) => r.try_get(col).ok(),
-            DbRow::Postgres(r) => r.try_get(col).ok(),
-        }
+        // Decode as `Option<String>` so a SQL NULL becomes `None` (decoding as `String`
+        // turns NULL into `Some("")` on SQLite). Also treat an empty string as absent — an
+        // unset optional column must never read as `Some("")`, or e.g. the client would try
+        // a post-quantum handshake against an empty key.
+        let v: Option<String> = match self {
+            DbRow::Sqlite(r) => r.try_get::<Option<String>, _>(col).ok().flatten(),
+            DbRow::Postgres(r) => r.try_get::<Option<String>, _>(col).ok().flatten(),
+        };
+        v.filter(|s| !s.is_empty())
     }
     pub fn int(&self, col: &str) -> i64 {
         match self {
