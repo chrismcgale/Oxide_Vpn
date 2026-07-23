@@ -5,6 +5,11 @@
 > identity". All are solo + verifiable without root (pure/loopback tests; live paths get a
 > netns script). Written 2026-07-23 on branch `rearchitect-wireguard`.
 
+> **Live status (2026-07-23):** 2E/3D/3E done **and live-verified under root** (netns).
+> `netns-{classic,split,fulltunnel,reconnect,newidentity}-test.sh` all PASS. The live run
+> caught a real bug (netlink errors were flattened to `ErrorKind::Other`, breaking 3D's
+> tolerate-`AlreadyExists`) — fixed. Next: **2G (WG-over-IPv6)**, then 2F.
+
 ## Where things stand (read these first)
 - **`PLAN.md`** — forward plan + checkboxes (source of truth for what's done/next).
 - **`.claude/skills/oxide-vpn/SKILL.md`** — Run · Debug · Architecture · Gotchas · Changelog

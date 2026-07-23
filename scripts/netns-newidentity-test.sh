@@ -75,7 +75,12 @@ ip netns exec "$CLI" env RUST_LOG=info "$CLIENT" connect \
 CLI_PID=$!
 
 # Helper: first exit id in a stream of connecting lines (empty if none; never fails set -e).
-exit_from() { grep -oE 'connecting server=Some\("[^"]+"\)' | head -1 | grep -oE '"[^"]+"' | tr -d '"'; }
+# tracing colours the `server=` field with ANSI escapes, so strip them before matching.
+exit_from() {
+    sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -oE 'connecting server=Some\("[^"]+"\)' | head -1 \
+        | grep -oE '"[^"]+"' | tr -d '"'
+}
 
 sleep 5   # let it select + start attempting the first exit (well under connect_timeout=20s)
 KEY_BEFORE=$(cat "$KEYFILE" 2>/dev/null || true)
