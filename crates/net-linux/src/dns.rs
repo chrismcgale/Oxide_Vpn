@@ -90,9 +90,17 @@ pub enum DnsGuard {
 
 /// Install `servers` as the resolver for the tunnel on `iface`, returning a guard that
 /// restores the prior state. Picks the systemd-resolved or resolv.conf backend automatically.
+/// If the resolved path fails (e.g. `resolvectl` errors, or the interface isn't visible to
+/// resolved), it falls back to rewriting `/etc/resolv.conf` rather than failing the tunnel.
 pub fn set_dns(iface: &str, servers: &[IpAddr]) -> io::Result<DnsGuard> {
     match detect_backend() {
-        DnsBackend::SystemdResolved => set_dns_resolved(iface, servers),
+        DnsBackend::SystemdResolved => match set_dns_resolved(iface, servers) {
+            Ok(guard) => Ok(guard),
+            Err(e) => {
+                tracing::warn!(?e, "resolvectl failed; falling back to /etc/resolv.conf");
+                set_dns_at(RESOLV_CONF, servers)
+            }
+        },
         DnsBackend::ResolvConf => set_dns_at(RESOLV_CONF, servers),
     }
 }
