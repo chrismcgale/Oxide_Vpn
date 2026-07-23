@@ -15,5 +15,6 @@ oxide-control-client = { path = "../control-client" }
 oxide-client-core = { path = "../client-core" }
 tokio = { workspace = true }
 clap = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -25,6 +26,9 @@ use oxide_common::{keys, InterfaceConfig, SecretKey, TransportKind};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink, TunDevice};
 use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport};
+
+pub mod reconnect;
+pub use reconnect::{ConnEvent, ConnInfo, ReconnectPolicy, TunnelOutcome};
 
 /// The tunnel interface name.
 pub const IFNAME: &str = "oxide0";
@@ -44,6 +48,9 @@ pub struct ConnectRequest {
     pub city: Option<String>,
     pub key_file: PathBuf,
     pub mtu: Option<u32>,
+    /// Server ids to avoid when auto-selecting (used on reconnect to skip a just-failed
+    /// server). Ignored when an explicit `server`/`exit` is set.
+    pub exclude: Vec<String>,
 }
 
 /// The resolved local config for a connection.
@@ -110,10 +117,22 @@ pub async fn resolve_connection(req: &ConnectRequest) -> Result<Resolved> {
                 .into_iter()
                 .find(|s| &s.id == id)
                 .with_context(|| format!("no such server: {id}"))?,
-            None => cc
+            None if req.exclude.is_empty() => cc
                 .best_server(&account, req.country.as_deref(), req.city.as_deref())
                 .await
                 .context("selecting best server")?,
+            // On reconnect we avoid the just-failed server(s): pick client-side from the list.
+            None => {
+                let servers = cc.list_servers(&account).await.context("listing servers")?;
+                reconnect::select_best(
+                    &servers,
+                    req.country.as_deref(),
+                    req.city.as_deref(),
+                    &req.exclude,
+                )
+                .cloned()
+                .context("no healthy server available (all excluded / down)")?
+            }
         };
         info!(server = %chosen.id, endpoint = %chosen.endpoint, "selected server");
         let (pq_ct, psk) = match &chosen.pq_public_key {
@@ -339,13 +358,18 @@ async fn build_client_transport(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tunnel<Stop, Ready>(
     iface: &InterfaceConfig,
     peers: Vec<PeerParams>,
     kill_switch: bool,
+    // Liveness watchdog policy. `Some` = detect a dead link and return `LinkDead` (used by
+    // `run_supervised`); `None` = run until the engine ends or `stop` fires (mesh / static
+    // `up`, where there's nothing to fail over to and a peerless mesh is legitimate).
+    policy: Option<ReconnectPolicy>,
     stop: Stop,
     on_ready: Ready,
-) -> Result<()>
+) -> Result<TunnelOutcome>
 where
     Stop: Future<Output = ()>,
     Ready: FnOnce(EngineHandle<TunDevice>),
@@ -435,13 +459,43 @@ where
     } else {
         engine
     };
-    on_ready(engine.handle());
+    let handle = engine.handle();
+    on_ready(handle.clone());
     info!("connecting");
 
-    tokio::select! {
-        r = engine.run() => { r.context("engine stopped")?; }
-        _ = stop => { info!("shutting down"); }
-    }
+    // Liveness watchdog: resolves (yielding `was_up`) once the link is deemed dead, so a
+    // supervisor can tear down and reconnect. Never fires while handshakes stay fresh; a
+    // `None` policy disables it entirely (the future stays pending).
+    let watchdog = {
+        let handle = handle.clone();
+        async move {
+            let Some(policy) = policy else {
+                return std::future::pending::<bool>().await;
+            };
+            let start = std::time::Instant::now();
+            let mut ever_up = false;
+            let mut tick = tokio::time::interval(policy.poll);
+            loop {
+                tick.tick().await;
+                let s = handle.stats();
+                if reconnect::is_up(&s, &policy) {
+                    ever_up = true;
+                }
+                if reconnect::link_dead(&s, ever_up, start.elapsed(), &policy) {
+                    return ever_up;
+                }
+            }
+        }
+    };
+
+    let outcome = tokio::select! {
+        r = engine.run() => { r.context("engine stopped")?; TunnelOutcome::Disconnected }
+        _ = stop => { info!("shutting down"); TunnelOutcome::Disconnected }
+        was_up = watchdog => {
+            warn!("tunnel link is dead (no handshake); tearing down for reconnect");
+            TunnelOutcome::LinkDead { was_up }
+        }
+    };
 
     // Teardown in reverse order.
     if kill_switch {
@@ -458,7 +512,107 @@ where
     if routed_v4 || routed_v6 {
         nl.clear_default_via_dev(tun_idx, routed_v6).await;
     }
+    Ok(outcome)
+}
+
+/// Run an **always-on** connection: resolve → tunnel → (on link death) re-select a
+/// different server and reconnect, with capped backoff, until `stop` fires. This is the
+/// classic-VPN reliability loop — it survives server death and network changes.
+///
+/// `stop` is a `watch` channel (send `true` to disconnect). `on_ready` is called with a
+/// fresh [`EngineHandle`] on every (re)connect so a supervisor can read live stats;
+/// `on_event` receives [`ConnEvent`]s for status display.
+pub async fn run_supervised<Ready, Event>(
+    mut req: ConnectRequest,
+    kill_switch: bool,
+    policy: ReconnectPolicy,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    on_ready: Ready,
+    on_event: Event,
+) -> Result<()>
+where
+    Ready: Fn(EngineHandle<TunDevice>) + Clone,
+    Event: Fn(ConnEvent),
+{
+    let mut attempt: u32 = 0;
+    // Servers that recently failed, with when — avoided until the cooldown lapses.
+    let mut failed: Vec<(String, std::time::Instant)> = Vec::new();
+
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        failed.retain(|(_, t)| t.elapsed() < policy.server_cooldown);
+        req.exclude = failed.iter().map(|(id, _)| id.clone()).collect();
+
+        on_event(ConnEvent::Selecting);
+        let resolved = match resolve_connection(&req).await {
+            Ok(r) => r,
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                let wait = reconnect::backoff(attempt, &policy);
+                warn!(error = %e, ?wait, "could not resolve a server; retrying");
+                if sleep_or_stop(wait, &mut stop).await {
+                    break;
+                }
+                continue;
+            }
+        };
+        let server = resolved
+            .server_id
+            .clone()
+            .or_else(|| resolved.exit_id.clone())
+            .unwrap_or_default();
+        on_event(ConnEvent::Connecting(ConnInfo {
+            server_id: resolved.server_id.clone(),
+            exit_id: resolved.exit_id.clone(),
+            assigned_ip: resolved.assigned_ip(),
+            stealth: resolved.stealth(),
+            post_quantum: resolved.post_quantum(),
+        }));
+
+        let outcome = run_tunnel(
+            &resolved.iface,
+            resolved.peers,
+            kill_switch,
+            Some(policy),
+            reconnect::stopped(stop.clone()),
+            on_ready.clone(),
+        )
+        .await?;
+
+        match outcome {
+            TunnelOutcome::Disconnected => {
+                on_event(ConnEvent::Stopped);
+                break;
+            }
+            TunnelOutcome::LinkDead { was_up } => {
+                if !server.is_empty() {
+                    failed.push((server.clone(), std::time::Instant::now()));
+                }
+                // A session that was established and dropped retries promptly; one that never
+                // connected backs off progressively (the endpoint may be blocked/down).
+                attempt = if was_up { 1 } else { attempt.saturating_add(1) };
+                let wait = reconnect::backoff(attempt, &policy);
+                on_event(ConnEvent::Reconnecting { server, wait });
+                if sleep_or_stop(wait, &mut stop).await {
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Sleep for `wait`, or return early (`true`) if `stop` fires first.
+async fn sleep_or_stop(wait: Duration, stop: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    if *stop.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => false,
+        _ = reconnect::stopped(stop.clone()) => true,
+    }
 }
 
 /// Load the device private key from `path`, or generate and persist one (0600).

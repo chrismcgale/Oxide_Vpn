@@ -14,11 +14,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use oxide_client_core::{resolve_connection, run_tunnel, ConnectRequest};
+use oxide_client_core::{run_supervised, ConnEvent, ConnectRequest, ReconnectPolicy};
 use oxide_common::agent::{AgentRequest, AgentResponse, TunnelStatus, DEFAULT_SOCKET};
 use oxide_net_linux::TunDevice;
 use oxide_wg_core::EngineHandle;
@@ -44,12 +44,12 @@ struct ConnMeta {
     started: Instant,
 }
 
-/// The active tunnel, if any.
+/// The active (always-on) tunnel, if any. `meta` and `handle` are shared cells the
+/// supervised task updates on every (re)connect, so status reflects the *current* server.
 struct Active {
-    meta: ConnMeta,
-    /// Set by the tunnel task's `on_ready` once the engine is up.
+    meta: Arc<StdMutex<Option<ConnMeta>>>,
     handle: Arc<StdMutex<Option<EngineHandle<TunDevice>>>>,
-    stop: Arc<Notify>,
+    stop: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
 }
 
@@ -137,6 +137,7 @@ async fn dispatch(req: AgentRequest, state: &State, key_file: &Arc<PathBuf>) -> 
                 city: None,
                 key_file: (**key_file).clone(),
                 mtu: None,
+                exclude: Vec::new(),
             };
             match connect(state, req, kill_switch).await {
                 Ok(()) => AgentResponse::Ok,
@@ -159,6 +160,11 @@ async fn status(state: &State) -> TunnelStatus {
     match &guard.active {
         None => TunnelStatus::default(),
         Some(a) => {
+            let meta = a.meta.lock().unwrap();
+            let Some(m) = meta.as_ref() else {
+                // Active but between attempts (selecting / connecting): not yet connected.
+                return TunnelStatus::default();
+            };
             let stats = a
                 .handle
                 .lock()
@@ -168,15 +174,15 @@ async fn status(state: &State) -> TunnelStatus {
                 .unwrap_or_default();
             TunnelStatus {
                 connected: true,
-                server_id: a.meta.server_id.clone(),
-                exit_id: a.meta.exit_id.clone(),
-                assigned_ip: Some(a.meta.assigned_ip.clone()),
-                uptime_secs: a.meta.started.elapsed().as_secs(),
+                server_id: m.server_id.clone(),
+                exit_id: m.exit_id.clone(),
+                assigned_ip: Some(m.assigned_ip.clone()),
+                uptime_secs: m.started.elapsed().as_secs(),
                 tx_bytes: stats.tx_bytes,
                 rx_bytes: stats.rx_bytes,
                 active_peers: stats.active_peers,
-                stealth: a.meta.stealth,
-                post_quantum: a.meta.post_quantum,
+                stealth: m.stealth,
+                post_quantum: m.post_quantum,
             }
         }
     }
@@ -185,33 +191,36 @@ async fn status(state: &State) -> TunnelStatus {
 async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Result<()> {
     disconnect(state).await.ok();
 
-    // Control-plane resolution (unprivileged) before we touch the device.
-    let resolved = resolve_connection(&req)
-        .await
-        .context("resolving connection")?;
-    let meta = ConnMeta {
-        server_id: resolved.server_id.clone(),
-        exit_id: resolved.exit_id.clone(),
-        assigned_ip: resolved.assigned_ip(),
-        stealth: resolved.stealth(),
-        post_quantum: resolved.post_quantum(),
-        started: Instant::now(),
-    };
-
-    let iface = resolved.iface;
-    let peers = resolved.peers;
-    let stop = Arc::new(Notify::new());
+    // Always-on: the supervisor keeps the tunnel up across server death / network changes,
+    // re-resolving and reconnecting as needed. `meta` and `handle` are shared cells it
+    // updates on each (re)connect so `status` reflects the current server and throughput.
+    let meta: Arc<StdMutex<Option<ConnMeta>>> = Arc::new(StdMutex::new(None));
     let handle: Arc<StdMutex<Option<EngineHandle<TunDevice>>>> = Arc::new(StdMutex::new(None));
+    let (stop_tx, stop_rx) = watch::channel(false);
 
-    let stop_task = stop.clone();
+    let meta_task = meta.clone();
     let handle_task = handle.clone();
     let task = tokio::spawn(async move {
-        run_tunnel(
-            &iface,
-            peers,
+        run_supervised(
+            req,
             kill_switch,
-            async move { stop_task.notified().await },
+            ReconnectPolicy::default(),
+            stop_rx,
             move |h| *handle_task.lock().unwrap() = Some(h),
+            move |ev| match ev {
+                ConnEvent::Connecting(i) => {
+                    *meta_task.lock().unwrap() = Some(ConnMeta {
+                        server_id: i.server_id,
+                        exit_id: i.exit_id,
+                        assigned_ip: i.assigned_ip,
+                        stealth: i.stealth,
+                        post_quantum: i.post_quantum,
+                        started: Instant::now(),
+                    });
+                }
+                ConnEvent::Stopped => *meta_task.lock().unwrap() = None,
+                _ => {}
+            },
         )
         .await
     });
@@ -219,7 +228,7 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
     state.lock().await.active = Some(Active {
         meta,
         handle,
-        stop,
+        stop: stop_tx,
         task,
     });
     Ok(())
@@ -228,9 +237,9 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
 async fn disconnect(state: &State) -> Result<()> {
     let active = state.lock().await.active.take();
     if let Some(a) = active {
-        a.stop.notify_one();
-        // Give teardown a moment; then ensure the task is done.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), a.task).await;
+        let _ = a.stop.send(true);
+        // Give the supervisor time to tear down the current tunnel, then ensure it's done.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(6), a.task).await;
         info!("disconnected");
     }
     Ok(())

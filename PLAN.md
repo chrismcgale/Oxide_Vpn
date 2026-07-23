@@ -18,7 +18,7 @@
 ## Part 0 — Current state (2026-07-21)
 
 A real WireGuard-based VPN platform built on **boringtun** (not hand-rolled crypto),
-Linux-first, as a 17-crate Cargo workspace. ~97 tests, all green, verified **without root**
+Linux-first, as a 17-crate Cargo workspace. ~102 tests, all green, verified **without root**
 (mock TUN + loopback UDP + in-process control plane; seccomp fork-tested unprivileged; the
 control plane runs on SQLite or Postgres — the Postgres flow test is gated on a live DB).
 The live-kernel path is verified by the CI netns job.
@@ -165,7 +165,14 @@ response returns to the prober; a genuine authenticated Initial still tunnels; b
 (loopback backend, no root). Docs: threat model — strongest when the decoy is a real service
 you host; note timing/behavioral caveats.
 
-#### Sprint 1C — True onion multihop  ⟶ *next Wave-1 moonshot*
+#### Sprint 1C — True onion multihop  ⏸ **PARKED (2026-07-23)**
+> **Direction pivot (user):** "Let's get this classic VPN going first." Onion multihop and all
+> onion-flavored work are paused until the *classic consumer VPN* is solid — reliability
+> (auto-reconnect + re-selection on server death), DNS that holds on systemd-resolved/
+> NetworkManager systems (2F), live end-to-end verification under root, desktop GUI (3A),
+> provisioning (2D), WG-over-IPv6 (2G). Pull those forward; do not start 1C until re-opened.
+> (The unresolved crypto fork — nested-WireGuard vs Tor-style onion cells — waits with it.)
+
 **Goal.** Upgrade multihop from "entry blindly relays exit-keyed ciphertext" to **nested
 per-hop encryption**: each relay peels exactly one layer and knows only its previous and next
 hop — never both your IP and your destination, even if a single hop is compromised.
@@ -238,8 +245,10 @@ crypto/format parts; seccomp test runs in CI.
   `devices(server_id,tunnel_ip)` + `relays(entry_id,listen_port)`, lock-free insert-retry,
   portable `is_unique_violation`, SQLite WAL+busy_timeout). 10-way concurrent-registration
   test passes on **both** SQLite and live Postgres → multiple API nodes can share one PG.
-  **Remaining:** server-token rotation (grace window), client re-selection on server death,
-  versioned zero-downtime API, concurrent schema-init hardening.
+  **Client re-selection on server death: DONE (2026-07-23, classic-VPN track)** — `client-core::
+  reconnect` + `run_supervised` (always-on auto-reconnect + failover), wired into `oxide-client
+  connect` and `oxide-agentd`. **Remaining:** server-token rotation (grace window), versioned
+  zero-downtime API, concurrent schema-init hardening.
 - [ ] **2D Provisioning automation** — stand up a server (keys, config, control-plane
   registration, NAT/sysctl) from one command / IaC; **CAP_NET_ADMIN non-root deploy**.
 - [ ] **2E Receiver-index peer demux** — replace the O(peers) source-addr fallback for busy

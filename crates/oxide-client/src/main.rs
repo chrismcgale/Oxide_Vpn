@@ -8,9 +8,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tracing::{info, warn};
 
 use oxide_client_core::{
-    resolve_connection, resolve_mesh, run_tunnel, ConnectRequest, MeshRequest,
+    resolve_mesh, run_supervised, run_tunnel, ConnEvent, ConnectRequest, MeshRequest,
+    ReconnectPolicy,
 };
 use oxide_common::{keys, Config, SecretKey};
 use oxide_control_client::ControlClient;
@@ -134,10 +136,12 @@ async fn main() -> Result<()> {
                 &resolved.iface,
                 resolved.peers,
                 false,
+                None, // mesh: no liveness watchdog (a peerless mesh is legitimate)
                 shutdown_signal(),
                 |_| {},
             )
             .await
+            .map(|_| ())
         }
         Cmd::Account { control_plane } => {
             let number = ControlClient::new(&control_plane).create_account().await?;
@@ -156,10 +160,12 @@ async fn main() -> Result<()> {
                 &cfg.interface,
                 peers,
                 kill_switch,
+                None, // static config: one server, nothing to fail over to
                 shutdown_signal(),
                 |_| {},
             )
             .await
+            .map(|_| ())
         }
         Cmd::Connect {
             control_plane,
@@ -183,14 +189,31 @@ async fn main() -> Result<()> {
                 city,
                 key_file,
                 mtu,
+                exclude: Vec::new(),
             };
-            let resolved = resolve_connection(&req).await?;
-            run_tunnel(
-                &resolved.iface,
-                resolved.peers,
+            // Always-on: keep the tunnel up across server death / network changes until the
+            // user interrupts. A pinned --server just reconnects to the same one.
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                let _ = stop_tx.send(true);
+            });
+            run_supervised(
+                req,
                 kill_switch,
-                shutdown_signal(),
+                ReconnectPolicy::default(),
+                stop_rx,
                 |_| {},
+                |ev| match ev {
+                    ConnEvent::Selecting => info!("selecting a server"),
+                    ConnEvent::Connecting(i) => {
+                        info!(server = ?i.server_id.or(i.exit_id), ip = %i.assigned_ip, "connecting")
+                    }
+                    ConnEvent::Reconnecting { server, wait } => {
+                        warn!(server = %server, ?wait, "link dropped; reconnecting")
+                    }
+                    ConnEvent::Stopped => info!("disconnected"),
+                },
             )
             .await
         }

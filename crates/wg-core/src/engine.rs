@@ -109,13 +109,25 @@ pub struct EngineStats {
     pub tx_bytes: u64,
     /// Total bytes received and decrypted from peers.
     pub rx_bytes: u64,
+    /// Seconds since the **freshest** completed handshake across all peers, or `None` if no
+    /// peer has ever handshaked. Used by the client's liveness watchdog: a growing age past
+    /// the rekey window means the link is dead (server gone / network changed).
+    pub handshake_age_secs: Option<u64>,
 }
 
 /// A cheap, cloneable handle for mutating a running engine's peer set. The control
 /// plane loop on the server uses this to reconcile peers as devices come and go.
-#[derive(Clone)]
 pub struct EngineHandle<T: TunQueue> {
     shared: Arc<Shared<T>>,
+}
+
+// Hand-written so cloning a handle doesn't require `T: Clone` (it's just an `Arc` bump).
+impl<T: TunQueue> Clone for EngineHandle<T> {
+    fn clone(&self) -> Self {
+        EngineHandle {
+            shared: self.shared.clone(),
+        }
+    }
 }
 
 impl<T: TunQueue> Engine<T> {
@@ -503,10 +515,16 @@ impl<T: TunQueue> EngineHandle<T> {
         let mut active_peers = 0;
         let mut tx_bytes = 0u64;
         let mut rx_bytes = 0u64;
+        let mut handshake_age_secs: Option<u64> = None;
         for (_, p) in &peers {
             let (since, tx, rx, _, _) = p.tunn.lock().unwrap().stats();
-            if matches!(since, Some(d) if d < ACTIVE_WINDOW) {
-                active_peers += 1;
+            if let Some(d) = since {
+                if d < ACTIVE_WINDOW {
+                    active_peers += 1;
+                }
+                // Track the freshest handshake across peers (smallest age).
+                let secs = d.as_secs();
+                handshake_age_secs = Some(handshake_age_secs.map_or(secs, |m| m.min(secs)));
             }
             tx_bytes += tx as u64;
             rx_bytes += rx as u64;
@@ -516,6 +534,7 @@ impl<T: TunQueue> EngineHandle<T> {
             active_peers,
             tx_bytes,
             rx_bytes,
+            handshake_age_secs,
         }
     }
 
