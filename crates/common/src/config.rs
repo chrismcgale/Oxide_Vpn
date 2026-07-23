@@ -158,6 +158,19 @@ pub struct InterfaceConfig {
     /// shapes egress; on a server it frames replies and drops inbound cover.
     #[serde(default)]
     pub daita: bool,
+
+    /// Split tunnelling (client-side): route **only** these CIDRs through the tunnel, on top
+    /// of any specific `allowed_ips` the peer already implies. Ignored on a full-tunnel peer
+    /// (a `0.0.0.0/0` peer already routes everything). Empty = derive routes from the peers'
+    /// `allowed_ips` alone. See [`crate::config`] docs / `client-core::split`.
+    #[serde(default)]
+    pub split_include: Vec<IpNet>,
+
+    /// Split tunnelling (client-side): route these CIDRs **around** the tunnel (pinned to the
+    /// original default gateway), even under full-tunnel. Longest-prefix match makes a more
+    /// specific exclude win over the tunnel default. Incompatible with the kill switch.
+    #[serde(default)]
+    pub split_exclude: Vec<IpNet>,
 }
 
 impl InterfaceConfig {
@@ -273,6 +286,40 @@ mod tests {
         assert_eq!(cfg.interface.mtu(), 1420);
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.nat.unwrap().egress.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn split_tunnel_fields_parse_and_default_empty() {
+        // Absent => empty (back-compat: existing configs are unaffected).
+        let bare = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.2/24"
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.0/24"]
+        "#;
+        let cfg = Config::from_toml_str(bare).unwrap();
+        assert!(cfg.interface.split_include.is_empty());
+        assert!(cfg.interface.split_exclude.is_empty());
+
+        // Present => parsed as CIDRs.
+        let split = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.2/24"
+            split_include = ["172.16.0.0/16"]
+            split_exclude = ["1.2.3.0/24", "10.60.0.0/24"]
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["0.0.0.0/0"]
+        "#;
+        let cfg = Config::from_toml_str(split).unwrap();
+        assert_eq!(
+            cfg.interface.split_include,
+            vec!["172.16.0.0/16".parse().unwrap()]
+        );
+        assert_eq!(cfg.interface.split_exclude.len(), 2);
     }
 
     #[test]

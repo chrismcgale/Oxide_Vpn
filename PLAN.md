@@ -280,7 +280,15 @@ crypto/format parts; seccomp test runs in CI.
   (the trait split was designed for this); `wg-core` is already OS-agnostic.
 - [ ] **3C Mobile** — expose `wg-core` as a library via UniFFI; integrate with
   iOS NetworkExtension / Android VpnService.
-- [ ] **3D Split tunnelling** — per-app / per-destination routing policy.
+- [x] **3D Split tunnelling** (per-destination) — DONE (2026-07-23). `[interface] split_include`
+  / `split_exclude` CIDRs; a pure `client-core::split::plan_routes` builder decides, per family,
+  full-tunnel vs include (route each specific `allowed_ips`/include CIDR **via oxide0**) vs
+  exclude (pin CIDRs **around** the tunnel via the original gateway, longest-prefix wins). This
+  removes the manual `ip route add <cidr> dev oxide0` step the netns harness needed. KS is
+  refused with `split_exclude` (contradictory). Teardown removes exactly the routes it added.
+  Pure builder unit-tested (6 cases) + config round-trip; live: `scripts/netns-split-test.sh`
+  (FIB assertions for exclude) + `netns-classic-test.sh` now asserts auto-include. Per-**app**
+  split (cgroup/fwmark) is a separate v2. 122 tests.
 - [ ] **3E "New identity"** — one action for ephemeral keys + exit rotation (per-session
   unlinkability).
 

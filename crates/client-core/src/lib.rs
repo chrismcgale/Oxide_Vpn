@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ipnet::IpNet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use oxide_common::api::RegisterDeviceResponse;
 use oxide_common::{keys, InterfaceConfig, SecretKey, TransportKind};
@@ -28,6 +28,7 @@ use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink, Tun
 use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport};
 
 pub mod reconnect;
+pub mod split;
 pub use reconnect::{ConnEvent, ConnInfo, ReconnectPolicy, TunnelOutcome};
 
 /// The tunnel interface name.
@@ -235,6 +236,8 @@ pub async fn resolve_mesh(req: &MeshRequest) -> Result<Resolved> {
         decoy_backend: None,
         transport: TransportKind::default(),
         daita: false,
+        split_include: Vec::new(),
+        split_exclude: Vec::new(),
     };
     Ok(Resolved {
         iface,
@@ -305,6 +308,8 @@ pub fn resolve_registration(
         decoy_backend: None,
         transport,
         daita: reg.daita,
+        split_include: Vec::new(),
+        split_exclude: Vec::new(),
     };
     let peer = PeerParams {
         public_key: reg.server.public_key,
@@ -380,50 +385,98 @@ where
         .context("bringing up tun interface")?;
     info!(iface = IFNAME, addr = %iface.address, mtu = iface.mtu(), "interface up");
 
-    // Full-tunnel routing: pin the server endpoint via the current default gateway BEFORE
-    // swinging the default, or the encrypted UDP would recurse into the tunnel.
+    // Plan routing from the peers' allowed_ips + the interface's split config: which family
+    // (if any) is full-tunnel, which CIDRs route via the tunnel (include), and which are
+    // pinned around it (exclude). See `split::plan_routes`.
+    let allowed: Vec<IpNet> = peers
+        .iter()
+        .flat_map(|p| p.allowed_ips.iter().copied())
+        .collect();
+    let plan = split::plan_routes(&allowed, &iface.split_include, &iface.split_exclude);
+    // Fail before touching the routing table: the kill switch permits only the tunnel + the
+    // server endpoint, so excluded CIDRs (which must reach the underlay) can't coexist.
+    if kill_switch && !plan.via_gateway.is_empty() {
+        anyhow::bail!(
+            "--kill-switch is incompatible with split_exclude: excluded CIDRs route around \
+             the tunnel and the kill switch would block them"
+        );
+    }
+
     let mut routed_v4 = false;
     let mut routed_v6 = false;
     let mut full_tunnel_endpoint: Option<SocketAddr> = None;
     let mut pinned: Option<(IpAddr, IpAddr, u32)> = None;
-    for peer in &peers {
-        let has_v4 = peer
-            .allowed_ips
+    // Split-tunnel routes we install, tracked so teardown removes exactly what we added.
+    let mut tunnel_routes: Vec<IpNet> = Vec::new();
+    let mut gateway_pins: Vec<(IpNet, IpAddr, u32)> = Vec::new();
+
+    // The original default gateway/egress — needed to pin the server endpoint (full tunnel)
+    // and any exclude CIDRs around the tunnel. Resolved once, only if something needs it.
+    let default_gw = if plan.is_full_tunnel() || !plan.via_gateway.is_empty() {
+        let (gw, dev) = netlink::default_route()?
+            .context("no default route found; cannot pin routes around the tunnel")?;
+        let dev_idx = nl
+            .link_index(&dev)
+            .await
+            .context("resolving egress interface index")?;
+        Some((gw, dev_idx))
+    } else {
+        None
+    };
+
+    // Full-tunnel: pin the server endpoint via the current default gateway BEFORE swinging
+    // the default, or the encrypted UDP would recurse into the tunnel.
+    if plan.is_full_tunnel() {
+        let endpoint = peers
             .iter()
-            .any(|n| matches!(n, IpNet::V4(v) if v.prefix_len() == 0));
-        let has_v6 = peer
-            .allowed_ips
-            .iter()
-            .any(|n| matches!(n, IpNet::V6(v) if v.prefix_len() == 0));
-        if has_v4 || has_v6 {
-            let endpoint = peer
-                .endpoint
-                .context("full-tunnel peer must have an endpoint")?;
-            let (gw, dev) = netlink::default_route()?
-                .context("no default route found; cannot pin server endpoint")?;
-            let dev_idx = nl
-                .link_index(&dev)
+            .find_map(|p| p.endpoint)
+            .context("full-tunnel peer must have an endpoint")?;
+        let (gw, dev_idx) = default_gw.expect("gateway resolved for full tunnel");
+        nl.add_host_route_via(endpoint.ip(), gw, dev_idx)
+            .await
+            .context("pinning server endpoint route")?;
+        if plan.full_tunnel_v4 {
+            nl.set_default_v4_via_dev(tun_idx)
                 .await
-                .context("resolving egress interface index")?;
-            nl.add_host_route_via(endpoint.ip(), gw, dev_idx)
+                .context("swinging IPv4 default into tunnel")?;
+            routed_v4 = true;
+        }
+        if plan.full_tunnel_v6 {
+            nl.set_default_v6_via_dev(tun_idx)
                 .await
-                .context("pinning server endpoint route")?;
-            if has_v4 {
-                nl.set_default_v4_via_dev(tun_idx)
-                    .await
-                    .context("swinging IPv4 default into tunnel")?;
-                routed_v4 = true;
+                .context("swinging IPv6 default into tunnel")?;
+            routed_v6 = true;
+        }
+        info!(server = %endpoint.ip(), via = %gw, "default route swung into tunnel");
+        full_tunnel_endpoint = Some(endpoint);
+        pinned = Some((endpoint.ip(), gw, dev_idx));
+    }
+
+    // Include-mode CIDRs: route each on-link via the tunnel device. This is what used to
+    // require a manual `ip route add <cidr> dev oxide0`.
+    for cidr in &plan.via_tunnel {
+        match nl.add_route_dev(*cidr, tun_idx).await {
+            Ok(()) => {
+                tunnel_routes.push(*cidr);
+                info!(%cidr, "routed via tunnel (split include)");
             }
-            if has_v6 {
-                nl.set_default_v6_via_dev(tun_idx)
-                    .await
-                    .context("swinging IPv6 default into tunnel")?;
-                routed_v6 = true;
+            // The interface subnet is auto-routed when its address is assigned; a duplicate
+            // route is not an error we should fail the connect over.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                debug!(%cidr, "tunnel route already present; leaving it in place");
             }
-            info!(server = %endpoint.ip(), via = %gw, "default route swung into tunnel");
-            full_tunnel_endpoint = Some(endpoint);
-            pinned = Some((endpoint.ip(), gw, dev_idx));
-            break;
+            Err(e) => return Err(e).context("installing split-include tunnel route"),
+        }
+    }
+
+    // Exclude-mode CIDRs: pin around the tunnel via the original default gateway.
+    if let Some((gw, dev_idx)) = default_gw {
+        for cidr in &plan.via_gateway {
+            nl.add_route_via(*cidr, gw, dev_idx)
+                .await
+                .context("pinning split-exclude route")?;
+            gateway_pins.push((*cidr, gw, dev_idx));
+            info!(%cidr, via = %gw, "pinned around tunnel (split exclude)");
         }
     }
 
@@ -505,6 +558,12 @@ where
     }
     if let Some(guard) = dns_guard {
         dns::restore(guard);
+    }
+    for (cidr, gw, dev_idx) in &gateway_pins {
+        let _ = nl.del_route_via(*cidr, *gw, *dev_idx).await;
+    }
+    for cidr in &tunnel_routes {
+        let _ = nl.del_route_dev(*cidr, tun_idx).await;
     }
     if let Some((host, gw, dev_idx)) = pinned {
         let _ = nl.del_host_route_via(host, gw, dev_idx).await;

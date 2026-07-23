@@ -14,7 +14,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use futures::TryStreamExt;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rtnetlink::packet_route::route::{RouteMessage, RouteScope};
 use rtnetlink::{new_connection, Handle, LinkUnspec, RouteMessageBuilder};
 
@@ -127,6 +127,28 @@ impl Netlink {
             .map_err(to_io)
     }
 
+    /// Add a route for an arbitrary-prefix `dst` CIDR via `gateway` out `index`. Used by
+    /// split-tunnel **exclude** to pin a CIDR to the original default gateway so it bypasses
+    /// the tunnel (a more specific exclude outranks the tunnel default by longest prefix).
+    pub async fn add_route_via(&self, dst: IpNet, gateway: IpAddr, index: u32) -> io::Result<()> {
+        self.handle
+            .route()
+            .add(net_route_via(dst, gateway, index)?)
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
+    /// Remove a routed-via-gateway CIDR (teardown).
+    pub async fn del_route_via(&self, dst: IpNet, gateway: IpAddr, index: u32) -> io::Result<()> {
+        self.handle
+            .route()
+            .del(net_route_via(dst, gateway, index)?)
+            .execute()
+            .await
+            .map_err(to_io)
+    }
+
     /// Capture all IPv4 traffic into the tunnel with the two-halves trick
     /// (`0.0.0.0/1` + `128.0.0.0/1`), which outranks the existing default by
     /// longest-prefix match without deleting it.
@@ -196,20 +218,28 @@ fn dev_route(dst: IpNet, oif: u32) -> RouteMessage {
 }
 
 fn host_route_via(host: IpAddr, gateway: IpAddr, oif: u32) -> io::Result<RouteMessage> {
-    match (host, gateway) {
-        (IpAddr::V4(h), IpAddr::V4(g)) => Ok(RouteMessageBuilder::<Ipv4Addr>::new()
-            .destination_prefix(h, 32)
+    let host_net = match host {
+        IpAddr::V4(h) => IpNet::V4(Ipv4Net::new(h, 32).expect("prefix 32 is valid")),
+        IpAddr::V6(h) => IpNet::V6(Ipv6Net::new(h, 128).expect("prefix 128 is valid")),
+    };
+    net_route_via(host_net, gateway, oif)
+}
+
+fn net_route_via(dst: IpNet, gateway: IpAddr, oif: u32) -> io::Result<RouteMessage> {
+    match (dst, gateway) {
+        (IpNet::V4(d), IpAddr::V4(g)) => Ok(RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(d.addr(), d.prefix_len())
             .gateway(g)
             .output_interface(oif)
             .build()),
-        (IpAddr::V6(h), IpAddr::V6(g)) => Ok(RouteMessageBuilder::<Ipv6Addr>::new()
-            .destination_prefix(h, 128)
+        (IpNet::V6(d), IpAddr::V6(g)) => Ok(RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(d.addr(), d.prefix_len())
             .gateway(g)
             .output_interface(oif)
             .build()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "host and gateway address families differ",
+            "destination and gateway address families differ",
         )),
     }
 }

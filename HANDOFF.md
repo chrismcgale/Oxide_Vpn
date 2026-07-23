@@ -127,7 +127,15 @@ dual-stack single socket vs per-family — flag if config surface grows.
 
 ---
 
-## 3D — Split tunnelling (per-destination)
+## 3D — Split tunnelling (per-destination) ✅ DONE (2026-07-23)
+Implemented as designed below: `[interface] split_include`/`split_exclude`, a pure
+`client-core::split::plan_routes` builder (per-family full/include/exclude), include CIDRs
+routed via oxide0 (removes the manual `ip route add`), exclude CIDRs pinned via the original
+gateway, KS refused with `split_exclude`, teardown tracks + removes every added route. Tests:
+6 pure builder cases + config round-trip; live `scripts/netns-split-test.sh` (FIB assertions)
+and `netns-classic-test.sh` now asserts the auto-include. 122 tests. See SKILL changelog.
+
+
 **Goal.** Route only chosen CIDRs through the tunnel (include list) — or everything **except**
 chosen CIDRs (exclude list) — instead of only full-tunnel or the interface subnet.
 
@@ -181,6 +189,6 @@ reconnects to a *different* ghost/exit after the action.
 ---
 
 ## Suggested order
-~~2E (contained, wg-core-only)~~ **✅ done** → **3D next** (removes a real UX gap + the manual netns route) → 3E
+~~2E (contained, wg-core-only)~~ **✅ done** → ~~3D (removes a real UX gap + the manual netns route)~~ **✅ done** → **3E next** (builds on `exclude`/reconnect)
 (builds on `exclude`/reconnect) → 2G (dual-stack) → 2F (biggest: new dep + API learning; do
 last or when the user okays the dependency). Reassess after each.

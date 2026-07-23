@@ -106,14 +106,21 @@ SRV_PID=$!
 ip netns exec "$CLI" env RUST_LOG=info "$CLIENT" up --config "$DIR/client.toml" >"$DIR/cli.log" 2>&1 &
 CLI_PID=$!
 
-echo "== wait for handshake, then route the 'internet' subnet into the tunnel =="
+echo "== wait for handshake =="
 sleep 4
-# client-core auto-routes only the full-tunnel (0.0.0.0/0) case; add the test subnet route
-# so the client sends 10.60.0.0/24 into oxide0 (the engine cryptokey-routes it to the server).
-ip netns exec "$CLI" ip route add 10.60.0.0/24 dev oxide0 2>/dev/null || true
-sleep 1
-
+# 3D split tunnelling: client-core now auto-installs an on-link route for every specific
+# (non-default) allowed_ips CIDR, so the client sends 10.60.0.0/24 into oxide0 with NO manual
+# `ip route add`. Assert the FIB agrees before relying on it end-to-end.
 RC=0
+echo "== split-include: the 'internet' subnet auto-routes via the tunnel =="
+if ip netns exec "$CLI" ip route get 10.60.0.5 2>/dev/null | grep -q "dev oxide0"; then
+    echo "  10.60.0.0/24 via oxide0: PASS ✓  (auto-routed, no manual step)"
+else
+    echo "  10.60.0.0/24 via oxide0: FAIL ✗"
+    ip netns exec "$CLI" ip route
+    RC=1
+fi
+
 echo "== baseline: ping the server's tunnel IP through the tunnel =="
 if ip netns exec "$CLI" ping -c 2 -W 2 10.8.0.1 >/dev/null 2>&1; then
     echo "  tunnel: PASS ✓"
