@@ -1,53 +1,101 @@
 //! Kill switch: block all outbound traffic that doesn't go through the tunnel.
 //!
-//! If the tunnel drops, the OS would normally fall back to the default route and
-//! leak plaintext to the ISP. The kill switch prevents that with an nftables `output`
-//! chain whose policy is `drop`, permitting only:
+//! If the tunnel drops, the OS would normally fall back to the default route and leak
+//! plaintext to the ISP. The kill switch prevents that with an nftables `output` chain whose
+//! policy is `drop`, permitting only:
 //!   * loopback,
 //!   * traffic out the tunnel interface,
-//!   * the encrypted WireGuard UDP to the server endpoint (so the tunnel itself and
-//!     its handshake/rekeys keep working).
+//!   * the encrypted WireGuard UDP to the server endpoint (so the tunnel itself and its
+//!     handshake/rekeys keep working).
 //!
-//! Everything else is dropped, so nothing escapes in the clear even mid-reconnect.
-//! Applied in a dedicated table so teardown is a single `nft delete table` and the
-//! host's other firewall rules are untouched.
+//! Everything else is dropped, so nothing escapes in the clear even mid-reconnect. Installed
+//! in a dedicated `inet oxide-ks` table so teardown is a single table delete and the host's
+//! other firewall rules are untouched.
+//!
+//! **2F:** this is built over **netlink** (via `rustables`) — no `nft` binary shell-out. The
+//! permit set is described as pure data ([`permits`]) so the policy stays unit-testable
+//! without touching the kernel; [`apply`] turns it into an nftables transaction. (Server NAT
+//! still uses `nft` — see [`crate::nat`] — because its MSS-clamp rule isn't expressible in
+//! rustables.)
 
 use std::io;
 use std::net::IpAddr;
 
-use crate::cmd::{apply_nft_ruleset, run};
+use rustables::{
+    Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule,
+    Table,
+};
 
 const TABLE: &str = "oxide-ks";
+const CHAIN: &str = "output";
 
-/// Build the kill-switch ruleset for a server reachable at `server_ip:server_port`
-/// with the tunnel on `tun_if`.
-pub fn build_ruleset(server_ip: IpAddr, server_port: u16, tun_if: &str) -> String {
-    // Match the server address in the right family.
-    let server_rule = match server_ip {
-        IpAddr::V4(v4) => format!("ip daddr {v4} udp dport {server_port} accept"),
-        IpAddr::V6(v6) => format!("ip6 daddr {v6} udp dport {server_port} accept"),
-    };
-    format!(
-        "table inet {TABLE} {{
-            chain output {{
-                type filter hook output priority filter; policy drop;
-                oif \"lo\" accept
-                oifname \"{tun_if}\" accept
-                {server_rule}
-            }}
-        }}"
-    )
+/// A single permit in the kill-switch `output` chain. Everything not matched by a permit is
+/// dropped by the chain's `drop` policy. Pure data so the policy is testable without the kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Permit {
+    /// Allow traffic leaving via this interface (by name): loopback and the tunnel.
+    OutInterface(String),
+    /// Allow the encrypted WireGuard UDP to the server endpoint, so the tunnel itself (and
+    /// its handshakes/rekeys) keeps working even while everything else is blocked.
+    ServerEndpoint(IpAddr, u16),
 }
 
-/// Install the kill switch. Safe to call repeatedly (replaces any existing table).
+/// The permit set for a server reachable at `server_ip:server_port` with the tunnel on
+/// `tun_if`: loopback, the tunnel interface, and the encrypted WG UDP to the server. Order is
+/// irrelevant (all are `accept`); the chain's `drop` policy blocks the rest.
+pub fn permits(server_ip: IpAddr, server_port: u16, tun_if: &str) -> Vec<Permit> {
+    vec![
+        Permit::OutInterface("lo".to_string()),
+        Permit::OutInterface(tun_if.to_string()),
+        Permit::ServerEndpoint(server_ip, server_port),
+    ]
+}
+
+/// Install the kill switch. Safe to call repeatedly (drops any existing table first).
 pub fn enable(server_ip: IpAddr, server_port: u16, tun_if: &str) -> io::Result<()> {
     let _ = disable();
-    apply_nft_ruleset(&build_ruleset(server_ip, server_port, tun_if))
+    apply(&permits(server_ip, server_port, tun_if))
+        .map_err(|e| io::Error::other(format!("installing kill switch via netlink: {e}")))
 }
 
-/// Remove the kill switch. Idempotent.
+/// Build the `inet oxide-ks` table + `drop`-policy output chain + one accept rule per permit,
+/// and send it as one netlink transaction.
+fn apply(permits: &[Permit]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut batch = Batch::new();
+
+    let table = Table::new(ProtocolFamily::Inet).with_name(TABLE);
+    batch.add(&table, MsgType::Add);
+
+    // output chain, default drop: only the permits below get through.
+    let chain = Chain::new(&table)
+        .with_name(CHAIN)
+        .with_hook(Hook::new(HookClass::Out, 0))
+        .with_type(ChainType::Filter)
+        .with_policy(ChainPolicy::Drop);
+    batch.add(&chain, MsgType::Add);
+
+    for p in permits {
+        let rule = match p {
+            Permit::OutInterface(name) => Rule::new(&chain)?.oiface(name)?.accept(),
+            Permit::ServerEndpoint(ip, port) => Rule::new(&chain)?
+                .daddr(*ip)
+                .dport(*port, Protocol::UDP)
+                .accept(),
+        };
+        batch.add(&rule, MsgType::Add);
+    }
+
+    batch.send()?;
+    Ok(())
+}
+
+/// Remove the kill switch. Idempotent — deleting a table that isn't there is ignored.
 pub fn disable() -> io::Result<()> {
-    let _ = run("nft", &["delete", "table", "inet", TABLE]);
+    let mut batch = Batch::new();
+    let table = Table::new(ProtocolFamily::Inet).with_name(TABLE);
+    batch.add(&table, MsgType::Del);
+    // A `Del` of a non-existent table errors (ENOENT); teardown must stay idempotent.
+    let _ = batch.send();
     Ok(())
 }
 
@@ -56,19 +104,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ruleset_permits_only_lo_tunnel_and_server() {
-        let rs = build_ruleset("203.0.113.7".parse().unwrap(), 51820, "oxide0");
-        assert!(rs.contains("policy drop"));
-        assert!(rs.contains("oif \"lo\" accept"));
-        assert!(rs.contains("oifname \"oxide0\" accept"));
-        assert!(rs.contains("ip daddr 203.0.113.7 udp dport 51820 accept"));
-        // No blanket accept that would defeat the switch.
-        assert!(!rs.contains("policy accept"));
+    fn permits_lo_tunnel_and_server_only() {
+        let ps = permits("203.0.113.7".parse().unwrap(), 51820, "oxide0");
+        assert_eq!(
+            ps,
+            vec![
+                Permit::OutInterface("lo".into()),
+                Permit::OutInterface("oxide0".into()),
+                Permit::ServerEndpoint("203.0.113.7".parse().unwrap(), 51820),
+            ]
+        );
     }
 
     #[test]
-    fn ipv6_server_uses_ip6_match() {
-        let rs = build_ruleset("2001:db8::1".parse().unwrap(), 51820, "oxide0");
-        assert!(rs.contains("ip6 daddr 2001:db8::1 udp dport 51820 accept"));
+    fn server_permit_carries_the_endpoint_family() {
+        // v4 and v6 endpoints both round-trip through the permit (apply picks ip/ip6 daddr).
+        let v6 = permits("2001:db8::1".parse().unwrap(), 51820, "oxide0");
+        assert!(matches!(
+            v6[2],
+            Permit::ServerEndpoint(IpAddr::V6(_), 51820)
+        ));
     }
 }

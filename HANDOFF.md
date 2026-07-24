@@ -77,7 +77,16 @@ existing `tunnel` capstones must stay green.
 
 ---
 
-## 2F — nftables via netlink (drop the `nft` shell-out)
+## 2F — nftables via netlink (drop the `nft` shell-out) 🟡 PARTIAL (2026-07-24)
+Chose **`rustables`** (pure-Rust netlink). **Kill switch ported** (`killswitch.rs`: pure
+`permits()` describe layer + netlink `apply` via `rustables` — table/chain/drop-policy +
+`oiface`/`daddr`/`dport`/`accept`; no `nft`). **NAT stays on `nft`**: its MSS-clamp
+(`tcp option maxseg size set rt mtu`) is an `exthdr` mangle `rustables` 0.8 can't express, and
+dropping it reopens the PMTU black hole — full NAT-via-netlink needs `nftnl`/libnftnl (C dep),
+deferred. `rustables` pulls `bindgen` → **libclang at build time** (no runtime C dep). Live:
+re-run `netns-fulltunnel-test.sh` (kill switch is now netlink). 127 tests. See SKILL changelog.
+
+
 **Goal.** Build the NAT + kill-switch rulesets over netlink instead of shelling out to `nft`.
 
 **Where.** `crates/net-linux/src/`:
@@ -210,6 +219,6 @@ reconnects to a *different* ghost/exit after the action.
 ---
 
 ## Suggested order
-~~2E~~ **✅** → ~~3D~~ **✅** → ~~3E~~ **✅** → ~~2G (dual-stack)~~ **✅** → **2F next** (biggest: new dep + API learning)
+~~2E~~ **✅** → ~~3D~~ **✅** → ~~3E~~ **✅** → ~~2G~~ **✅** → **2F 🟡 partial** (kill switch on rustables/netlink; NAT stays nft for MSS clamp — full via-netlink needs nftnl/C dep). All 5 handoff items addressed.
 (builds on `exclude`/reconnect) → 2G (dual-stack) → 2F (biggest: new dep + API learning; do
 last or when the user okays the dependency). Reassess after each.

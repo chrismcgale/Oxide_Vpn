@@ -4,6 +4,14 @@
 //! `nft delete table` and we never disturb the host's other firewall rules. The
 //! postrouting rule masquerades tunnel traffic leaving the egress interface; the
 //! forward rule permits forwarding to/from the tunnel interface.
+//!
+//! **2F note:** unlike the kill switch (ported to netlink via `rustables` — see
+//! [`crate::killswitch`]), NAT still shells out to the `nft` binary. Its forward chain does
+//! **MSS clamping** (`tcp option maxseg size set rt mtu`), an `exthdr`-mangle statement that
+//! `rustables` 0.8 can't express (it has no `exthdr` expression). Dropping MSS clamping would
+//! reopen the "ping works, curl hangs" PMTU black hole, so NAT keeps the shell-out until we
+//! either adopt `nftnl`/libnftnl (a C dependency that *can* express exthdr) or `rustables`
+//! grows the expression. NAT runs on servers, which already have `nft` present.
 
 use std::io;
 

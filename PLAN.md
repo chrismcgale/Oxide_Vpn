@@ -267,8 +267,14 @@ crypto/format parts; seccomp test runs in CI.
   `parse_recv_index` (pure, unit-tested) + `recv_index_to_peer` cache in `Shared` (pruned on
   peer removal). Integration test: with 40 decoy peers, steady-state traffic costs ~1
   decapsulate probe/packet, not O(peers). 115 tests.
-- [ ] **2F net-linux polish** — nftables via netlink lib (drop `nft` shell-out);
-  `systemd-resolved`-aware DNS backend; idempotent teardown/crash recovery.
+- [~] **2F net-linux polish** — DNS backend (`systemd-resolved` via resolvectl) DONE earlier.
+  nftables-via-netlink (2026-07-24): the **kill switch is ported to `rustables`** (pure-Rust
+  netlink, no `nft` shell-out) — a pure `permits()` describe layer + a netlink `apply`. **NAT
+  stays on `nft`** because its MSS-clamp rule (`tcp option maxseg size set rt mtu`) is an
+  `exthdr` mangle that `rustables` 0.8 can't express; dropping it reopens the PMTU black hole.
+  Full NAT-via-netlink would need `nftnl`/libnftnl (a C dep) — deferred by choice (pure-Rust).
+  Note: `rustables` uses `bindgen` → **libclang at build time** (not a runtime dep). Live: the
+  kill-switch path is covered by `netns-fulltunnel-test.sh` (now netlink under the hood). 127 tests.
 - [x] **2G WG-over-IPv6 transport** — DONE (2026-07-23). The UDP underlay binds **dual-stack**
   (`net-linux::bind_dual_stack`: `[::]:port` with `IPV6_V6ONLY` off, falls back to `0.0.0.0` if
   v6 is disabled) on both server and client, so a client dials a v4 **or** v6 endpoint from one
