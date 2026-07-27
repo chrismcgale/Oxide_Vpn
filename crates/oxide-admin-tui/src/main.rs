@@ -11,7 +11,7 @@ mod app;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
@@ -27,25 +27,44 @@ use app::{
 use oxide_common::api::AdminServerInfo;
 use oxide_control_client::ControlClient;
 
+/// Saved profile at `~/.config/oxide/admin.toml`; flags override any field here. Handy for the
+/// admin token and cost rates so they aren't retyped (or left in shell history) every launch.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Profile {
+    #[serde(default)]
+    control_plane: Option<String>,
+    #[serde(default)]
+    admin_token: Option<String>,
+    #[serde(default)]
+    cost_per_gb: Option<f64>,
+    #[serde(default)]
+    cost_per_server_hour: Option<f64>,
+    #[serde(default)]
+    refresh_secs: Option<u64>,
+}
+
 #[derive(Parser)]
 #[command(name = "oxide-admin-tui", about = "Oxide VPN admin console")]
 struct Cli {
-    /// Control-plane base URL, e.g. http://127.0.0.1:8080.
+    /// Control-plane base URL, e.g. http://127.0.0.1:8080. Optional if set in the profile.
     #[arg(long)]
-    control_plane: String,
-    /// Admin bearer token (the control plane's `--admin-token`). Also read from
-    /// OXIDE_ADMIN_TOKEN so it needn't appear in shell history.
+    control_plane: Option<String>,
+    /// Admin bearer token (the control plane's `--admin-token`). Also read from OXIDE_ADMIN_TOKEN
+    /// or the profile (~/.config/oxide/admin.toml) so it needn't appear in shell history.
     #[arg(long, env = "OXIDE_ADMIN_TOKEN")]
-    admin_token: String,
+    admin_token: Option<String>,
     /// Estimated egress bandwidth price, USD per GB (10^9 bytes).
-    #[arg(long, default_value_t = 0.09)]
-    cost_per_gb: f64,
+    #[arg(long)]
+    cost_per_gb: Option<f64>,
     /// Estimated server price, USD per running server-hour.
-    #[arg(long, default_value_t = 0.02)]
-    cost_per_server_hour: f64,
+    #[arg(long)]
+    cost_per_server_hour: Option<f64>,
     /// Seconds between auto-refreshes.
-    #[arg(long, default_value_t = 3)]
-    refresh_secs: u64,
+    #[arg(long)]
+    refresh_secs: Option<u64>,
+    /// Read settings from this profile file instead of the default location.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
 }
 
 fn now_unix() -> i64 {
@@ -58,15 +77,34 @@ fn now_unix() -> i64 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Merge the saved profile with flags (flags win); required values must come from one of them.
+    let profile: Profile =
+        oxide_common::profile::load_named("admin", cli.config.as_deref())?.unwrap_or_default();
+    let control_plane = cli
+        .control_plane
+        .or(profile.control_plane)
+        .context("--control-plane not set (pass it or add it to ~/.config/oxide/admin.toml)")?;
+    let admin_token = cli.admin_token.or(profile.admin_token).context(
+        "--admin-token not set (pass it, set OXIDE_ADMIN_TOKEN, or add it to the profile)",
+    )?;
     let cost = CostModel {
-        per_gb: cli.cost_per_gb,
-        per_server_hour: cli.cost_per_server_hour,
+        per_gb: cli.cost_per_gb.or(profile.cost_per_gb).unwrap_or(0.09),
+        per_server_hour: cli
+            .cost_per_server_hour
+            .or(profile.cost_per_server_hour)
+            .unwrap_or(0.02),
     };
-    let mut app = App::new(cli.control_plane, cli.admin_token, cost);
+    let refresh_secs = cli
+        .refresh_secs
+        .or(profile.refresh_secs)
+        .unwrap_or(3)
+        .max(1);
+
+    let mut app = App::new(control_plane, admin_token, cost);
     refresh(&mut app).await;
 
     let mut terminal = ratatui::init();
-    let res = run(&mut terminal, &mut app, cli.refresh_secs.max(1)).await;
+    let res = run(&mut terminal, &mut app, refresh_secs).await;
     ratatui::restore();
     res
 }

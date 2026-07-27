@@ -28,22 +28,53 @@ use oxide_control_client::ControlClient;
 /// Braille spinner frames for the "working" states (selecting / connecting / reconnecting).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Saved profile at `~/.config/oxide/client.toml`; flags override any field here.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Profile {
+    #[serde(default)]
+    control_plane: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    socket: Option<PathBuf>,
+}
+
 #[derive(Parser)]
 #[command(name = "oxide-tui", about = "Oxide VPN terminal UI")]
 struct Cli {
+    /// Control-plane URL. Optional if set in the profile (~/.config/oxide/client.toml).
     #[arg(long)]
-    control_plane: String,
-    /// Account number (create one with `oxide-client account`).
+    control_plane: Option<String>,
+    /// Account number (create one with `oxide-client account`). Optional if set in the profile.
     #[arg(long)]
-    account: String,
-    #[arg(long, default_value = DEFAULT_SOCKET)]
-    socket: PathBuf,
+    account: Option<String>,
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// Read settings from this profile file instead of the default location.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut app = App::new(cli.control_plane, cli.account, cli.socket);
+    // Merge the saved profile with flags (flags win); a required value missing from both errors.
+    let profile: Profile =
+        oxide_common::profile::load_named("client", cli.config.as_deref())?.unwrap_or_default();
+    let control_plane = cli
+        .control_plane
+        .or(profile.control_plane)
+        .context("--control-plane not set (pass it or add it to ~/.config/oxide/client.toml)")?;
+    let account = cli
+        .account
+        .or(profile.account)
+        .context("--account not set (pass it or add it to ~/.config/oxide/client.toml)")?;
+    let socket = cli
+        .socket
+        .or(profile.socket)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
+
+    let mut app = App::new(control_plane, account, socket);
     refresh_servers(&mut app).await;
     refresh_status(&mut app).await;
 

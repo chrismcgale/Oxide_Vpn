@@ -13,6 +13,7 @@ oxide-control-client = { path = "../control-client" }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"

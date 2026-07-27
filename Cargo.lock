@@ -1668,6 +1668,7 @@ dependencies = [
  "oxide-common",
  "oxide-control-client",
  "ratatui",
+ "serde",
  "tokio",
 ]
 
@@ -1877,6 +1878,7 @@ dependencies = [
  "oxide-common",
  "oxide-control-client",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
 ]
