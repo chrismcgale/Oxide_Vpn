@@ -123,6 +123,33 @@ pub fn adoption(count: u64, total: u64) -> f64 {
     }
 }
 
+/// How many bandwidth samples the fleet sparkline keeps.
+const HISTORY_LEN: usize = 60;
+
+/// Push `v` onto `buf`, dropping the oldest sample past [`HISTORY_LEN`].
+fn push_capped(buf: &mut Vec<u64>, v: u64) {
+    buf.push(v);
+    if buf.len() > HISTORY_LEN {
+        buf.remove(0);
+    }
+}
+
+/// Render `samples` as a unicode sparkline scaled to the local maximum.
+pub fn sparkline(samples: &[u64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = samples.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return "▁".repeat(samples.len());
+    }
+    samples
+        .iter()
+        .map(|&v| {
+            let idx = ((v as f64 / max as f64) * (BARS.len() - 1) as f64).round() as usize;
+            BARS[idx.min(BARS.len() - 1)]
+        })
+        .collect()
+}
+
 /// Human-readable byte count.
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -152,6 +179,15 @@ pub struct App {
     pub now: i64,
     /// A server id whose token rotation is armed and awaiting confirmation (destructive action).
     pub confirm_rotate: Option<String>,
+    /// Per-refresh fleet byte deltas (bytes moved between the last two refreshes), for the
+    /// bandwidth-over-time sparkline. Derived from successive cumulative totals.
+    pub tx_rate: Vec<u64>,
+    pub rx_rate: Vec<u64>,
+    /// Last cumulative (tx, rx) totals seen, to difference against — `None` until the first
+    /// sample establishes a baseline.
+    prev_bytes: Option<(u64, u64)>,
+    /// Seconds between refreshes, so a per-refresh delta can be shown as a per-second rate.
+    pub refresh_secs: u64,
     pub should_quit: bool,
 }
 
@@ -168,8 +204,29 @@ impl App {
             message: "loading…".into(),
             now: 0,
             confirm_rotate: None,
+            tx_rate: Vec::new(),
+            rx_rate: Vec::new(),
+            prev_bytes: None,
+            refresh_secs: 3,
             should_quit: false,
         }
+    }
+
+    /// Fold a fresh pair of cumulative fleet totals into the bandwidth history. The first call
+    /// only sets the baseline (no bar yet); later calls push the delta since the previous one.
+    /// Totals are monotonic (the control plane accumulates), so `saturating_sub` just guards
+    /// the degenerate case.
+    pub fn record_bandwidth(&mut self, tx_total: u64, rx_total: u64) {
+        if let Some((ptx, prx)) = self.prev_bytes {
+            push_capped(&mut self.tx_rate, tx_total.saturating_sub(ptx));
+            push_capped(&mut self.rx_rate, rx_total.saturating_sub(prx));
+        }
+        self.prev_bytes = Some((tx_total, rx_total));
+    }
+
+    /// The most recent per-second rate for a history series (latest delta / refresh interval).
+    pub fn latest_rate(&self, series: &[u64]) -> u64 {
+        series.last().copied().unwrap_or(0) / self.refresh_secs.max(1)
     }
 
     pub fn select_next(&mut self) {
@@ -310,6 +367,36 @@ mod tests {
         assert_eq!(server_alert(&s), Some(Alert::HighLoad));
         s.healthy = false; // stale outranks high load
         assert_eq!(server_alert(&s), Some(Alert::Stale));
+    }
+
+    #[test]
+    fn record_bandwidth_differences_cumulative_totals() {
+        let m = CostModel {
+            per_gb: 0.0,
+            per_server_hour: 0.0,
+        };
+        let mut app = App::new("http://cp".into(), "tok".into(), m);
+        app.refresh_secs = 2;
+        // First sample only sets the baseline — no bar yet.
+        app.record_bandwidth(1_000, 500);
+        assert!(app.tx_rate.is_empty());
+        // Later samples push the delta since the previous cumulative reading.
+        app.record_bandwidth(3_000, 1_500); // +2_000 tx, +1_000 rx
+        app.record_bandwidth(3_000, 4_500); // +0 tx, +3_000 rx
+        assert_eq!(app.tx_rate, vec![2_000, 0]);
+        assert_eq!(app.rx_rate, vec![1_000, 3_000]);
+        // latest_rate divides the last delta by the refresh interval (2s).
+        assert_eq!(app.latest_rate(&app.tx_rate), 0);
+        assert_eq!(app.latest_rate(&app.rx_rate), 1_500);
+    }
+
+    #[test]
+    fn sparkline_scales_and_handles_flat() {
+        assert_eq!(sparkline(&[]), "");
+        assert_eq!(sparkline(&[0, 0]), "▁▁");
+        let s: Vec<char> = sparkline(&[0, 5, 10]).chars().collect();
+        assert_eq!(s[0], '▁');
+        assert_eq!(s[2], '█');
     }
 
     #[test]

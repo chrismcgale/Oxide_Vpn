@@ -22,7 +22,8 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 
 use app::{
-    adoption, hours_since, human_bytes, load_fraction, server_alert, Alert, App, CostModel, Tab,
+    adoption, hours_since, human_bytes, load_fraction, server_alert, sparkline, Alert, App,
+    CostModel, Tab,
 };
 use oxide_common::api::AdminServerInfo;
 use oxide_control_client::ControlClient;
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         .max(1);
 
     let mut app = App::new(control_plane, admin_token, cost);
+    app.refresh_secs = refresh_secs;
     refresh(&mut app).await;
 
     let mut terminal = ratatui::init();
@@ -184,7 +186,11 @@ async fn rotate_selected_token(app: &mut App) {
 async fn refresh(app: &mut App) {
     let cc = ControlClient::new(&app.cp_url);
     match cc.admin_overview(&app.admin_token).await {
-        Ok(o) => app.overview = Some(o),
+        Ok(o) => {
+            // Fold this reading's cumulative totals into the bandwidth-over-time history.
+            app.record_bandwidth(o.tx_bytes_total, o.rx_bytes_total);
+            app.overview = Some(o);
+        }
         Err(e) => {
             app.message = format!("admin API error: {e} (token? --control-plane?)");
             return;
@@ -269,12 +275,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Big-number stat cards for the fleet.
+/// Big-number stat cards for the fleet, plus a bandwidth-over-time sparkline.
 fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
     let Some(o) = &app.overview else {
         f.render_widget(Paragraph::new("  no data yet"), area);
         return;
     };
+
+    // Cards on top, the bandwidth graph pinned to the bottom.
+    let [cards_area, graph_area] =
+        Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).areas(area);
+    draw_fleet_bandwidth(f, app, graph_area);
+    let area = cards_area;
 
     let health = format!("{}/{}", o.healthy_servers, o.servers);
     let health_color = if o.servers > 0 && o.healthy_servers == o.servers {
@@ -327,6 +339,37 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(card, *col);
         }
     }
+}
+
+/// Fleet bandwidth over time: a sparkline per direction built from per-refresh deltas of the
+/// cumulative totals, with the current per-second rate. In-memory only (resets on restart).
+fn draw_fleet_bandwidth(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Fleet bandwidth (per refresh) ");
+    // Until two refreshes have landed there's no delta to plot yet.
+    if app.tx_rate.is_empty() {
+        f.render_widget(Paragraph::new("  gathering samples…").block(block), area);
+        return;
+    }
+    let row = |arrow: &str, rate: &[u64], color: Color| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {arrow} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(sparkline(rate), Style::default().fg(color)),
+            Span::raw(format!("  {}/s", human_bytes(app.latest_rate(rate)))),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            row("↑", &app.tx_rate, Color::Green),
+            row("↓", &app.rx_rate, Color::Blue),
+        ])
+        .block(block),
+        area,
+    );
 }
 
 /// Servers tab: the fleet list on the left, a detail pane for the selected server on the right.
@@ -714,6 +757,29 @@ mod render_tests {
             text.contains("rotate token"),
             "detail shows the rotate hint"
         );
+    }
+
+    #[test]
+    fn overview_bandwidth_graph_renders_after_two_samples() {
+        let mut app = seeded_app();
+        app.tab = Tab::Overview;
+        app.refresh_secs = 2;
+        // One sample = baseline only (graph says "gathering"); a second produces a delta bar.
+        app.record_bandwidth(1_000_000, 500_000);
+        let text1 = {
+            let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            t.draw(|f| draw(f, &app)).unwrap();
+            buffer_text(&t)
+        };
+        assert!(text1.contains("gathering samples"));
+        app.record_bandwidth(3_000_000, 1_500_000); // +2 MB tx, +1 MB rx
+        let text2 = {
+            let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            t.draw(|f| draw(f, &app)).unwrap();
+            buffer_text(&t)
+        };
+        assert!(text2.contains("Fleet bandwidth"));
+        assert!(text2.contains("/s")); // current rate label
     }
 
     #[test]
