@@ -1,0 +1,18 @@
+[package]
+name = "oxide-admin-tui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "oxide-admin-tui"
+path = "src/main.rs"
+
+[dependencies]
+oxide-common = { path = "../common" }
+oxide-control-client = { path = "../control-client" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
