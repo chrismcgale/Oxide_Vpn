@@ -291,9 +291,12 @@ crypto/format parts; seccomp test runs in CI.
   adoption, and bandwidth. Consumed by the new **`oxide-admin-tui`** operator console (Overview /
   Servers / Features tabs + estimated cost). *Still open:* Prometheus counters for PSK/DAITA/onion,
   and external dashboards/alerting (Grafana) on `/metrics`.
-- [ ] **Client TUI polish** — *DONE (2026-07-27).* `oxide-tui` is now phase-aware (spinner /
+- [ ] **Client TUI polish + QoL** — *DONE (2026-07-27).* `oxide-tui` is now phase-aware (spinner /
   link-health dot / capability badges / throughput sparklines); `TunnelStatus` gained
-  `phase`/`handshake_age_secs`/`transport`/`daita`/`kill_switch`. (Complements 3A desktop GUI.)
+  `phase`/`handshake_age_secs`/`transport`/`daita`/`kill_switch`. **QoL batch:** kill-switch toggle,
+  filter/search, quick-connect-best, latency ranking (`client-core::latency` TCP-ping); admin TUI
+  drill-down detail + alerts (stale / >80% load) + rotate-token action; saved profiles
+  (`~/.config/oxide/*.toml` via `oxide_common::profile`). (Complements 3A desktop GUI.)
 
 ### WAVE 3 — Clients & reach
 
