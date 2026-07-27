@@ -5,6 +5,8 @@
 //! bandwidth turned into an estimated cost. It shows only fleet-level aggregates — no
 //! per-account data — so it never sees who is connected, only how much the fleet is doing.
 
+use std::collections::HashMap;
+
 use oxide_common::api::{AdminOverview, AdminServerInfo};
 
 /// Bytes in a "GB" for billing (cloud egress is priced per 10^9 bytes, not GiB).
@@ -123,7 +125,7 @@ pub fn adoption(count: u64, total: u64) -> f64 {
     }
 }
 
-/// How many bandwidth samples the fleet sparkline keeps.
+/// How many bandwidth samples a sparkline keeps.
 const HISTORY_LEN: usize = 60;
 
 /// Push `v` onto `buf`, dropping the oldest sample past [`HISTORY_LEN`].
@@ -132,6 +134,39 @@ fn push_capped(buf: &mut Vec<u64>, v: u64) {
     if buf.len() > HISTORY_LEN {
         buf.remove(0);
     }
+}
+
+/// A rolling tx/rx throughput history, derived from successive *cumulative* byte totals.
+/// Shared by the fleet graph and the per-server graph so the differencing logic lives once.
+#[derive(Default)]
+pub struct RateHistory {
+    pub tx: Vec<u64>,
+    pub rx: Vec<u64>,
+    /// Last cumulative `(tx, rx)` seen — `None` until the first sample sets a baseline.
+    prev: Option<(u64, u64)>,
+}
+
+impl RateHistory {
+    /// Fold a fresh pair of cumulative totals in. The first call only sets the baseline (no bar
+    /// yet); later calls push the delta since the previous reading. Totals are monotonic (the
+    /// control plane accumulates), so `saturating_sub` just guards the degenerate case.
+    pub fn record(&mut self, tx_total: u64, rx_total: u64) {
+        if let Some((ptx, prx)) = self.prev {
+            push_capped(&mut self.tx, tx_total.saturating_sub(ptx));
+            push_capped(&mut self.rx, rx_total.saturating_sub(prx));
+        }
+        self.prev = Some((tx_total, rx_total));
+    }
+
+    /// Whether there's at least one plotted delta (i.e. two refreshes have landed).
+    pub fn has_data(&self) -> bool {
+        !self.tx.is_empty()
+    }
+}
+
+/// The most recent per-second rate for a history series (latest delta ÷ refresh interval).
+pub fn latest_rate(series: &[u64], refresh_secs: u64) -> u64 {
+    series.last().copied().unwrap_or(0) / refresh_secs.max(1)
 }
 
 /// Render `samples` as a unicode sparkline scaled to the local maximum.
@@ -179,13 +214,10 @@ pub struct App {
     pub now: i64,
     /// A server id whose token rotation is armed and awaiting confirmation (destructive action).
     pub confirm_rotate: Option<String>,
-    /// Per-refresh fleet byte deltas (bytes moved between the last two refreshes), for the
-    /// bandwidth-over-time sparkline. Derived from successive cumulative totals.
-    pub tx_rate: Vec<u64>,
-    pub rx_rate: Vec<u64>,
-    /// Last cumulative (tx, rx) totals seen, to difference against — `None` until the first
-    /// sample establishes a baseline.
-    prev_bytes: Option<(u64, u64)>,
+    /// Fleet-wide throughput history for the Overview graph.
+    pub fleet_bw: RateHistory,
+    /// Per-server throughput history (keyed by server id) for the detail-pane graph.
+    pub server_bw: HashMap<String, RateHistory>,
     /// Seconds between refreshes, so a per-refresh delta can be shown as a per-second rate.
     pub refresh_secs: u64,
     pub should_quit: bool,
@@ -204,29 +236,34 @@ impl App {
             message: "loading…".into(),
             now: 0,
             confirm_rotate: None,
-            tx_rate: Vec::new(),
-            rx_rate: Vec::new(),
-            prev_bytes: None,
+            fleet_bw: RateHistory::default(),
+            server_bw: HashMap::new(),
             refresh_secs: 3,
             should_quit: false,
         }
     }
 
-    /// Fold a fresh pair of cumulative fleet totals into the bandwidth history. The first call
-    /// only sets the baseline (no bar yet); later calls push the delta since the previous one.
-    /// Totals are monotonic (the control plane accumulates), so `saturating_sub` just guards
-    /// the degenerate case.
+    /// Fold the fleet's cumulative totals into the Overview bandwidth history.
     pub fn record_bandwidth(&mut self, tx_total: u64, rx_total: u64) {
-        if let Some((ptx, prx)) = self.prev_bytes {
-            push_capped(&mut self.tx_rate, tx_total.saturating_sub(ptx));
-            push_capped(&mut self.rx_rate, rx_total.saturating_sub(prx));
-        }
-        self.prev_bytes = Some((tx_total, rx_total));
+        self.fleet_bw.record(tx_total, rx_total);
     }
 
-    /// The most recent per-second rate for a history series (latest delta / refresh interval).
+    /// Fold each server's cumulative totals into its own history, and forget servers that have
+    /// left the fleet so the map can't grow without bound.
+    pub fn record_server_bandwidth(&mut self, servers: &[AdminServerInfo]) {
+        for s in servers {
+            self.server_bw
+                .entry(s.id.clone())
+                .or_default()
+                .record(s.tx_bytes_total, s.rx_bytes_total);
+        }
+        self.server_bw
+            .retain(|id, _| servers.iter().any(|s| &s.id == id));
+    }
+
+    /// Per-second rate of a history series at the current refresh interval.
     pub fn latest_rate(&self, series: &[u64]) -> u64 {
-        series.last().copied().unwrap_or(0) / self.refresh_secs.max(1)
+        latest_rate(series, self.refresh_secs)
     }
 
     pub fn select_next(&mut self) {
@@ -379,15 +416,40 @@ mod tests {
         app.refresh_secs = 2;
         // First sample only sets the baseline — no bar yet.
         app.record_bandwidth(1_000, 500);
-        assert!(app.tx_rate.is_empty());
+        assert!(app.fleet_bw.tx.is_empty());
         // Later samples push the delta since the previous cumulative reading.
         app.record_bandwidth(3_000, 1_500); // +2_000 tx, +1_000 rx
         app.record_bandwidth(3_000, 4_500); // +0 tx, +3_000 rx
-        assert_eq!(app.tx_rate, vec![2_000, 0]);
-        assert_eq!(app.rx_rate, vec![1_000, 3_000]);
+        assert_eq!(app.fleet_bw.tx, vec![2_000, 0]);
+        assert_eq!(app.fleet_bw.rx, vec![1_000, 3_000]);
         // latest_rate divides the last delta by the refresh interval (2s).
-        assert_eq!(app.latest_rate(&app.tx_rate), 0);
-        assert_eq!(app.latest_rate(&app.rx_rate), 1_500);
+        assert_eq!(app.latest_rate(&app.fleet_bw.tx), 0);
+        assert_eq!(app.latest_rate(&app.fleet_bw.rx), 1_500);
+    }
+
+    #[test]
+    fn per_server_bandwidth_tracks_and_prunes() {
+        let m = CostModel {
+            per_gb: 0.0,
+            per_server_hour: 0.0,
+        };
+        let mut app = App::new("http://cp".into(), "tok".into(), m);
+        let mut a = sample_server("a", 0);
+        let mut b = sample_server("b", 0);
+        a.tx_bytes_total = 100;
+        a.rx_bytes_total = 10;
+        b.tx_bytes_total = 200;
+        b.rx_bytes_total = 20;
+        app.record_server_bandwidth(&[a.clone(), b.clone()]); // baselines
+        a.tx_bytes_total = 400; // +300
+        b.tx_bytes_total = 250; // +50
+        app.record_server_bandwidth(&[a.clone(), b.clone()]);
+        assert_eq!(app.server_bw["a"].tx, vec![300]);
+        assert_eq!(app.server_bw["b"].tx, vec![50]);
+        // b leaves the fleet → its history is pruned.
+        app.record_server_bandwidth(&[a]);
+        assert!(app.server_bw.contains_key("a"));
+        assert!(!app.server_bw.contains_key("b"));
     }
 
     #[test]

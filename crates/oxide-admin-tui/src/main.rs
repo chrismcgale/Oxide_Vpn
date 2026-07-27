@@ -198,6 +198,7 @@ async fn refresh(app: &mut App) {
     }
     match cc.admin_list_servers(&app.admin_token).await {
         Ok(s) => {
+            app.record_server_bandwidth(&s); // per-server bandwidth history
             app.set_servers(s);
             app.now = now_unix();
             app.message = format!("{} servers · refreshed", app.servers.len());
@@ -348,28 +349,30 @@ fn draw_fleet_bandwidth(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(" Fleet bandwidth (per refresh) ");
     // Until two refreshes have landed there's no delta to plot yet.
-    if app.tx_rate.is_empty() {
+    if !app.fleet_bw.has_data() {
         f.render_widget(Paragraph::new("  gathering samples…").block(block), area);
         return;
     }
-    let row = |arrow: &str, rate: &[u64], color: Color| {
-        Line::from(vec![
-            Span::styled(
-                format!("  {arrow} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(sparkline(rate), Style::default().fg(color)),
-            Span::raw(format!("  {}/s", human_bytes(app.latest_rate(rate)))),
-        ])
-    };
     f.render_widget(
         Paragraph::new(vec![
-            row("↑", &app.tx_rate, Color::Green),
-            row("↓", &app.rx_rate, Color::Blue),
+            bandwidth_row(app, "↑", &app.fleet_bw.tx, Color::Green),
+            bandwidth_row(app, "↓", &app.fleet_bw.rx, Color::Blue),
         ])
         .block(block),
         area,
     );
+}
+
+/// One `arrow + sparkline + rate` throughput line, shared by the fleet and per-server graphs.
+fn bandwidth_row(app: &App, arrow: &str, rate: &[u64], color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {arrow} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(sparkline(rate), Style::default().fg(color)),
+        Span::raw(format!("  {}/s", human_bytes(app.latest_rate(rate)))),
+    ])
 }
 
 /// Servers tab: the fleet list on the left, a detail pane for the selected server on the right.
@@ -523,6 +526,24 @@ fn draw_server_detail(f: &mut Frame, app: &App, area: Rect) {
         format!("{:.1}h", hours_since(s.created_at, app.now)),
     ));
     lines.push(kv("est. cost", format!("${:.2}", app.server_cost(s))));
+
+    // Per-server throughput-over-time, built from this server's own byte-total deltas.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  throughput (per refresh)",
+        Style::default().fg(Color::DarkGray),
+    )));
+    match app.server_bw.get(&s.id) {
+        Some(bw) if bw.has_data() => {
+            lines.push(bandwidth_row(app, "↑", &bw.tx, Color::Green));
+            lines.push(bandwidth_row(app, "↓", &bw.rx, Color::Blue));
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "  gathering samples…",
+            Style::default().fg(Color::DarkGray),
+        ))),
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  R rotate token",
@@ -716,6 +737,25 @@ mod render_tests {
             let text = buffer_text(&terminal);
             assert!(text.contains("Oxide Admin"), "title on {tab:?}");
         }
+    }
+
+    #[test]
+    fn detail_pane_shows_per_server_throughput_graph() {
+        let mut app = seeded_app();
+        app.tab = Tab::Servers;
+        app.selected = 0; // us-a
+        let id = app.servers[0].id.clone();
+        // Two samples for this server → its detail graph plots a delta.
+        let mut a = app.servers[0].clone();
+        a.tx_bytes_total = 1_000;
+        app.record_server_bandwidth(&[a.clone()]);
+        a.tx_bytes_total = 5_000;
+        app.record_server_bandwidth(&[a]);
+        assert!(app.server_bw[&id].has_data());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("throughput"), "detail per-server graph label");
     }
 
     #[test]
