@@ -82,6 +82,38 @@ pub fn load_fraction(active_peers: u32, capacity: u32) -> Option<f64> {
     }
 }
 
+/// Load above this fraction of capacity raises a "nearly full" alert.
+pub const HIGH_LOAD: f64 = 0.80;
+
+/// An operational alert about a server that wants an operator's attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alert {
+    /// No recent heartbeat — the server may be down.
+    Stale,
+    /// Running hot: at or above [`HIGH_LOAD`] of capacity.
+    HighLoad,
+}
+
+impl Alert {
+    pub fn label(self) -> &'static str {
+        match self {
+            Alert::Stale => "STALE",
+            Alert::HighLoad => "HIGH LOAD",
+        }
+    }
+}
+
+/// The most pressing alert for a server, if any. A dead server outranks a busy one.
+pub fn server_alert(s: &AdminServerInfo) -> Option<Alert> {
+    if !s.healthy {
+        Some(Alert::Stale)
+    } else if load_fraction(s.active_peers, s.capacity).is_some_and(|f| f >= HIGH_LOAD) {
+        Some(Alert::HighLoad)
+    } else {
+        None
+    }
+}
+
 /// Fraction of the fleet that has a feature enabled (0.0 when there are no servers).
 pub fn adoption(count: u64, total: u64) -> f64 {
     if total == 0 {
@@ -118,6 +150,8 @@ pub struct App {
     pub message: String,
     /// Unix time captured at the last successful refresh (for uptime/cost math).
     pub now: i64,
+    /// A server id whose token rotation is armed and awaiting confirmation (destructive action).
+    pub confirm_rotate: Option<String>,
     pub should_quit: bool,
 }
 
@@ -133,6 +167,7 @@ impl App {
             tab: Tab::Overview,
             message: "loading…".into(),
             now: 0,
+            confirm_rotate: None,
             should_quit: false,
         }
     }
@@ -154,6 +189,19 @@ impl App {
         if self.selected >= self.servers.len() {
             self.selected = 0;
         }
+    }
+
+    /// The currently-selected server, if any.
+    pub fn selected_server(&self) -> Option<&AdminServerInfo> {
+        self.servers.get(self.selected)
+    }
+
+    /// How many servers currently have an operational alert (stale or overloaded).
+    pub fn alert_count(&self) -> usize {
+        self.servers
+            .iter()
+            .filter(|s| server_alert(s).is_some())
+            .count()
     }
 
     /// Combined server-hours across the fleet (for the flat-rate part of the cost).
@@ -252,6 +300,31 @@ mod tests {
         app.set_servers(vec![sample_server("s1", 0)]); // created at epoch → 1 server-hour → $1.00
         assert!((app.fleet_server_hours() - 1.0).abs() < 1e-9);
         assert!((app.fleet_cost() - 1.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn alerts_flag_stale_and_overloaded() {
+        let mut s = sample_server("s1", 0); // healthy, 10/100 load → no alert
+        assert_eq!(server_alert(&s), None);
+        s.active_peers = 85; // ≥80% → high load
+        assert_eq!(server_alert(&s), Some(Alert::HighLoad));
+        s.healthy = false; // stale outranks high load
+        assert_eq!(server_alert(&s), Some(Alert::Stale));
+    }
+
+    #[test]
+    fn alert_count_sums_flagged_servers() {
+        let m = CostModel {
+            per_gb: 0.0,
+            per_server_hour: 0.0,
+        };
+        let mut app = App::new("http://cp".into(), "tok".into(), m);
+        let mut hot = sample_server("hot", 0);
+        hot.active_peers = 95;
+        let mut down = sample_server("down", 0);
+        down.healthy = false;
+        app.set_servers(vec![sample_server("ok", 0), hot, down]);
+        assert_eq!(app.alert_count(), 2);
     }
 
     fn sample_server(id: &str, created_at: i64) -> AdminServerInfo {
