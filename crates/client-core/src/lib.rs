@@ -646,6 +646,8 @@ where
             assigned_ip: resolved.assigned_ip(),
             stealth: resolved.stealth(),
             post_quantum: resolved.post_quantum(),
+            transport: resolved.iface.transport_kind().label().to_string(),
+            daita: resolved.iface.daita,
         }));
 
         // Tear the tunnel down on either a stop or a new-identity request; the two are told

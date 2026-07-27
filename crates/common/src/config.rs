@@ -101,6 +101,16 @@ impl TransportKind {
     pub fn is_stealth(&self) -> bool {
         !matches!(self, TransportKind::Plain)
     }
+
+    /// Short wire-name label, e.g. for status display (`plain`|`obfs`|`quic`|`mimic`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            TransportKind::Plain => "plain",
+            TransportKind::Obfs => "obfs",
+            TransportKind::Quic => "quic",
+            TransportKind::Mimic => "mimic",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

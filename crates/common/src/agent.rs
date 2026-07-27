@@ -48,10 +48,51 @@ pub enum AgentResponse {
     },
 }
 
+/// Where the always-on connection is in its lifecycle. The agent derives this from the
+/// supervisor's [`ConnEvent`](../../oxide_client_core/reconnect/enum.ConnEvent.html) stream so
+/// the UI can distinguish "picking a server" from "handshaking" from "link dropped, retrying".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnPhase {
+    /// No active tunnel.
+    #[default]
+    Disconnected,
+    /// Choosing a server (initial, or after a failure).
+    Selecting,
+    /// Tunnel is coming up; no live handshake yet.
+    Connecting,
+    /// Handshake is live and traffic can flow.
+    Connected,
+    /// The link dropped; the supervisor is reconnecting.
+    Reconnecting,
+}
+
+impl ConnPhase {
+    /// A short human label for the status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnPhase::Disconnected => "disconnected",
+            ConnPhase::Selecting => "selecting",
+            ConnPhase::Connecting => "connecting",
+            ConnPhase::Connected => "connected",
+            ConnPhase::Reconnecting => "reconnecting",
+        }
+    }
+
+    /// Whether the tunnel is up enough to carry traffic.
+    pub fn is_connected(self) -> bool {
+        self == ConnPhase::Connected
+    }
+}
+
 /// The current state of the tunnel, shown in the UI.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TunnelStatus {
     pub connected: bool,
+    /// Lifecycle phase (finer-grained than `connected`): selecting / connecting / connected /
+    /// reconnecting. Defaults to `disconnected` so older UIs that ignore it still work.
+    #[serde(default)]
+    pub phase: ConnPhase,
     /// Server id we're connected to (or connecting to), if any.
     #[serde(default)]
     pub server_id: Option<String>,
@@ -72,6 +113,19 @@ pub struct TunnelStatus {
     /// Peers with a live session (typically 1 for a client).
     #[serde(default)]
     pub active_peers: usize,
+    /// Seconds since the freshest WireGuard handshake, if any — the link-health signal. `None`
+    /// means no handshake has completed yet (still connecting) or the link went quiet.
+    #[serde(default)]
+    pub handshake_age_secs: Option<u64>,
+    /// Wire transport in use (`plain`|`obfs`|`quic`|`mimic`), if known.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Whether DAITA (traffic-analysis defense) is shaping this connection.
+    #[serde(default)]
+    pub daita: bool,
+    /// Whether the kill switch is armed for this connection.
+    #[serde(default)]
+    pub kill_switch: bool,
     /// Whether stealth (obfuscation) is active.
     #[serde(default)]
     pub stealth: bool,

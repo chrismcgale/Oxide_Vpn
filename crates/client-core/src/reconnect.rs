@@ -66,6 +66,10 @@ pub struct ConnInfo {
     pub assigned_ip: String,
     pub stealth: bool,
     pub post_quantum: bool,
+    /// Wire transport label (`plain`|`obfs`|`quic`|`mimic`).
+    pub transport: String,
+    /// Whether DAITA is shaping this connection.
+    pub daita: bool,
 }
 
 /// Why a single tunnel attempt ended.

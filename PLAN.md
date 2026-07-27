@@ -284,7 +284,16 @@ crypto/format parts; seccomp test runs in CI.
   v4+v6), v6-underlay loopback handshake (`wg-core`), `host_of` v6 test; live
   `scripts/netns-ipv6-test.sh`. Inside-tunnel v6 already worked (static config). Control-plane v6
   *IP allocation* (assigning v6 tunnel addresses) not needed yet — deferred. 127 tests.
-- [ ] **2H Observability** — dashboards/alerting on `/metrics`; PSK/DAITA/onion counters.
+- [~] **2H Observability** — *partial (2026-07-27).* **Real bandwidth accounting** landed: servers
+  report cumulative tx/rx in the heartbeat, the control plane folds them into monotonic, reset-safe
+  per-server totals (pure `accumulate_bytes`, unit-tested), and an **admin read API** (`GET
+  /v1/admin/overview` + `/v1/admin/servers`, admin-token-gated) exposes fleet health, feature
+  adoption, and bandwidth. Consumed by the new **`oxide-admin-tui`** operator console (Overview /
+  Servers / Features tabs + estimated cost). *Still open:* Prometheus counters for PSK/DAITA/onion,
+  and external dashboards/alerting (Grafana) on `/metrics`.
+- [ ] **Client TUI polish** — *DONE (2026-07-27).* `oxide-tui` is now phase-aware (spinner /
+  link-health dot / capability badges / throughput sparklines); `TunnelStatus` gained
+  `phase`/`handshake_age_secs`/`transport`/`daita`/`kill_switch`. (Complements 3A desktop GUI.)
 
 ### WAVE 3 — Clients & reach
 

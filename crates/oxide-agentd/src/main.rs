@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use oxide_client_core::{run_supervised, ConnEvent, ConnectRequest, ReconnectPolicy};
-use oxide_common::agent::{AgentRequest, AgentResponse, TunnelStatus, DEFAULT_SOCKET};
+use oxide_common::agent::{AgentRequest, AgentResponse, ConnPhase, TunnelStatus, DEFAULT_SOCKET};
 use oxide_net_linux::TunDevice;
 use oxide_wg_core::EngineHandle;
 
@@ -41,13 +41,18 @@ struct ConnMeta {
     assigned_ip: String,
     stealth: bool,
     post_quantum: bool,
+    transport: Option<String>,
+    daita: bool,
+    kill_switch: bool,
     started: Instant,
 }
 
-/// The active (always-on) tunnel, if any. `meta` and `handle` are shared cells the
+/// The active (always-on) tunnel, if any. `meta`, `handle`, and `phase` are shared cells the
 /// supervised task updates on every (re)connect, so status reflects the *current* server.
 struct Active {
     meta: Arc<StdMutex<Option<ConnMeta>>>,
+    /// Lifecycle phase, updated from the supervisor's `ConnEvent` stream.
+    phase: Arc<StdMutex<ConnPhase>>,
     handle: Arc<StdMutex<Option<EngineHandle<TunDevice>>>>,
     stop: watch::Sender<bool>,
     /// New-identity generation counter; bumping it makes the supervisor rotate the device
@@ -169,11 +174,6 @@ async fn status(state: &State) -> TunnelStatus {
     match &guard.active {
         None => TunnelStatus::default(),
         Some(a) => {
-            let meta = a.meta.lock().unwrap();
-            let Some(m) = meta.as_ref() else {
-                // Active but between attempts (selecting / connecting): not yet connected.
-                return TunnelStatus::default();
-            };
             let stats = a
                 .handle
                 .lock()
@@ -181,8 +181,26 @@ async fn status(state: &State) -> TunnelStatus {
                 .as_ref()
                 .map(|h| h.stats())
                 .unwrap_or_default();
+            // Refine the event-driven phase with live handshake state: a `Connecting` phase is
+            // promoted to `Connected` once the engine reports a completed handshake.
+            let raw_phase = *a.phase.lock().unwrap();
+            let phase = match raw_phase {
+                ConnPhase::Connecting if stats.handshake_age_secs.is_some() => ConnPhase::Connected,
+                other => other,
+            };
+
+            let meta = a.meta.lock().unwrap();
+            let Some(m) = meta.as_ref() else {
+                // Active but between attempts (selecting / reconnecting): report the phase so
+                // the UI can show progress, but there's no connection detail yet.
+                return TunnelStatus {
+                    phase,
+                    ..Default::default()
+                };
+            };
             TunnelStatus {
-                connected: true,
+                connected: phase.is_connected(),
+                phase,
                 server_id: m.server_id.clone(),
                 exit_id: m.exit_id.clone(),
                 assigned_ip: Some(m.assigned_ip.clone()),
@@ -190,6 +208,10 @@ async fn status(state: &State) -> TunnelStatus {
                 tx_bytes: stats.tx_bytes,
                 rx_bytes: stats.rx_bytes,
                 active_peers: stats.active_peers,
+                handshake_age_secs: stats.handshake_age_secs,
+                transport: m.transport.clone(),
+                daita: m.daita,
+                kill_switch: m.kill_switch,
                 stealth: m.stealth,
                 post_quantum: m.post_quantum,
             }
@@ -204,11 +226,13 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
     // re-resolving and reconnecting as needed. `meta` and `handle` are shared cells it
     // updates on each (re)connect so `status` reflects the current server and throughput.
     let meta: Arc<StdMutex<Option<ConnMeta>>> = Arc::new(StdMutex::new(None));
+    let phase: Arc<StdMutex<ConnPhase>> = Arc::new(StdMutex::new(ConnPhase::Selecting));
     let handle: Arc<StdMutex<Option<EngineHandle<TunDevice>>>> = Arc::new(StdMutex::new(None));
     let (stop_tx, stop_rx) = watch::channel(false);
     let (new_id_tx, new_id_rx) = watch::channel(0u64);
 
     let meta_task = meta.clone();
+    let phase_task = phase.clone();
     let handle_task = handle.clone();
     let task = tokio::spawn(async move {
         run_supervised(
@@ -218,19 +242,32 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
             stop_rx,
             new_id_rx,
             move |h| *handle_task.lock().unwrap() = Some(h),
-            move |ev| match ev {
-                ConnEvent::Connecting(i) => {
-                    *meta_task.lock().unwrap() = Some(ConnMeta {
-                        server_id: i.server_id,
-                        exit_id: i.exit_id,
-                        assigned_ip: i.assigned_ip,
-                        stealth: i.stealth,
-                        post_quantum: i.post_quantum,
-                        started: Instant::now(),
-                    });
+            move |ev| {
+                // Track the lifecycle phase for the UI, and cache per-connection metadata.
+                let mut phase = phase_task.lock().unwrap();
+                match ev {
+                    ConnEvent::Selecting => *phase = ConnPhase::Selecting,
+                    ConnEvent::Connecting(i) => {
+                        *phase = ConnPhase::Connecting;
+                        *meta_task.lock().unwrap() = Some(ConnMeta {
+                            server_id: i.server_id,
+                            exit_id: i.exit_id,
+                            assigned_ip: i.assigned_ip,
+                            stealth: i.stealth,
+                            post_quantum: i.post_quantum,
+                            transport: Some(i.transport),
+                            daita: i.daita,
+                            kill_switch,
+                            started: Instant::now(),
+                        });
+                    }
+                    ConnEvent::Reconnecting { .. } => *phase = ConnPhase::Reconnecting,
+                    ConnEvent::NewIdentity => *phase = ConnPhase::Selecting,
+                    ConnEvent::Stopped => {
+                        *phase = ConnPhase::Disconnected;
+                        *meta_task.lock().unwrap() = None;
+                    }
                 }
-                ConnEvent::Stopped => *meta_task.lock().unwrap() = None,
-                _ => {}
             },
         )
         .await
@@ -238,6 +275,7 @@ async fn connect(state: &State, req: ConnectRequest, kill_switch: bool) -> Resul
 
     state.lock().await.active = Some(Active {
         meta,
+        phase,
         handle,
         stop: stop_tx,
         new_id: new_id_tx,

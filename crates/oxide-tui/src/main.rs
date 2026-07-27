@@ -21,9 +21,12 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use app::{human_bytes, App};
-use oxide_common::agent::{AgentRequest, AgentResponse, TunnelStatus, DEFAULT_SOCKET};
+use app::{human_bytes, sparkline, App, LinkHealth};
+use oxide_common::agent::{AgentRequest, AgentResponse, ConnPhase, TunnelStatus, DEFAULT_SOCKET};
 use oxide_control_client::ControlClient;
+
+/// Braille spinner frames for the "working" states (selecting / connecting / reconnecting).
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Parser)]
 #[command(name = "oxide-tui", about = "Oxide VPN terminal UI")]
@@ -53,10 +56,13 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(1000));
+    // A faster tick just animates the spinner so "connecting…" feels alive.
+    let mut anim = tokio::time::interval(Duration::from_millis(120));
     loop {
         terminal.draw(|f| draw(f, app))?;
         tokio::select! {
             _ = tick.tick() => refresh_status(app).await,
+            _ = anim.tick() => app.tick_spinner(),
             ev = events.next() => match ev {
                 Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => handle_key(app, k.code).await,
                 Some(Err(_)) | None => break,
@@ -161,52 +167,13 @@ async fn agent_request(socket: &PathBuf, req: &AgentRequest) -> Result<AgentResp
 
 fn draw(f: &mut Frame, app: &App) {
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(7),
         Constraint::Min(0),
         Constraint::Length(3),
     ])
     .areas(f.area());
 
-    // --- header: title + live status ---
-    let st = &app.status;
-    let title = Line::from(Span::styled(
-        "  Oxide VPN",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    let status_line = if st.connected {
-        let flags = format!(
-            "{}{}",
-            if st.stealth { "stealth " } else { "" },
-            if st.post_quantum { "PQ" } else { "" },
-        );
-        Line::from(vec![
-            Span::styled(
-                "  ● CONNECTED ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                "{}  up {}s  ↑{} ↓{}  {}",
-                st.server_id.clone().unwrap_or_else(|| "?".into()),
-                st.uptime_secs,
-                human_bytes(st.tx_bytes),
-                human_bytes(st.rx_bytes),
-                flags,
-            )),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "  ○ disconnected",
-            Style::default().fg(Color::DarkGray),
-        ))
-    };
-    f.render_widget(
-        Paragraph::new(vec![title, status_line]).block(Block::default().borders(Borders::BOTTOM)),
-        header,
-    );
+    draw_header(f, app, header);
 
     // --- body: server list ---
     let items: Vec<ListItem> = app
@@ -257,4 +224,208 @@ fn draw(f: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::TOP)),
         footer,
     );
+}
+
+/// The status panel: title, a phase-aware status line, feature badges, and — when connected —
+/// a live throughput sparkline for each direction.
+fn draw_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let st = &app.status;
+    let mut lines = vec![Line::from(Span::styled(
+        "  Oxide VPN",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    lines.push(status_line(app));
+
+    // Feature badges (only meaningful once we have a connection).
+    if st.phase != ConnPhase::Disconnected {
+        lines.push(badge_line(st));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    // Throughput sparklines when connected.
+    if st.connected {
+        lines.push(throughput_line(
+            "  ↑",
+            &app.tx_rate,
+            st.tx_bytes,
+            Color::Green,
+        ));
+        lines.push(throughput_line(
+            "  ↓",
+            &app.rx_rate,
+            st.rx_bytes,
+            Color::Blue,
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::BOTTOM)),
+        area,
+    );
+}
+
+/// The phase-aware status line: a green dot when connected, an animated spinner while working,
+/// a gray ring when idle.
+fn status_line(app: &App) -> Line<'static> {
+    let st = &app.status;
+    let server = st.server_id.clone().unwrap_or_else(|| "?".into());
+    match st.phase {
+        ConnPhase::Disconnected => Line::from(Span::styled(
+            "  ○ disconnected",
+            Style::default().fg(Color::DarkGray),
+        )),
+        ConnPhase::Connected => {
+            let (dot, dot_color) = match app.link_health() {
+                LinkHealth::Live => ("●", Color::Green),
+                LinkHealth::Stale => ("◐", Color::Yellow),
+                LinkHealth::Unknown => ("○", Color::Gray),
+            };
+            let handshake = st
+                .handshake_age_secs
+                .map(|a| format!("  hs {a}s"))
+                .unwrap_or_default();
+            let exit = st
+                .exit_id
+                .as_ref()
+                .map(|e| format!(" → {e}"))
+                .unwrap_or_default();
+            Line::from(vec![
+                Span::styled(
+                    format!("  {dot} CONNECTED "),
+                    Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{server}{exit}  up {}s{handshake}", st.uptime_secs)),
+            ])
+        }
+        working => {
+            let frame = SPINNER[app.spinner % SPINNER.len()];
+            Line::from(vec![
+                Span::styled(
+                    format!("  {frame} {} ", working.label().to_uppercase()),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(if server == "?" { String::new() } else { server }),
+            ])
+        }
+    }
+}
+
+/// A row of colored capability badges for the current connection.
+fn badge_line(st: &TunnelStatus) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    let transport = st.transport.clone().unwrap_or_else(|| "plain".into());
+    let (t_color, t_text) = match transport.as_str() {
+        "quic" => (Color::Cyan, "QUIC"),
+        "mimic" => (Color::Cyan, "MIMIC"),
+        "obfs" => (Color::Blue, "OBFS"),
+        _ => (Color::DarkGray, "PLAIN"),
+    };
+    spans.push(badge(t_text, t_color, true));
+    spans.push(badge("DAITA", Color::Magenta, st.daita));
+    spans.push(badge("PQ", Color::Yellow, st.post_quantum));
+    spans.push(badge("STEALTH", Color::Green, st.stealth));
+    spans.push(badge("KILL", Color::Red, st.kill_switch));
+    Line::from(spans)
+}
+
+/// A single badge: bright when `on`, dim when off, so the whole capability set is always visible.
+fn badge(text: &str, color: Color, on: bool) -> Span<'static> {
+    let style = if on {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Span::styled(format!("[{text}] "), style)
+}
+
+/// One throughput row: an arrow, a sparkline, and the cumulative byte count.
+fn throughput_line(arrow: &str, rate: &[u64], total: u64, color: Color) -> Line<'static> {
+    let last = rate.last().copied().unwrap_or(0);
+    Line::from(vec![
+        Span::styled(
+            format!("{arrow} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(sparkline(rate), Style::default().fg(color)),
+        Span::raw(format!(
+            "  {}/s  ({} total)",
+            human_bytes(last),
+            human_bytes(total)
+        )),
+    ])
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn render(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        buffer_text(&terminal)
+    }
+
+    #[test]
+    fn connected_header_shows_badges_and_throughput() {
+        let mut app = App::new("http://cp".into(), "acct".into(), "/tmp/s".into());
+        app.set_status(TunnelStatus {
+            connected: true,
+            phase: ConnPhase::Connected,
+            server_id: Some("us-nyc-1".into()),
+            uptime_secs: 42,
+            tx_bytes: 10_000,
+            rx_bytes: 20_000,
+            handshake_age_secs: Some(3),
+            transport: Some("quic".into()),
+            daita: true,
+            post_quantum: true,
+            kill_switch: true,
+            ..Default::default()
+        });
+        let text = render(&app);
+        assert!(text.contains("CONNECTED"));
+        assert!(text.contains("us-nyc-1"));
+        assert!(text.contains("QUIC"));
+        assert!(text.contains("DAITA"));
+        assert!(text.contains("KILL"));
+        assert!(text.contains("hs 3s")); // handshake age
+    }
+
+    #[test]
+    fn connecting_header_shows_phase_label() {
+        let mut app = App::new("http://cp".into(), "acct".into(), "/tmp/s".into());
+        app.set_status(TunnelStatus {
+            phase: ConnPhase::Connecting,
+            server_id: Some("de-fra-2".into()),
+            ..Default::default()
+        });
+        let text = render(&app);
+        assert!(text.contains("CONNECTING"));
+        assert!(text.contains("de-fra-2"));
+    }
+
+    #[test]
+    fn disconnected_header_is_idle() {
+        let app = App::new("http://cp".into(), "acct".into(), "/tmp/s".into());
+        let text = render(&app);
+        assert!(text.contains("disconnected"));
+    }
 }
