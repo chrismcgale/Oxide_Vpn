@@ -61,10 +61,20 @@ fn default_true() -> bool {
     true
 }
 
-/// Server-reported live load (server-authenticated heartbeat).
+/// Server-reported live load (server-authenticated heartbeat). `tx_bytes`/`rx_bytes` are the
+/// server engine's **cumulative** counters since the server process started; the control plane
+/// turns them into monotonic per-server totals by accumulating deltas (reset-safe). These are
+/// fleet-level infrastructure metrics (aggregate bytes per *server*, like `active_peers`) — not
+/// per-account traffic, so they don't breach the no-logs posture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub active_peers: u32,
+    /// Cumulative bytes the server has sent through the tunnel since it started.
+    #[serde(default)]
+    pub tx_bytes: u64,
+    /// Cumulative bytes the server has received through the tunnel since it started.
+    #[serde(default)]
+    pub rx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +246,69 @@ pub struct AdminAddServerResponse {
 pub struct RotateTokenResponse {
     pub auth_token: String,
     pub previous_valid_secs: i64,
+}
+
+/// One server's full operational view for the admin console (admin-authenticated). Everything
+/// an operator needs to see fleet health, feature adoption, and bandwidth — no user data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminServerInfo {
+    pub id: String,
+    /// Public UDP endpoint, `host:port`.
+    pub endpoint: String,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    /// Soft capacity (max peers). 0 = unlimited.
+    pub capacity: u32,
+    /// Peers with a live session, as last reported by the server's heartbeat.
+    pub active_peers: u32,
+    /// Whether the server has heartbeated recently enough to be considered up.
+    pub healthy: bool,
+    /// Wire transport (`plain`|`obfs`|`quic`|`mimic`); `None` means plain.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Whether the server runs DAITA (traffic-analysis defense).
+    pub daita: bool,
+    /// Whether the server advertises a post-quantum (ML-KEM) key.
+    pub post_quantum: bool,
+    /// Whether the server runs stealth (has an obfuscation key).
+    pub stealth: bool,
+    /// Monotonic cumulative bytes sent/received through this server (accumulated from
+    /// heartbeats, reset-safe across server restarts).
+    pub tx_bytes_total: u64,
+    pub rx_bytes_total: u64,
+    /// Seconds since the last heartbeat, or `None` if the server has never heartbeated.
+    #[serde(default)]
+    pub last_heartbeat_secs: Option<i64>,
+    /// Unix timestamp the server was registered.
+    pub created_at: i64,
+}
+
+/// `GET /v1/admin/servers` — the full fleet (admin-authenticated).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminServersResponse {
+    pub servers: Vec<AdminServerInfo>,
+}
+
+/// `GET /v1/admin/overview` — fleet-wide aggregates for the admin dashboard (admin-authenticated).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminOverview {
+    pub accounts: u64,
+    pub servers: u64,
+    pub devices: u64,
+    /// Servers currently healthy (fresh heartbeat).
+    pub healthy_servers: u64,
+    /// Sum of live peers across the fleet.
+    pub active_peers: u64,
+    /// Fleet-wide cumulative bytes sent/received.
+    pub tx_bytes_total: u64,
+    pub rx_bytes_total: u64,
+    // Feature adoption across the fleet.
+    pub stealth_servers: u64,
+    pub quic_servers: u64,
+    pub daita_servers: u64,
+    pub pq_servers: u64,
 }
 
 /// Standard JSON error body.

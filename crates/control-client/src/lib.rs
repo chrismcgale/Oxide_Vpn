@@ -8,11 +8,11 @@ use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
 
 use oxide_common::api::{
-    AdminAddServerRequest, AdminAddServerResponse, CreateAccountResponse, HeartbeatRequest,
-    MeshListResponse, MeshPeer, MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest,
-    PeerEntry, PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry,
-    RelayListResponse, RotateTokenResponse, ServerInfo, ServerListResponse, VersionResponse,
-    API_VERSION,
+    AdminAddServerRequest, AdminAddServerResponse, AdminOverview, AdminServerInfo,
+    AdminServersResponse, CreateAccountResponse, HeartbeatRequest, MeshListResponse, MeshPeer,
+    MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest, PeerEntry,
+    PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse,
+    RotateTokenResponse, ServerInfo, ServerListResponse, VersionResponse, API_VERSION,
 };
 use oxide_common::PublicKey;
 
@@ -86,13 +86,26 @@ impl ControlClient {
         Ok(resp.json().await?)
     }
 
-    /// Report live load to the control plane (server-authenticated heartbeat).
-    pub async fn heartbeat(&self, server_id: &str, token: &str, active_peers: u32) -> Result<()> {
+    /// Report live load + cumulative bandwidth to the control plane (server-authenticated
+    /// heartbeat). `tx_bytes`/`rx_bytes` are the engine's counters since the server started;
+    /// the control plane folds them into reset-safe per-server totals.
+    pub async fn heartbeat(
+        &self,
+        server_id: &str,
+        token: &str,
+        active_peers: u32,
+        tx_bytes: u64,
+        rx_bytes: u64,
+    ) -> Result<()> {
         let resp = self
             .http
             .post(self.url(&format!("/v1/internal/servers/{server_id}/heartbeat")))
             .bearer_auth(token)
-            .json(&HeartbeatRequest { active_peers })
+            .json(&HeartbeatRequest {
+                active_peers,
+                tx_bytes,
+                rx_bytes,
+            })
             .send()
             .await
             .context("POST heartbeat")?;
@@ -155,6 +168,39 @@ impl ControlClient {
             .context("POST rotate-token")?;
         let resp = check(resp).await?;
         resp.json().await.context("parsing rotate-token response")
+    }
+
+    /// List the full fleet with operational detail (admin-authenticated). Powers the admin TUI.
+    pub async fn admin_list_servers(&self, admin_token: &str) -> Result<Vec<AdminServerInfo>> {
+        let resp = self
+            .http
+            .get(self.url("/v1/admin/servers"))
+            .bearer_auth(admin_token)
+            .send()
+            .await
+            .context("GET admin servers")?;
+        let body: AdminServersResponse = check(resp)
+            .await?
+            .json()
+            .await
+            .context("parsing admin servers")?;
+        Ok(body.servers)
+    }
+
+    /// Fleet-wide aggregates for the admin dashboard (admin-authenticated).
+    pub async fn admin_overview(&self, admin_token: &str) -> Result<AdminOverview> {
+        let resp = self
+            .http
+            .get(self.url("/v1/admin/overview"))
+            .bearer_auth(admin_token)
+            .send()
+            .await
+            .context("GET admin overview")?;
+        check(resp)
+            .await?
+            .json()
+            .await
+            .context("parsing admin overview")
     }
 
     /// Register this device's public key on `server_id`; returns connection details.

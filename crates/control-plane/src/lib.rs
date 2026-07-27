@@ -32,11 +32,12 @@ use tower_http::timeout::TimeoutLayer;
 
 use oxide_common::account::{generate_account_number, is_valid_account_number};
 use oxide_common::api::{
-    AdminAddServerRequest, AdminAddServerResponse, ApiError, CreateAccountResponse,
-    HeartbeatRequest, MeshListResponse, MeshPeer, MeshRegisterRequest, MeshRegisterResponse,
-    MultihopRegisterRequest, PeerEntry, PeerListResponse, RegisterDeviceRequest,
-    RegisterDeviceResponse, RelayEntry, RelayListResponse, RotateTokenResponse, ServerConnection,
-    ServerInfo, ServerListResponse, VersionResponse, API_VERSION,
+    AdminAddServerRequest, AdminAddServerResponse, AdminOverview, AdminServerInfo,
+    AdminServersResponse, ApiError, CreateAccountResponse, HeartbeatRequest, MeshListResponse,
+    MeshPeer, MeshRegisterRequest, MeshRegisterResponse, MultihopRegisterRequest, PeerEntry,
+    PeerListResponse, RegisterDeviceRequest, RegisterDeviceResponse, RelayEntry, RelayListResponse,
+    RotateTokenResponse, ServerConnection, ServerInfo, ServerListResponse, VersionResponse,
+    API_VERSION,
 };
 use oxide_common::PublicKey;
 
@@ -51,6 +52,12 @@ const SERVER_STALE_SECS: i64 = 90;
 /// Columns selected when building a [`ServerInfo`].
 const SERVER_COLUMNS: &str =
     "id, public_key, endpoint, country, city, capacity, active_peers, last_heartbeat, pq_public_key";
+
+/// Columns selected when building an [`AdminServerInfo`] (operator view: adds transport,
+/// feature flags, and bandwidth totals).
+const ADMIN_SERVER_COLUMNS: &str = "id, endpoint, country, city, capacity, active_peers, \
+    last_heartbeat, transport, daita, obfuscation_key, pq_public_key, tx_bytes_total, \
+    rx_bytes_total, created_at";
 
 /// Max requests per source IP per [`RATE_WINDOW`]. Protects the account-number bearer
 /// auth from brute force and the account-creation endpoint from abuse.
@@ -142,7 +149,11 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/devices/multihop", post(register_device_multihop))
         .route("/v1/mesh/register", post(mesh_register))
         .route("/v1/mesh", get(mesh_list))
-        .route("/v1/admin/servers", post(admin_add_server))
+        .route(
+            "/v1/admin/servers",
+            post(admin_add_server).get(admin_list_servers),
+        )
+        .route("/v1/admin/overview", get(admin_overview))
         .route(
             "/v1/admin/servers/:id/rotate-token",
             post(admin_rotate_token),
@@ -833,6 +844,19 @@ async fn list_relays(
     Ok(Json(RelayListResponse { relays }))
 }
 
+/// Fold a fresh cumulative counter reading into a monotonic total. `reported` is the server's
+/// counter since *its* process start, so normally it only grows and the delta is
+/// `reported - last`. If it went *down*, the server restarted (counter reset to 0), so the
+/// whole current reading is new. Returns `(new_total, new_last)`. Pure so it's unit-tested.
+fn accumulate_bytes(total: i64, last: i64, reported: i64) -> (i64, i64) {
+    let delta = if reported >= last {
+        reported - last
+    } else {
+        reported
+    };
+    (total.saturating_add(delta), reported)
+}
+
 // POST /v1/internal/servers/:id/heartbeat  (server-authenticated)
 async fn server_heartbeat(
     State(state): State<AppState>,
@@ -841,13 +865,43 @@ async fn server_heartbeat(
     Json(hb): Json<HeartbeatRequest>,
 ) -> ApiResult<StatusCode> {
     auth_server(&state, &server_id, &headers).await?;
+
+    // Read the last cumulative readings, fold in this heartbeat's delta (reset-safe), and
+    // write back the new monotonic totals. One server process owns its row, so read-then-write
+    // isn't racy here. Byte counts never approach i64::MAX, so the u64→i64 cast is lossless.
+    let row = state
+        .pool
+        .fetch_optional(
+            "SELECT tx_bytes_total, rx_bytes_total, last_tx_bytes, last_rx_bytes
+             FROM servers WHERE id = ?",
+            &[Val::from(server_id.as_str())],
+        )
+        .await?;
+    let (tx_total, rx_total, tx_last, rx_last) = match &row {
+        Some(r) => (
+            r.int("tx_bytes_total"),
+            r.int("rx_bytes_total"),
+            r.int("last_tx_bytes"),
+            r.int("last_rx_bytes"),
+        ),
+        None => (0, 0, 0, 0),
+    };
+    let (new_tx_total, new_tx_last) = accumulate_bytes(tx_total, tx_last, hb.tx_bytes as i64);
+    let (new_rx_total, new_rx_last) = accumulate_bytes(rx_total, rx_last, hb.rx_bytes as i64);
+
     state
         .pool
         .execute(
-            "UPDATE servers SET active_peers = ?, last_heartbeat = ? WHERE id = ?",
+            "UPDATE servers SET active_peers = ?, last_heartbeat = ?,
+                 tx_bytes_total = ?, rx_bytes_total = ?, last_tx_bytes = ?, last_rx_bytes = ?
+             WHERE id = ?",
             &[
                 Val::from(hb.active_peers as i64),
                 Val::from(db::now_unix()),
+                Val::from(new_tx_total),
+                Val::from(new_rx_total),
+                Val::from(new_tx_last),
+                Val::from(new_rx_last),
                 Val::from(server_id.as_str()),
             ],
         )
@@ -982,6 +1036,94 @@ async fn admin_rotate_token(
     }
 }
 
+// GET /v1/admin/servers — the full fleet with operational detail (admin-authenticated).
+async fn admin_list_servers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<AdminServersResponse>> {
+    auth_admin(&state, &headers)?;
+    Ok(Json(AdminServersResponse {
+        servers: load_admin_servers(&state.pool).await?,
+    }))
+}
+
+// GET /v1/admin/overview — fleet-wide aggregates for the admin dashboard (admin-authenticated).
+async fn admin_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<AdminOverview>> {
+    auth_admin(&state, &headers)?;
+    let accounts = state
+        .pool
+        .scalar_i64("SELECT COUNT(*) FROM accounts", &[])
+        .await? as u64;
+    let devices = state
+        .pool
+        .scalar_i64("SELECT COUNT(*) FROM devices", &[])
+        .await? as u64;
+
+    // Aggregate the per-server view in Rust so the health/feature logic lives in one place.
+    let servers = load_admin_servers(&state.pool).await?;
+    let mut o = AdminOverview {
+        accounts,
+        servers: servers.len() as u64,
+        devices,
+        healthy_servers: 0,
+        active_peers: 0,
+        tx_bytes_total: 0,
+        rx_bytes_total: 0,
+        stealth_servers: 0,
+        quic_servers: 0,
+        daita_servers: 0,
+        pq_servers: 0,
+    };
+    for s in &servers {
+        o.healthy_servers += s.healthy as u64;
+        o.active_peers += s.active_peers as u64;
+        o.tx_bytes_total += s.tx_bytes_total;
+        o.rx_bytes_total += s.rx_bytes_total;
+        o.stealth_servers += s.stealth as u64;
+        o.quic_servers += (s.transport.as_deref() == Some("quic")) as u64;
+        o.daita_servers += s.daita as u64;
+        o.pq_servers += s.post_quantum as u64;
+    }
+    Ok(Json(o))
+}
+
+/// Load every server as an [`AdminServerInfo`] (operator view).
+async fn load_admin_servers(pool: &Db) -> ApiResult<Vec<AdminServerInfo>> {
+    let sql = format!("SELECT {ADMIN_SERVER_COLUMNS} FROM servers ORDER BY id");
+    let rows = pool.fetch_all(&sql, &[]).await?;
+    Ok(rows.iter().map(admin_server_info_from_row).collect())
+}
+
+fn admin_server_info_from_row(row: &DbRow) -> AdminServerInfo {
+    let (healthy, last_heartbeat_secs) = match row.opt_int("last_heartbeat") {
+        None => (true, None),
+        Some(t) => {
+            let age = db::now_unix() - t;
+            (age <= SERVER_STALE_SECS, Some(age))
+        }
+    };
+    AdminServerInfo {
+        id: row.text("id"),
+        endpoint: row.text("endpoint"),
+        country: row.opt_text("country"),
+        city: row.opt_text("city"),
+        capacity: row.int("capacity") as u32,
+        active_peers: row.int("active_peers") as u32,
+        healthy,
+        transport: row.opt_text("transport"),
+        daita: row.int("daita") != 0,
+        post_quantum: row.opt_text("pq_public_key").is_some(),
+        stealth: row.opt_text("obfuscation_key").is_some(),
+        tx_bytes_total: row.int("tx_bytes_total").max(0) as u64,
+        rx_bytes_total: row.int("rx_bytes_total").max(0) as u64,
+        last_heartbeat_secs,
+        created_at: row.int("created_at"),
+    }
+}
+
 /// Rotate a server's auth token in the DB: the current token becomes the previous one (valid
 /// for the grace window) and a fresh token is issued. Returns `(new_token, grace_secs)`, or
 /// `None` if the server doesn't exist. Shared by the admin endpoint and the `rotate-token` CLI.
@@ -1064,5 +1206,35 @@ mod host_of_tests {
         assert_eq!(host_of("[fe80::1]:80"), "fe80::1");
         // A bare hostname without a port passes through unchanged.
         assert_eq!(host_of("relay.example"), "relay.example");
+    }
+}
+
+#[cfg(test)]
+mod accumulate_tests {
+    use super::accumulate_bytes;
+
+    #[test]
+    fn first_report_counts_the_whole_reading() {
+        // Fresh server: total 0, last 0, reports 1500 cumulative → +1500.
+        assert_eq!(accumulate_bytes(0, 0, 1500), (1500, 1500));
+    }
+
+    #[test]
+    fn growing_counter_adds_only_the_delta() {
+        // Later heartbeat: total 1500, last 1500, now reports 4000 → +2500.
+        assert_eq!(accumulate_bytes(1500, 1500, 4000), (4000, 4000));
+    }
+
+    #[test]
+    fn counter_reset_after_restart_adds_the_new_reading() {
+        // Server restarted: its counter fell (10_000 → 300). Add the whole 300, don't go
+        // negative; the running total keeps climbing.
+        assert_eq!(accumulate_bytes(50_000, 10_000, 300), (50_300, 300));
+    }
+
+    #[test]
+    fn idempotent_repeat_report_adds_nothing() {
+        // Same reading twice (e.g. a retried heartbeat) → no double count.
+        assert_eq!(accumulate_bytes(4000, 4000, 4000), (4000, 4000));
     }
 }

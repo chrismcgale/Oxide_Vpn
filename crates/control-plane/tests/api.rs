@@ -173,9 +173,15 @@ async fn best_server_selection_balances_by_load_and_location() {
     let account = cc.create_account().await.unwrap();
 
     // Report load: us-a heavy, us-b light, de-a lightest.
-    cc.heartbeat("us-a", &tokens["us-a"], 50).await.unwrap();
-    cc.heartbeat("us-b", &tokens["us-b"], 10).await.unwrap();
-    cc.heartbeat("de-a", &tokens["de-a"], 5).await.unwrap();
+    cc.heartbeat("us-a", &tokens["us-a"], 50, 0, 0)
+        .await
+        .unwrap();
+    cc.heartbeat("us-b", &tokens["us-b"], 10, 0, 0)
+        .await
+        .unwrap();
+    cc.heartbeat("de-a", &tokens["de-a"], 5, 0, 0)
+        .await
+        .unwrap();
 
     // Global best = lowest load factor = de-a.
     let best = cc.best_server(&account, None, None).await.unwrap();
@@ -188,7 +194,9 @@ async fn best_server_selection_balances_by_load_and_location() {
     assert_eq!(best_us.id, "us-b");
 
     // A new heartbeat shifts the balance: now us-b is heavier than us-a.
-    cc.heartbeat("us-b", &tokens["us-b"], 90).await.unwrap();
+    cc.heartbeat("us-b", &tokens["us-b"], 90, 0, 0)
+        .await
+        .unwrap();
     let best_us = cc.best_server(&account, Some("us"), None).await.unwrap(); // case-insensitive
     assert_eq!(best_us.id, "us-a");
 
@@ -649,4 +657,94 @@ async fn version_endpoint_reports_api_and_build() {
     assert!(!v.git_commit.is_empty());
     // A matching client is compatible.
     assert!(cc.is_compatible().await.unwrap());
+}
+
+#[tokio::test]
+async fn admin_read_endpoints_and_byte_accounting() {
+    // Two servers with different feature mixes; drive heartbeats with cumulative byte counters
+    // and assert the admin fleet view + overview reflect reset-safe totals and feature adoption.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let mut tokens = std::collections::HashMap::new();
+    for (id, transport, daita, pq, obfs) in [
+        ("s-quic", Some("quic"), true, Some("cGtwcQ=="), None),
+        ("s-plain", None, false, None, Some("b2Jmcw==")),
+    ] {
+        let pubk = public_from_secret(&generate_secret()).to_base64();
+        let t = add_server(
+            &pool,
+            NewServer {
+                id,
+                public_key: &pubk,
+                endpoint: "203.0.113.9:51820",
+                cidr: "10.8.0.0/24".parse().unwrap(),
+                country: Some("US"),
+                city: None,
+                capacity: 100,
+                dns: None,
+                obfuscation_key: obfs,
+                pq_public_key: pq,
+                transport,
+                daita,
+            },
+        )
+        .await
+        .unwrap();
+        tokens.insert(id, t);
+    }
+
+    let state = AppState::new(pool).with_admin_token(Some("adm".into()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    // s-quic reports cumulative counters that grow, then reset (restart), then grow again.
+    cc.heartbeat("s-quic", &tokens["s-quic"], 3, 1_000, 2_000)
+        .await
+        .unwrap();
+    cc.heartbeat("s-quic", &tokens["s-quic"], 5, 5_000, 8_000)
+        .await
+        .unwrap(); // +4_000 tx, +6_000 rx
+    cc.heartbeat("s-quic", &tokens["s-quic"], 4, 200, 100)
+        .await
+        .unwrap(); // reset: +200 tx, +100 rx
+                   // Totals: tx = 5_000 + 200 = 5_200 ; rx = 8_000 + 100 = 8_100.
+
+    cc.heartbeat("s-plain", &tokens["s-plain"], 2, 700, 900)
+        .await
+        .unwrap();
+
+    // Wrong admin token is rejected.
+    assert!(cc.admin_list_servers("nope").await.is_err());
+
+    let mut servers = cc.admin_list_servers("adm").await.unwrap();
+    servers.sort_by(|a, b| a.id.cmp(&b.id));
+    let quic = servers.iter().find(|s| s.id == "s-quic").unwrap();
+    assert_eq!(quic.tx_bytes_total, 5_200);
+    assert_eq!(quic.rx_bytes_total, 8_100);
+    assert_eq!(quic.active_peers, 4);
+    assert_eq!(quic.transport.as_deref(), Some("quic"));
+    assert!(quic.daita);
+    assert!(quic.post_quantum);
+    assert!(!quic.stealth);
+    assert!(quic.healthy);
+    assert!(quic.last_heartbeat_secs.is_some());
+
+    let plain = servers.iter().find(|s| s.id == "s-plain").unwrap();
+    assert_eq!(plain.tx_bytes_total, 700);
+    assert!(plain.stealth); // has an obfuscation key
+    assert!(!plain.post_quantum);
+    assert_eq!(plain.transport, None);
+
+    // Overview aggregates the fleet.
+    let ov = cc.admin_overview("adm").await.unwrap();
+    assert_eq!(ov.servers, 2);
+    assert_eq!(ov.healthy_servers, 2);
+    assert_eq!(ov.active_peers, 6); // 4 + 2
+    assert_eq!(ov.tx_bytes_total, 5_900); // 5_200 + 700
+    assert_eq!(ov.rx_bytes_total, 9_000); // 8_100 + 900
+    assert_eq!(ov.quic_servers, 1);
+    assert_eq!(ov.daita_servers, 1);
+    assert_eq!(ov.pq_servers, 1);
+    assert_eq!(ov.stealth_servers, 1);
 }

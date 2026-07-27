@@ -553,7 +553,13 @@ async fn poll_control_plane<T: TunQueue>(
         // Report live load so the control plane can balance new clients across servers.
         let stats = handle.stats();
         if let Err(e) = client
-            .heartbeat(&cp.server_id, &cp.token, stats.active_peers as u32)
+            .heartbeat(
+                &cp.server_id,
+                &cp.token,
+                stats.active_peers as u32,
+                stats.tx_bytes,
+                stats.rx_bytes,
+            )
             .await
         {
             warn!(error = %e, "heartbeat failed");

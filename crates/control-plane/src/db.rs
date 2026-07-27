@@ -339,6 +339,10 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
             pq_public_key  TEXT,
             transport      TEXT,
             daita          INTEGER NOT NULL DEFAULT 0,
+            tx_bytes_total INTEGER NOT NULL DEFAULT 0,
+            rx_bytes_total INTEGER NOT NULL DEFAULT 0,
+            last_tx_bytes  INTEGER NOT NULL DEFAULT 0,
+            last_rx_bytes  INTEGER NOT NULL DEFAULT 0,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
@@ -387,6 +391,12 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
         // Server-token rotation: the previous token stays valid until its expiry (grace).
         "ALTER TABLE servers ADD COLUMN prev_auth_token TEXT",
         "ALTER TABLE servers ADD COLUMN prev_token_expires_at INTEGER",
+        // Bandwidth accounting (fleet-level, reset-safe): monotonic totals plus the last
+        // cumulative counter each server reported, so we can add only the delta each heartbeat.
+        "ALTER TABLE servers ADD COLUMN tx_bytes_total INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN rx_bytes_total INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN last_tx_bytes INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN last_rx_bytes INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
         // Concurrency-safe allocation constraints (2C), added idempotently so existing
         // databases pick them up. On a legacy DB that already holds duplicates, index
@@ -424,6 +434,10 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
             pq_public_key  TEXT,
             transport      TEXT,
             daita          BIGINT NOT NULL DEFAULT 0,
+            tx_bytes_total BIGINT NOT NULL DEFAULT 0,
+            rx_bytes_total BIGINT NOT NULL DEFAULT 0,
+            last_tx_bytes  BIGINT NOT NULL DEFAULT 0,
+            last_rx_bytes  BIGINT NOT NULL DEFAULT 0,
             created_at     BIGINT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS devices (
@@ -460,6 +474,11 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
         // Server-token rotation with a grace window.
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS prev_auth_token TEXT",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS prev_token_expires_at BIGINT",
+        // Bandwidth accounting (fleet-level, reset-safe).
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS tx_bytes_total BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS rx_bytes_total BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_tx_bytes BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_rx_bytes BIGINT NOT NULL DEFAULT 0",
     ];
     for stmt in statements {
         sqlx::query(stmt)
