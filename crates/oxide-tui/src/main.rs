@@ -89,10 +89,16 @@ async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(1000));
     // A faster tick just animates the spinner so "connecting…" feels alive.
     let mut anim = tokio::time::interval(Duration::from_millis(120));
+    // Periodically re-list servers (which also re-probes latency), starting one interval in so
+    // it doesn't immediately repeat the startup refresh.
+    let refresh_every = Duration::from_secs(30);
+    let mut servers_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + refresh_every, refresh_every);
     loop {
         terminal.draw(|f| draw(f, app))?;
         tokio::select! {
             _ = tick.tick() => refresh_status(app).await,
+            _ = servers_tick.tick() => refresh_servers(app).await,
             _ = anim.tick() => app.tick_spinner(),
             ev = events.next() => match ev {
                 Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => handle_key(app, k.code).await,
@@ -211,6 +217,8 @@ async fn refresh_servers(app: &mut App) {
         Ok(v) => {
             app.set_servers(v);
             app.message = format!("{} servers", app.servers.len());
+            // Keep latency measurements fresh: re-probe whenever the list refreshes.
+            probe_latencies(app).await;
         }
         Err(e) => app.message = format!("server list failed: {e}"),
     }
