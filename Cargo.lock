@@ -1873,6 +1873,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "oxide-client-core",
  "oxide-common",
  "oxide-control-client",
  "ratatui",

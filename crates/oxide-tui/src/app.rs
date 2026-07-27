@@ -1,6 +1,8 @@
 //! TUI application state and (testable) state transitions. Rendering lives in `main`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use oxide_common::agent::TunnelStatus;
 use oxide_common::api::ServerInfo;
@@ -31,6 +33,17 @@ pub fn link_health(handshake_age_secs: Option<u64>) -> LinkHealth {
     }
 }
 
+/// Whether `server` matches a lowercase search `needle` (id / country / city substring).
+pub fn server_matches(server: &ServerInfo, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hay = |s: &Option<String>| s.as_deref().unwrap_or("").to_lowercase();
+    server.id.to_lowercase().contains(needle)
+        || hay(&server.country).contains(needle)
+        || hay(&server.city).contains(needle)
+}
+
 pub struct App {
     pub cp_url: String,
     pub account: String,
@@ -40,6 +53,16 @@ pub struct App {
     pub status: TunnelStatus,
     pub message: String,
     pub should_quit: bool,
+    /// Whether a new connection should arm the kill switch. Toggled in the UI.
+    pub kill_switch: bool,
+    /// Case-insensitive filter over id/country/city; empty = show all.
+    pub filter: String,
+    /// Whether the filter input is active (keystrokes edit the filter, not commands).
+    pub filtering: bool,
+    /// Sort the list by measured latency (ascending, unmeasured last) instead of load.
+    pub sort_by_latency: bool,
+    /// Measured round-trip per server id (`None` = probed but unreachable; absent = not probed).
+    pub latency: HashMap<String, Option<Duration>>,
     /// Per-poll tx/rx byte deltas (≈ bytes/sec at the 1 Hz poll), for the throughput sparkline.
     pub tx_rate: Vec<u64>,
     pub rx_rate: Vec<u64>,
@@ -60,6 +83,11 @@ impl App {
             status: TunnelStatus::default(),
             message: String::new(),
             should_quit: false,
+            kill_switch: false,
+            filter: String::new(),
+            filtering: false,
+            sort_by_latency: false,
+            latency: HashMap::new(),
             tx_rate: Vec::new(),
             rx_rate: Vec::new(),
             prev_tx: 0,
@@ -73,27 +101,79 @@ impl App {
         self.spinner = self.spinner.wrapping_add(1);
     }
 
+    /// The servers currently shown: filtered by the search term, then ordered by latency (when
+    /// the latency sort is on) or left in the control plane's order (load-sorted upstream).
+    pub fn visible(&self) -> Vec<&ServerInfo> {
+        let needle = self.filter.to_lowercase();
+        let mut v: Vec<&ServerInfo> = self
+            .servers
+            .iter()
+            .filter(|s| server_matches(s, &needle))
+            .collect();
+        if self.sort_by_latency {
+            // Unmeasured / unreachable sort last (u128::MAX).
+            v.sort_by_key(|s| {
+                self.latency
+                    .get(&s.id)
+                    .and_then(|o| *o)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(u128::MAX)
+            });
+        }
+        v
+    }
+
     pub fn select_next(&mut self) {
-        if !self.servers.is_empty() {
-            self.selected = (self.selected + 1) % self.servers.len();
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected = (self.selected + 1) % n;
         }
     }
 
     pub fn select_prev(&mut self) {
-        if !self.servers.is_empty() {
-            self.selected = (self.selected + self.servers.len() - 1) % self.servers.len();
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected = (self.selected + n - 1) % n;
         }
     }
 
-    pub fn selected_server(&self) -> Option<&ServerInfo> {
-        self.servers.get(self.selected)
+    /// The id of the currently-selected visible server (clones so it doesn't borrow `self`).
+    pub fn selected_server_id(&self) -> Option<String> {
+        self.visible().get(self.selected).map(|s| s.id.clone())
     }
 
     pub fn set_servers(&mut self, servers: Vec<ServerInfo>) {
         self.servers = servers;
-        if self.selected >= self.servers.len() {
-            self.selected = 0;
+        self.clamp_selection();
+    }
+
+    /// Keep `selected` within the visible list after a filter/sort/list change.
+    pub fn clamp_selection(&mut self) {
+        let n = self.visible().len();
+        if self.selected >= n {
+            self.selected = n.saturating_sub(1);
         }
+    }
+
+    /// Toggle whether new connections arm the kill switch.
+    pub fn toggle_kill_switch(&mut self) {
+        self.kill_switch = !self.kill_switch;
+    }
+
+    /// Toggle latency vs. load ordering.
+    pub fn toggle_sort(&mut self) {
+        self.sort_by_latency = !self.sort_by_latency;
+        self.clamp_selection();
+    }
+
+    /// Record a latency probe result for a server.
+    pub fn set_latency(&mut self, id: String, rtt: Option<Duration>) {
+        self.latency.insert(id, rtt);
+    }
+
+    /// Look up a server's latency (outer `None` = not probed, inner `None` = unreachable).
+    pub fn latency_of(&self, id: &str) -> Option<Option<Duration>> {
+        self.latency.get(id).copied()
     }
 
     pub fn set_status(&mut self, status: TunnelStatus) {
@@ -204,7 +284,64 @@ mod tests {
         a.selected = 4;
         a.set_servers(Vec::new());
         assert_eq!(a.selected, 0);
-        assert!(a.selected_server().is_none());
+        assert!(a.selected_server_id().is_none());
+    }
+
+    #[test]
+    fn filter_narrows_the_visible_list_and_clamps_selection() {
+        let mut a = app_with(5); // ids s0..s4
+        a.servers[2].country = Some("Germany".into());
+        a.selected = 4;
+        a.filter = "s3".into();
+        a.clamp_selection();
+        assert_eq!(a.visible().len(), 1);
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.selected_server_id().as_deref(), Some("s3"));
+        // Filtering by country field, case-insensitively.
+        a.filter = "german".into();
+        assert_eq!(a.visible().len(), 1);
+        assert_eq!(a.selected_server_id().as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn sort_by_latency_orders_measured_first() {
+        let mut a = app_with(3); // s0, s1, s2
+        a.set_latency("s0".into(), Some(Duration::from_millis(80)));
+        a.set_latency("s1".into(), Some(Duration::from_millis(20)));
+        a.set_latency("s2".into(), None); // unreachable → last
+        a.sort_by_latency = true;
+        let order: Vec<&str> = a.visible().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(order, vec!["s1", "s0", "s2"]);
+    }
+
+    #[test]
+    fn kill_switch_toggles() {
+        let mut a = app_with(1);
+        assert!(!a.kill_switch);
+        a.toggle_kill_switch();
+        assert!(a.kill_switch);
+    }
+
+    #[test]
+    fn server_matches_checks_id_country_city() {
+        let s = ServerInfo {
+            id: "us-nyc-1".into(),
+            public_key: oxide_common::keys::public_from_secret(
+                &oxide_common::keys::generate_secret(),
+            ),
+            endpoint: "1.2.3.4:51820".into(),
+            country: Some("US".into()),
+            city: Some("New York".into()),
+            active_peers: 0,
+            capacity: 0,
+            healthy: true,
+            pq_public_key: None,
+        };
+        assert!(server_matches(&s, "")); // empty matches all
+        assert!(server_matches(&s, "nyc"));
+        assert!(server_matches(&s, "york"));
+        assert!(server_matches(&s, "us"));
+        assert!(!server_matches(&s, "berlin"));
     }
 
     #[test]

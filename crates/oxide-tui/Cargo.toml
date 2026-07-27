@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 oxide-common = { path = "../common" }
 oxide-control-client = { path = "../control-client" }
+oxide-client-core = { path = "../client-core" }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

@@ -77,6 +77,27 @@ async fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 async fn handle_key(app: &mut App, code: KeyCode) {
+    // While the filter input is active, keystrokes edit the search term.
+    if app.filtering {
+        match code {
+            KeyCode::Esc => {
+                app.filter.clear();
+                app.filtering = false;
+                app.clamp_selection();
+            }
+            KeyCode::Enter => app.filtering = false,
+            KeyCode::Backspace => {
+                app.filter.pop();
+                app.clamp_selection();
+            }
+            KeyCode::Char(c) => {
+                app.filter.push(c);
+                app.clamp_selection();
+            }
+            _ => {}
+        }
+        return;
+    }
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
@@ -84,9 +105,71 @@ async fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('r') => refresh_servers(app).await,
         KeyCode::Char('d') => disconnect(app).await,
         KeyCode::Char('n') => new_identity(app).await,
+        KeyCode::Char('/') => app.filtering = true,
+        KeyCode::Char('K') => {
+            app.toggle_kill_switch();
+            app.message = format!(
+                "kill switch {} for next connect",
+                if app.kill_switch { "ON" } else { "off" }
+            );
+        }
+        KeyCode::Char('t') => {
+            app.toggle_sort();
+            app.message = if app.sort_by_latency {
+                "sorted by latency".into()
+            } else {
+                "sorted by load".into()
+            };
+        }
+        KeyCode::Char('p') => probe_latencies(app).await,
+        KeyCode::Char('b') => quick_connect_best(app).await,
         KeyCode::Enter | KeyCode::Char('c') => connect_selected(app).await,
         _ => {}
     }
+}
+
+/// Measure latency to every visible server concurrently (a manual "TCP ping" sweep).
+async fn probe_latencies(app: &mut App) {
+    let targets: Vec<(String, String)> = app
+        .visible()
+        .iter()
+        .map(|s| (s.id.clone(), s.endpoint.clone()))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    app.message = format!("pinging {} servers…", targets.len());
+    let probes = targets.into_iter().map(|(id, endpoint)| async move {
+        let rtt = oxide_client_core::latency::tcp_ping(
+            &endpoint,
+            oxide_client_core::latency::DEFAULT_TIMEOUT,
+        )
+        .await;
+        (id, rtt)
+    });
+    for (id, rtt) in futures::future::join_all(probes).await {
+        app.set_latency(id, rtt);
+    }
+    app.message = "latency updated (press t to sort by it)".into();
+}
+
+/// Connect to the control plane's best (least-loaded) server — no manual pick needed.
+async fn quick_connect_best(app: &mut App) {
+    let req = AgentRequest::Connect {
+        control_plane: app.cp_url.clone(),
+        account: app.account.clone(),
+        server: None, // let the agent/control plane auto-select the best server
+        exit: None,
+        country: None,
+        kill_switch: app.kill_switch,
+    };
+    match agent_request(&app.socket, &req).await {
+        Ok(AgentResponse::Ok) => app.message = "quick-connecting to best server…".into(),
+        Ok(AgentResponse::Error { message }) => app.message = format!("connect failed: {message}"),
+        Ok(_) => {}
+        Err(e) => app.message = format!("agent unreachable: {e} (is oxide-agentd running?)"),
+    }
+    refresh_status(app).await;
 }
 
 async fn refresh_servers(app: &mut App) {
@@ -102,6 +185,37 @@ async fn refresh_servers(app: &mut App) {
     }
 }
 
+async fn connect_selected(app: &mut App) {
+    let Some(id) = app.selected_server_id() else {
+        app.message = "no server selected".into();
+        return;
+    };
+    let req = AgentRequest::Connect {
+        control_plane: app.cp_url.clone(),
+        account: app.account.clone(),
+        server: Some(id.clone()),
+        exit: None,
+        country: None,
+        kill_switch: app.kill_switch,
+    };
+    match agent_request(&app.socket, &req).await {
+        Ok(AgentResponse::Ok) => {
+            app.message = format!(
+                "connecting to {id}{}…",
+                if app.kill_switch {
+                    " (kill switch)"
+                } else {
+                    ""
+                }
+            )
+        }
+        Ok(AgentResponse::Error { message }) => app.message = format!("connect failed: {message}"),
+        Ok(_) => {}
+        Err(e) => app.message = format!("agent unreachable: {e} (is oxide-agentd running?)"),
+    }
+    refresh_status(app).await;
+}
+
 async fn refresh_status(app: &mut App) {
     match agent_request(&app.socket, &AgentRequest::Status).await {
         Ok(AgentResponse::Status(s)) => app.set_status(s),
@@ -109,29 +223,6 @@ async fn refresh_status(app: &mut App) {
         // Agent not running / unreachable: show disconnected.
         Err(_) => app.set_status(TunnelStatus::default()),
     }
-}
-
-async fn connect_selected(app: &mut App) {
-    let Some(server) = app.selected_server() else {
-        app.message = "no server selected".into();
-        return;
-    };
-    let id = server.id.clone();
-    let req = AgentRequest::Connect {
-        control_plane: app.cp_url.clone(),
-        account: app.account.clone(),
-        server: Some(id.clone()),
-        exit: None,
-        country: None,
-        kill_switch: false,
-    };
-    match agent_request(&app.socket, &req).await {
-        Ok(AgentResponse::Ok) => app.message = format!("connecting to {id}…"),
-        Ok(AgentResponse::Error { message }) => app.message = format!("connect failed: {message}"),
-        Ok(_) => {}
-        Err(e) => app.message = format!("agent unreachable: {e} (is oxide-agentd running?)"),
-    }
-    refresh_status(app).await;
 }
 
 async fn disconnect(app: &mut App) {
@@ -175,9 +266,9 @@ fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, header);
 
-    // --- body: server list ---
-    let items: Vec<ListItem> = app
-        .servers
+    // --- body: server list (filtered + optionally latency-sorted) ---
+    let visible = app.visible();
+    let items: Vec<ListItem> = visible
         .iter()
         .map(|s| {
             let loc = match (&s.country, &s.city) {
@@ -191,14 +282,34 @@ fn draw(f: &mut Frame, app: &App) {
                 s.active_peers.to_string()
             };
             let health = if s.healthy { "●" } else { "×" };
+            // Latency column: absent until probed, "—" if unreachable.
+            let lat = match app.latency_of(&s.id) {
+                None => String::new(),
+                Some(rtt) => oxide_client_core::latency::format_latency(rtt),
+            };
             ListItem::new(format!(
-                "{:<12} {:<16} load {:<9} {}",
-                s.id, loc, load, health
+                "{:<12} {:<16} load {:<9} {:>7} {}",
+                s.id, loc, load, lat, health
             ))
         })
         .collect();
+    let sort = if app.sort_by_latency {
+        "latency"
+    } else {
+        "load"
+    };
+    let title = if app.filter.is_empty() {
+        format!(" Servers ({}) · by {sort} ", visible.len())
+    } else {
+        format!(
+            " Servers ({}/{}) · filter \"{}\" · by {sort} ",
+            visible.len(),
+            app.servers.len(),
+            app.filter
+        )
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Servers "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .bg(Color::Blue)
@@ -206,13 +317,20 @@ fn draw(f: &mut Frame, app: &App) {
         )
         .highlight_symbol("▶ ");
     let mut list_state = ListState::default();
-    if !app.servers.is_empty() {
-        list_state.select(Some(app.selected));
+    if !visible.is_empty() {
+        list_state.select(Some(app.selected.min(visible.len() - 1)));
     }
     f.render_stateful_widget(list, body, &mut list_state);
 
     // --- footer: keys + last message ---
-    let help = "↑/↓ select · Enter connect · d disconnect · n new identity · r refresh · q quit";
+    let help = if app.filtering {
+        "type to filter · Enter apply · Esc clear".to_string()
+    } else {
+        let ks = if app.kill_switch { "KS on" } else { "KS off" };
+        format!(
+            "Enter connect · b best · d disconnect · n new-id · / filter · p ping · t sort · K kill-switch [{ks}] · q quit"
+        )
+    };
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -427,5 +545,33 @@ mod render_tests {
         let app = App::new("http://cp".into(), "acct".into(), "/tmp/s".into());
         let text = render(&app);
         assert!(text.contains("disconnected"));
+    }
+
+    #[test]
+    fn server_list_shows_filter_and_latency() {
+        use oxide_common::api::ServerInfo;
+        use std::time::Duration;
+        let mut app = App::new("http://cp".into(), "acct".into(), "/tmp/s".into());
+        let mk = |id: &str, country: &str| ServerInfo {
+            id: id.into(),
+            public_key: oxide_common::keys::public_from_secret(
+                &oxide_common::keys::generate_secret(),
+            ),
+            endpoint: "1.2.3.4:51820".into(),
+            country: Some(country.into()),
+            city: None,
+            active_peers: 3,
+            capacity: 100,
+            healthy: true,
+            pq_public_key: None,
+        };
+        app.set_servers(vec![mk("us-nyc-1", "US"), mk("de-fra-2", "DE")]);
+        app.set_latency("us-nyc-1".into(), Some(Duration::from_millis(24)));
+        app.filter = "nyc".into();
+        let text = render(&app);
+        assert!(text.contains("us-nyc-1"));
+        assert!(!text.contains("de-fra-2")); // filtered out
+        assert!(text.contains("24ms")); // latency column
+        assert!(text.contains("filter")); // title reflects the active filter
     }
 }

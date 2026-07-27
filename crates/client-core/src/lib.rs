@@ -27,6 +27,7 @@ use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink, TunDevice};
 use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport};
 
+pub mod latency;
 pub mod reconnect;
 pub mod split;
 pub use reconnect::{ConnEvent, ConnInfo, ReconnectPolicy, TunnelOutcome};
