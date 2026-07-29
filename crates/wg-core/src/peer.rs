@@ -6,10 +6,11 @@
 //! `.await` — so a blocking mutex is correct and cheap here.
 
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use boringtun::noise::Tunn;
 use ipnet::IpNet;
+use oxide_daita::Shaper;
 
 use crate::PublicKey;
 
@@ -27,6 +28,11 @@ pub struct Peer {
 
     /// Static public key (safe to log; used for diagnostics).
     pub public_key: PublicKey,
+
+    /// Per-peer DAITA shaper queue, created lazily when DAITA shaping is enabled. Each peer gets
+    /// its own so a multi-peer engine (a server shaping toward every client — bidirectional 4A)
+    /// drains each peer's real datagrams into cells sent to *that* peer's endpoint.
+    pub shaper: OnceLock<Arc<Shaper>>,
 }
 
 impl Peer {
@@ -41,7 +47,14 @@ impl Peer {
             endpoint: Mutex::new(endpoint),
             allowed_ips,
             public_key,
+            shaper: OnceLock::new(),
         }
+    }
+
+    /// This peer's shaper queue, creating it (with `cell_size`) on first use.
+    pub fn shaper(&self, cell_size: usize, max_queue: usize) -> &Arc<Shaper> {
+        self.shaper
+            .get_or_init(|| Arc::new(Shaper::new(cell_size, max_queue)))
     }
 
     pub fn endpoint(&self) -> Option<SocketAddr> {

@@ -71,7 +71,9 @@ pub struct State {
     pub transitions: Vec<(Event, usize)>,
 }
 
-/// A pacing state machine: states + sampled delays + event-driven transitions.
+/// A pacing state machine: states + sampled delays + event-driven transitions. `Clone` so it can
+/// serve as a per-peer template (each peer's shaper drives its own fresh copy).
+#[derive(Debug, Clone)]
 pub struct Machine {
     states: Vec<State>,
     current: usize,

@@ -556,6 +556,103 @@ async fn daita_counts_cover_and_real() {
 }
 
 #[tokio::test]
+async fn daita_shapes_bidirectionally() {
+    // Bidirectional 4A: BOTH ends shape. The server no longer merely frames replies — it
+    // generates its own paced cover toward each client, so server→client is protected too.
+    // We assert (1) a server→client real packet still crosses the shaped path, (2) the server
+    // emits its own cover cells, and (3) the client drops the server's inbound cover.
+    let obfs_key = [0x5e; 32];
+    let cell_size = oxide_daita::DEFAULT_CELL_SIZE;
+    let slot = Duration::from_millis(2);
+
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Server ALSO shapes now (was framing-only).
+    let (server_tun, srv_inject, _srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::obfuscated(server_udp, obfs_key),
+        server_tun,
+    )
+    .with_daita(Daita::shaping(cell_size, slot));
+
+    let (client_tun, client_inject, mut cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::obfuscated(client_udp, obfs_key),
+        client_tun,
+    )
+    .with_daita(Daita::shaping(cell_size, slot));
+
+    let server_handle = server.handle();
+    let client_handle = client.handle();
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    // Bring the tunnel up client→server first so the server learns the client's endpoint,
+    // then send a real packet server→client and require it over the shaped path.
+    let up = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"up",
+    );
+    client_inject.send(up).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let down = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 1),
+        Ipv4Addr::new(10, 8, 0, 2),
+        b"down over the shaped path",
+    );
+    srv_inject.send(down.clone()).unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(10), cli_capture.recv())
+        .await
+        .expect("timed out; server→client shaped path never delivered")
+        .expect("client tun channel closed");
+    assert_eq!(received, down);
+
+    // Let cover accrue both ways.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ss = server_handle.stats();
+    assert!(
+        ss.daita_tx_cover > 0,
+        "server should emit its OWN cover cells (bidirectional shaping)"
+    );
+    assert!(
+        ss.daita_tx_real >= 1,
+        "server should have emitted a real cell for the down packet"
+    );
+
+    let cs = client_handle.stats();
+    assert!(
+        cs.daita_rx_cover_dropped > 0,
+        "shaping client should drop the server's inbound cover cells"
+    );
+}
+
+#[tokio::test]
 async fn peer_added_at_runtime_comes_up() {
     // Same as above, but the server starts with NO peers and the client is added
     // live through the EngineHandle after the engine is already running — the path

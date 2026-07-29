@@ -41,6 +41,7 @@ use crate::daita::Daita;
 use crate::peer::Peer;
 use crate::table::{PeerId, PeerTable};
 use crate::transport::Transport;
+use oxide_daita::machine::Machine;
 
 /// Max datagram/packet we buffer. Tunnel MTU is 1420; WireGuard adds ~32 bytes of
 /// overhead. 2048 leaves comfortable headroom without being wasteful.
@@ -352,24 +353,26 @@ impl<T: TunQueue> Engine<T> {
             };
             if let Some(d) = datagram {
                 debug!(peer = %PublicKey(id).to_base64(), %endpoint, "initiating handshake");
-                let _ = Self::send_egress(shared, d, endpoint).await;
+                let _ = Self::send_egress(shared, &peer, d, endpoint).await;
             }
         }
     }
 
-    /// Send one WireGuard datagram toward a peer, applying DAITA if enabled:
-    ///   * shaping (client): enqueue for the constant-rate shaper (`endpoint` is ignored;
-    ///     the shaper sends to the single peer's endpoint each slot);
-    ///   * framing (server): wrap as a fixed-size real cell and send now;
+    /// Send one WireGuard datagram toward `peer`, applying DAITA if enabled:
+    ///   * shaping: enqueue on *this peer's* shaper (`endpoint` is ignored; the shaper task
+    ///     drains the queue to the peer's endpoint at the paced rate). Per-peer so a server
+    ///     shaping toward many clients routes each client's data to that client;
+    ///   * framing: wrap as a fixed-size real cell and send now;
     ///   * no DAITA: send the raw datagram.
     async fn send_egress(
         shared: &Arc<Shared<T>>,
+        peer: &Peer,
         datagram: Vec<u8>,
         endpoint: SocketAddr,
     ) -> std::io::Result<()> {
         match shared.daita.as_deref() {
             Some(d) if d.shape_egress => {
-                if !d.shaper.enqueue(datagram) {
+                if !peer.shaper(d.cell_size, d.max_queue).enqueue(datagram) {
                     trace!("daita: outbound datagram dropped (queue full or oversized)");
                 }
                 Ok(())
@@ -392,43 +395,64 @@ impl<T: TunQueue> Engine<T> {
         }
     }
 
-    /// The DAITA shaper task (client): every slot, send exactly one cell — a queued real
-    /// datagram if any, else a cover cell — to the single peer's endpoint. This is what
-    /// makes the client→server flow a constant-rate, constant-size, contentless stream.
+    /// The DAITA shaper task: for **every** peer we have an endpoint for, emit exactly one
+    /// cell per that peer's paced slot — a queued real datagram if any, else a cover cell —
+    /// to that peer's endpoint. On a client this shapes the single server flow; on a **server**
+    /// it shapes toward every connected client, so both directions carry a constant-rate,
+    /// constant-size, contentless stream (bidirectional cover, 4A).
+    ///
+    /// Each peer drives its own clone of the pacing state machine (`daita.machine` is the
+    /// template) so their cadences — and, under the adaptive machine, their active/idle
+    /// phases — are independent. Pacers are created when a peer first has an endpoint and
+    /// pruned when it goes away.
     async fn shaper_loop(shared: Arc<Shared<T>>, daita: Arc<Daita>) {
-        // The cell cadence is driven by the pacing state machine (4A): constant-rate is a single
-        // `Constant` state, adaptive a multi-state machine. `last_was_real` feeds it back each cell.
-        // (Only spawned when `shape_egress`, so `machine` is always `Some` here.)
-        let Some(machine) = daita.machine.as_ref() else {
+        // Only spawned when `shape_egress`, so `machine` is always `Some` here; it's the
+        // template each peer clones. Constant-rate is a single `Constant` state, adaptive a
+        // multi-state machine.
+        let Some(template) = daita.machine.as_ref() else {
             return;
         };
-        let mut last_was_real = false;
+        // Per-peer pacing state: the peer's machine clone plus its next-fire deadline.
+        let mut pacers: HashMap<PeerId, (Machine, tokio::time::Instant)> = HashMap::new();
+        // Fallback poll cadence while no peer has an endpoint yet (nothing to pace).
+        const IDLE_POLL: Duration = Duration::from_millis(5);
         loop {
-            let delay = machine.lock().unwrap().next_delay(last_was_real);
-            tokio::time::sleep(delay).await;
-            // v1 targets the single-peer client: find the one peer we have an endpoint for.
-            let endpoint = shared
-                .table
-                .read()
-                .unwrap()
-                .snapshot()
-                .into_iter()
-                .find_map(|(_, p)| p.endpoint());
-            let Some(ep) = endpoint else {
-                // No endpoint yet (not configured/learned) — nothing to send toward.
-                continue;
-            };
-            let cell = daita.shaper.next_cell();
-            // Classify by the emitted cell's tag byte (race-free vs. inspecting the queue):
-            // a real datagram was drained if the tag is REAL, otherwise a cover cell filled
-            // the slot.
-            last_was_real = cell.first() == Some(&oxide_daita::REAL);
-            if last_was_real {
-                shared.daita_tx_real.fetch_add(1, Ordering::Relaxed);
-            } else {
-                shared.daita_tx_cover.fetch_add(1, Ordering::Relaxed);
+            let now = tokio::time::Instant::now();
+            // Seed a pacer for any peer that now has an endpoint; forget peers that are gone.
+            let mut present: HashMap<PeerId, Arc<Peer>> = HashMap::new();
+            for (id, peer) in shared.table.read().unwrap().snapshot() {
+                if peer.endpoint().is_some() {
+                    pacers.entry(id).or_insert_with(|| (template.clone(), now));
+                    present.insert(id, peer);
+                }
             }
-            let _ = shared.transport.send_to(&cell, ep).await;
+            pacers.retain(|id, _| present.contains_key(id));
+
+            // Fire every peer whose slot is due; track the soonest deadline to sleep until.
+            let mut next_deadline: Option<tokio::time::Instant> = None;
+            for (id, (machine, fire_at)) in pacers.iter_mut() {
+                if *fire_at <= now {
+                    let peer = &present[id];
+                    let Some(ep) = peer.endpoint() else { continue };
+                    let cell = peer.shaper(daita.cell_size, daita.max_queue).next_cell();
+                    // Classify by the emitted cell's tag byte (race-free vs. inspecting the
+                    // queue): real if a datagram was drained, else a cover cell filled the slot.
+                    let was_real = cell.first() == Some(&oxide_daita::REAL);
+                    if was_real {
+                        shared.daita_tx_real.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        shared.daita_tx_cover.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = shared.transport.send_to(&cell, ep).await;
+                    *fire_at = now + machine.next_delay(was_real);
+                }
+                next_deadline = Some(match next_deadline {
+                    Some(d) => d.min(*fire_at),
+                    None => *fire_at,
+                });
+            }
+
+            tokio::time::sleep_until(next_deadline.unwrap_or_else(|| now + IDLE_POLL)).await;
         }
     }
 
@@ -470,7 +494,7 @@ impl<T: TunQueue> Engine<T> {
                     // route flap) must drop this one packet, NOT tear down the data plane —
                     // the other loops already tolerate it, and the tunnel should ride
                     // through blips (esp. under the kill switch / reconnect).
-                    if let Err(e) = Self::send_egress(&shared, d, ep).await {
+                    if let Err(e) = Self::send_egress(&shared, &peer, d, ep).await {
                         debug!(?e, "outbound send failed; dropping packet");
                     }
                 }
@@ -595,7 +619,7 @@ impl<T: TunQueue> Engine<T> {
             }
 
             for d in to_network {
-                let _ = Self::send_egress(shared, d, src).await;
+                let _ = Self::send_egress(shared, &peer, d, src).await;
             }
             if let Some(pkt) = to_tun {
                 if let Err(e) = shared.tun.send(&pkt).await {
@@ -626,7 +650,7 @@ impl<T: TunQueue> Engine<T> {
                 };
                 if let Some(d) = datagram {
                     if let Some(ep) = peer.endpoint() {
-                        let _ = Self::send_egress(&shared, d, ep).await;
+                        let _ = Self::send_egress(&shared, &peer, d, ep).await;
                     }
                 }
             }

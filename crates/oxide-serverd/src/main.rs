@@ -399,11 +399,18 @@ async fn run(config_path: PathBuf) -> Result<()> {
         tun,
         HANDSHAKE_LIMIT,
     );
-    // DAITA (traffic-analysis defense): the server frames replies as cells and drops
-    // inbound cover; the client drives the constant rate. Requires a stealth transport.
+    // DAITA (traffic-analysis defense): the server shapes toward *every* connected client —
+    // one paced, fixed-size cell stream per peer with cover filling idle slots — so the
+    // server→client direction is protected too, not just client→server (bidirectional, 4A).
+    // Honour `daita_adaptive` to match the client's machine. Requires a stealth transport.
     let engine = if cfg.interface.daita {
-        info!("DAITA enabled (server framing mode)");
-        engine.with_daita(Daita::server())
+        if cfg.interface.daita_adaptive {
+            info!("DAITA enabled (server shaping, adaptive)");
+            engine.with_daita(Daita::server_adaptive())
+        } else {
+            info!("DAITA enabled (server shaping, constant-rate)");
+            engine.with_daita(Daita::server())
+        }
     } else {
         engine
     };
