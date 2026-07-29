@@ -58,7 +58,7 @@ const SERVER_COLUMNS: &str =
 const ADMIN_SERVER_COLUMNS: &str = "id, endpoint, country, city, capacity, active_peers, \
     last_heartbeat, transport, daita, obfuscation_key, pq_public_key, tx_bytes_total, \
     rx_bytes_total, daita_tx_real, daita_tx_cover, daita_rx_cover_dropped, decap_probes, \
-    created_at";
+    obfs_decode_failures, decoy_forwards, created_at";
 
 /// Max requests per source IP per [`RATE_WINDOW`]. Protects the account-number bearer
 /// auth from brute force and the account-creation endpoint from abuse.
@@ -248,6 +248,7 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
         .fetch_all(
             "SELECT id, active_peers, capacity, last_heartbeat, tx_bytes_total, rx_bytes_total, \
              daita_tx_real, daita_tx_cover, daita_rx_cover_dropped, decap_probes, \
+             obfs_decode_failures, decoy_forwards, \
              transport, daita, obfuscation_key, pq_public_key FROM servers ORDER BY id",
             &[],
         )
@@ -324,6 +325,20 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
         "Inbound demux decapsulate probes (efficiency: ~1 per packet steady-state).",
         &rows,
         "decap_probes",
+    );
+    counter_series(
+        &mut out,
+        "oxide_server_obfs_decode_failures_total",
+        "Undecodable inbound datagrams dropped by the stealth layer (scans/probes/junk).",
+        &rows,
+        "obfs_decode_failures",
+    );
+    counter_series(
+        &mut out,
+        "oxide_server_decoy_forwards_total",
+        "Unauthenticated Initials spliced to the decoy backend (active-probe deflections).",
+        &rows,
+        "decoy_forwards",
     );
 
     // Fleet feature-adoption gauges (how many servers run each defense/transport). Same
@@ -1018,7 +1033,8 @@ async fn server_heartbeat(
         .execute(
             "UPDATE servers SET active_peers = ?, last_heartbeat = ?,
                  tx_bytes_total = ?, rx_bytes_total = ?, last_tx_bytes = ?, last_rx_bytes = ?,
-                 daita_tx_real = ?, daita_tx_cover = ?, daita_rx_cover_dropped = ?, decap_probes = ?
+                 daita_tx_real = ?, daita_tx_cover = ?, daita_rx_cover_dropped = ?, decap_probes = ?,
+                 obfs_decode_failures = ?, decoy_forwards = ?
              WHERE id = ?",
             &[
                 Val::from(hb.active_peers as i64),
@@ -1031,6 +1047,8 @@ async fn server_heartbeat(
                 Val::from(hb.daita_tx_cover as i64),
                 Val::from(hb.daita_rx_cover_dropped as i64),
                 Val::from(hb.decap_probes as i64),
+                Val::from(hb.obfs_decode_failures as i64),
+                Val::from(hb.decoy_forwards as i64),
                 Val::from(server_id.as_str()),
             ],
         )
@@ -1252,6 +1270,8 @@ fn admin_server_info_from_row(row: &DbRow) -> AdminServerInfo {
         daita_tx_cover: row.int("daita_tx_cover").max(0) as u64,
         daita_rx_cover_dropped: row.int("daita_rx_cover_dropped").max(0) as u64,
         decap_probes: row.int("decap_probes").max(0) as u64,
+        obfs_decode_failures: row.int("obfs_decode_failures").max(0) as u64,
+        decoy_forwards: row.int("decoy_forwards").max(0) as u64,
         last_heartbeat_secs,
         created_at: row.int("created_at"),
     }

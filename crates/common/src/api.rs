@@ -88,6 +88,12 @@ pub struct HeartbeatRequest {
     /// Inbound demux probes since start (efficiency: probes per packet).
     #[serde(default)]
     pub decap_probes: u64,
+    /// Undecodable inbound datagrams dropped by the stealth (obfs) layer — scans/probes/junk.
+    #[serde(default)]
+    pub obfs_decode_failures: u64,
+    /// Unauthenticated Initials spliced to the decoy backend (active-probe deflections).
+    #[serde(default)]
+    pub decoy_forwards: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +308,12 @@ pub struct AdminServerInfo {
     /// Inbound demux probes (efficiency signal).
     #[serde(default)]
     pub decap_probes: u64,
+    /// Undecodable inbound datagrams dropped by the stealth layer (scans/probes/junk).
+    #[serde(default)]
+    pub obfs_decode_failures: u64,
+    /// Unauthenticated Initials spliced to the decoy backend (active-probe deflections).
+    #[serde(default)]
+    pub decoy_forwards: u64,
     /// Seconds since the last heartbeat, or `None` if the server has never heartbeated.
     #[serde(default)]
     pub last_heartbeat_secs: Option<i64>,

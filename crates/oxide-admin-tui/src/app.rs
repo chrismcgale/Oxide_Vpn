@@ -495,6 +495,8 @@ mod tests {
             daita_tx_cover: 0,
             daita_rx_cover_dropped: 0,
             decap_probes: 0,
+            obfs_decode_failures: 0,
+            decoy_forwards: 0,
             last_heartbeat_secs: Some(5),
             created_at,
         }

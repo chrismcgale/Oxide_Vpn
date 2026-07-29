@@ -579,6 +579,8 @@ async fn poll_control_plane<T: TunQueue>(
             daita_tx_cover: stats.daita_tx_cover,
             daita_rx_cover_dropped: stats.daita_rx_cover_dropped,
             decap_probes: stats.decap_probes,
+            obfs_decode_failures: stats.obfs_decode_failures,
+            decoy_forwards: stats.decoy_forwards,
         };
         if let Err(e) = client.heartbeat(&cp.server_id, &cp.token, &report).await {
             warn!(error = %e, "heartbeat failed");

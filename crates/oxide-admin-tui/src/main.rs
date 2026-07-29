@@ -538,6 +538,17 @@ fn draw_server_detail(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     lines.push(kv("demux", format!("{} probes", s.decap_probes)));
+    // Stealth / probe-resistance activity: junk dropped by the obfs layer + Initials deflected
+    // to the decoy backend. Shown for a stealth server (obfs/quic/mimic).
+    if s.stealth || s.transport.as_deref().is_some_and(|t| t != "plain") {
+        lines.push(kv(
+            "stealth",
+            format!(
+                "obfs-drop {} · decoy {}",
+                s.obfs_decode_failures, s.decoy_forwards
+            ),
+        ));
+    }
 
     // Per-server throughput-over-time, built from this server's own byte-total deltas.
     lines.push(Line::from(""));
@@ -556,7 +567,6 @@ fn draw_server_detail(f: &mut Frame, app: &App, area: Rect) {
         ))),
     }
 
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  R rotate token",
         Style::default().fg(Color::DarkGray),
@@ -718,6 +728,8 @@ mod render_tests {
                 daita_tx_cover: 0,
                 daita_rx_cover_dropped: 5678,
                 decap_probes: 42,
+                obfs_decode_failures: 90,
+                decoy_forwards: 7,
                 last_heartbeat_secs: Some(3),
                 created_at: 0,
             },
@@ -739,6 +751,8 @@ mod render_tests {
                 daita_tx_cover: 0,
                 daita_rx_cover_dropped: 0,
                 decap_probes: 0,
+                obfs_decode_failures: 0,
+                decoy_forwards: 0,
                 last_heartbeat_secs: Some(200),
                 created_at: 0,
             },
@@ -780,6 +794,9 @@ mod render_tests {
         assert!(text.contains("real ↑1234"), "daita real cells");
         assert!(text.contains("drop ↓5678"), "daita cover dropped");
         assert!(text.contains("42 probes"), "demux probes");
+        // us-a is quic (a stealth transport) with obfs=90 / decoy=7 in the fixture.
+        assert!(text.contains("obfs-drop 90"), "obfs decode failures");
+        assert!(text.contains("decoy 7"), "decoy forwards");
     }
 
     #[test]

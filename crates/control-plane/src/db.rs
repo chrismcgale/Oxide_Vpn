@@ -347,6 +347,8 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
             daita_tx_cover INTEGER NOT NULL DEFAULT 0,
             daita_rx_cover_dropped INTEGER NOT NULL DEFAULT 0,
             decap_probes   INTEGER NOT NULL DEFAULT 0,
+            obfs_decode_failures INTEGER NOT NULL DEFAULT 0,
+            decoy_forwards INTEGER NOT NULL DEFAULT 0,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
@@ -407,6 +409,8 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN daita_tx_cover INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN daita_rx_cover_dropped INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN decap_probes INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN obfs_decode_failures INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN decoy_forwards INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
         // Concurrency-safe allocation constraints (2C), added idempotently so existing
         // databases pick them up. On a legacy DB that already holds duplicates, index
@@ -452,6 +456,8 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
             daita_tx_cover BIGINT NOT NULL DEFAULT 0,
             daita_rx_cover_dropped BIGINT NOT NULL DEFAULT 0,
             decap_probes   BIGINT NOT NULL DEFAULT 0,
+            obfs_decode_failures BIGINT NOT NULL DEFAULT 0,
+            decoy_forwards BIGINT NOT NULL DEFAULT 0,
             created_at     BIGINT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS devices (
@@ -498,6 +504,8 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita_tx_cover BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita_rx_cover_dropped BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS decap_probes BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS obfs_decode_failures BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS decoy_forwards BIGINT NOT NULL DEFAULT 0",
     ];
     for stmt in statements {
         sqlx::query(stmt)

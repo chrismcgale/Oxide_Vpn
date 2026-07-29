@@ -323,6 +323,8 @@ async fn metrics_report_counts_and_load() {
             daita_tx_cover: 0,
             daita_rx_cover_dropped: 222,
             decap_probes: 333,
+            obfs_decode_failures: 444,
+            decoy_forwards: 55,
         },
     )
     .await
@@ -347,6 +349,8 @@ async fn metrics_report_counts_and_load() {
     assert!(text.contains("oxide_server_daita_tx_real_total{server=\"m-1\"} 111"));
     assert!(text.contains("oxide_server_daita_rx_cover_dropped_total{server=\"m-1\"} 222"));
     assert!(text.contains("oxide_server_decap_probes_total{server=\"m-1\"} 333"));
+    assert!(text.contains("oxide_server_obfs_decode_failures_total{server=\"m-1\"} 444"));
+    assert!(text.contains("oxide_server_decoy_forwards_total{server=\"m-1\"} 55"));
     // Prometheus format sanity: HELP/TYPE headers present, incl. a counter type.
     assert!(text.contains("# TYPE oxide_accounts_total gauge"));
     assert!(text.contains("# TYPE oxide_server_tx_bytes_total counter"));
@@ -756,6 +760,8 @@ async fn admin_read_endpoints_and_byte_accounting() {
             rx_bytes: 100,
             daita_tx_real: 9,
             daita_rx_cover_dropped: 77,
+            obfs_decode_failures: 12,
+            decoy_forwards: 3,
             ..Default::default()
         },
     )
@@ -777,9 +783,11 @@ async fn admin_read_endpoints_and_byte_accounting() {
     assert_eq!(quic.rx_bytes_total, 8_100);
     assert_eq!(quic.active_peers, 4);
     assert_eq!(quic.transport.as_deref(), Some("quic"));
-    // Runtime DAITA counters flow through the admin API (raw-latest reading).
+    // Runtime DAITA + stealth-defense counters flow through the admin API (raw-latest reading).
     assert_eq!(quic.daita_tx_real, 9);
     assert_eq!(quic.daita_rx_cover_dropped, 77);
+    assert_eq!(quic.obfs_decode_failures, 12);
+    assert_eq!(quic.decoy_forwards, 3);
     assert!(quic.daita);
     assert!(quic.post_quantum);
     assert!(!quic.stealth);
