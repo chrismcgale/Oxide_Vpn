@@ -631,6 +631,28 @@ impl<T: TunQueue> EngineHandle<T> {
     pub fn remove_peer(&self, public_key: &PublicKey) {
         let id = public_key.0;
         self.shared.table.write().unwrap().remove(&id);
+        self.prune_caches(id);
+    }
+
+    /// Replace a peer's session with a fresh one built from `params` — used to **rotate the
+    /// preshared key** at runtime (boringtun fixes the PSK at `Tunn::new`, so a rotation must
+    /// recreate the `Tunn`). The old session and its keys drop; a new handshake follows, so the
+    /// far end must rotate to the same PSK for traffic to resume. Endpoint/allowed-IPs/keepalive
+    /// come from `params` (a server passes `endpoint: None` and re-learns it from the next
+    /// inbound packet). Demux caches for this peer are pruned, like `remove_peer`.
+    pub fn replace_peer(&self, params: PeerParams) {
+        let id = params.public_key.0;
+        {
+            let mut table = self.shared.table.write().unwrap();
+            table.remove(&id);
+            table.add(params);
+        }
+        self.prune_caches(id);
+    }
+
+    /// Drop any cached source-address / receiver-index mappings pointing at `id` (a removed or
+    /// replaced peer), so stale entries never route to a dead session.
+    fn prune_caches(&self, id: PeerId) {
         self.shared
             .addr_to_peer
             .lock()

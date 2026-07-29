@@ -798,3 +798,102 @@ async fn tunnel_carries_a_packet_over_ipv6_underlay() {
         "packet must traverse the v6-underlay tunnel unchanged"
     );
 }
+
+#[tokio::test]
+async fn psk_rotates_at_runtime_without_reconnect() {
+    // 4B continuous rekey: rotate the preshared key on a live tunnel. boringtun fixes the PSK at
+    // Tunn::new, so `replace_peer` recreates the session; when BOTH ends rotate to the same new
+    // PSK a fresh handshake brings traffic back, and a one-sided rotation must break (proving the
+    // PSK is actually enforced end to end). The TUN/engine stay up throughout — no reconnect.
+    let psk_a = [0xA1u8; 32];
+    let psk_b = [0xB2u8; 32];
+
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Peer params per end; only the PSK changes on rotation.
+    let server_peer = |psk: [u8; 32]| PeerParams {
+        public_key: client_pub,
+        preshared_key: Some(psk),
+        endpoint: None, // server learns the client's endpoint from inbound packets
+        allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+        persistent_keepalive: None,
+    };
+    let client_peer = |psk: [u8; 32]| PeerParams {
+        public_key: server_pub,
+        preshared_key: Some(psk),
+        endpoint: Some(server_addr),
+        allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+        persistent_keepalive: Some(5),
+    };
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![server_peer(psk_a)],
+        Transport::plain(server_udp),
+        server_tun,
+    );
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![client_peer(psk_a)],
+        Transport::plain(client_udp),
+        client_tun,
+    );
+
+    let server_h = server.handle();
+    let client_h = client.handle();
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    // Helper: inject a packet at the client and wait (bounded) for it at the server.
+    async fn crosses(
+        inject: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        capture: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        within: Duration,
+    ) -> bool {
+        let pkt = ipv4_packet(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::new(10, 8, 0, 1),
+            b"rekey probe",
+        );
+        // Send a few times so a handshake has slots to complete within the window.
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let _ = inject.send(pkt.clone());
+            match tokio::time::timeout(Duration::from_millis(250), capture.recv()).await {
+                Ok(Some(got)) => return got == pkt,
+                _ if tokio::time::Instant::now() >= deadline => return false,
+                _ => continue,
+            }
+        }
+    }
+
+    // PSK_A works.
+    assert!(
+        crosses(&client_inject, &mut srv_capture, Duration::from_secs(10)).await,
+        "tunnel must work with the initial PSK"
+    );
+
+    // Rotate BOTH ends to PSK_B → a fresh handshake resumes traffic.
+    client_h.replace_peer(client_peer(psk_b));
+    server_h.replace_peer(server_peer(psk_b));
+    assert!(
+        crosses(&client_inject, &mut srv_capture, Duration::from_secs(10)).await,
+        "tunnel must resume after both ends rotate to the new PSK"
+    );
+
+    // Rotate ONLY the client (server still on PSK_B) → mismatch, no traffic.
+    client_h.replace_peer(client_peer([0xC3u8; 32]));
+    assert!(
+        !crosses(&client_inject, &mut srv_capture, Duration::from_secs(2)).await,
+        "a one-sided PSK rotation must break the tunnel (PSK is enforced)"
+    );
+}
