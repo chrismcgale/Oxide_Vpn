@@ -396,9 +396,20 @@ impl<T: TunQueue> Engine<T> {
     /// datagram if any, else a cover cell — to the single peer's endpoint. This is what
     /// makes the client→server flow a constant-rate, constant-size, contentless stream.
     async fn shaper_loop(shared: Arc<Shared<T>>, daita: Arc<Daita>) {
+        // Constant-rate DAITA uses a fixed-cadence interval; adaptive pacing (4A) sleeps for the
+        // pacer's jittered/tapered delay each iteration. `last_was_real` feeds the pacer's state.
         let mut tick = interval(daita.slot);
+        let mut last_was_real = false;
         loop {
-            tick.tick().await;
+            match &daita.pacer {
+                Some(pacer) => {
+                    let delay = pacer.lock().unwrap().next_delay(last_was_real);
+                    tokio::time::sleep(delay).await;
+                }
+                None => {
+                    tick.tick().await;
+                }
+            }
             // v1 targets the single-peer client: find the one peer we have an endpoint for.
             let endpoint = shared
                 .table
@@ -415,7 +426,8 @@ impl<T: TunQueue> Engine<T> {
             // Classify by the emitted cell's tag byte (race-free vs. inspecting the queue):
             // a real datagram was drained if the tag is REAL, otherwise a cover cell filled
             // the slot.
-            if cell.first() == Some(&oxide_daita::REAL) {
+            last_was_real = cell.first() == Some(&oxide_daita::REAL);
+            if last_was_real {
                 shared.daita_tx_real.fetch_add(1, Ordering::Relaxed);
             } else {
                 shared.daita_tx_cover.fetch_add(1, Ordering::Relaxed);

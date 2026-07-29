@@ -169,6 +169,13 @@ pub struct InterfaceConfig {
     #[serde(default)]
     pub daita: bool,
 
+    /// Use the **adaptive** DAITA pacer (Sprint 4A) for client egress instead of the fixed
+    /// constant-rate slot: jittered inter-cell timing + an idle taper. Requires `daita = true`.
+    /// Trades a little active/idle envelope leakage for much less idle bandwidth cost (see the
+    /// `oxide_daita::pacer` docs). Client-only (a server just frames cells).
+    #[serde(default)]
+    pub daita_adaptive: bool,
+
     /// Split tunnelling (client-side): route **only** these CIDRs through the tunnel, on top
     /// of any specific `allowed_ips` the peer already implies. Ignored on a full-tunnel peer
     /// (a `0.0.0.0/0` peer already routes everything). Empty = derive routes from the peers'
@@ -260,6 +267,11 @@ impl Config {
                 "daita = true requires a stealth transport (set transport = \
                  \"obfs\"/\"quic\"/\"mimic\" and an obfuscation_key)"
                     .into(),
+            ));
+        }
+        if self.interface.daita_adaptive && !self.interface.daita {
+            return Err(Error::Config(
+                "daita_adaptive = true requires daita = true".into(),
             ));
         }
         if self.interface.transport_kind().is_stealth() && self.interface.obfuscation_key.is_none()
@@ -403,6 +415,31 @@ mod tests {
             allowed_ips = ["10.8.0.2/32"]
         "#;
         assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn daita_adaptive_requires_daita() {
+        // adaptive pacing on, but daita off → rejected.
+        let toml = r#"
+            [interface]
+            private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            address = "10.8.0.1/24"
+            transport = "obfs"
+            obfuscation_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            daita_adaptive = true
+            [[peer]]
+            public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allowed_ips = ["10.8.0.2/32"]
+        "#;
+        assert!(Config::from_toml_str(toml).is_err());
+
+        // daita + adaptive + stealth → accepted, and the flag parses through.
+        let ok = toml.replace(
+            "daita_adaptive = true",
+            "daita = true\ndaita_adaptive = true",
+        );
+        let cfg = Config::from_toml_str(&ok).expect("daita + adaptive + stealth is valid");
+        assert!(cfg.interface.daita_adaptive);
     }
 
     #[test]

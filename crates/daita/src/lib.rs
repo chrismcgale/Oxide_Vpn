@@ -37,6 +37,8 @@ use std::sync::Mutex;
 
 use rand_core::{OsRng, RngCore};
 
+pub mod pacer;
+
 /// Cell type tag: carries a real WireGuard datagram.
 pub const REAL: u8 = 1;
 /// Cell type tag: cover traffic — dropped by the peer, no WireGuard payload.

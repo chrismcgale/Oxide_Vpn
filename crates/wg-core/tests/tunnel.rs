@@ -897,3 +897,75 @@ async fn psk_rotates_at_runtime_without_reconnect() {
         "a one-sided PSK rotation must break the tunnel (PSK is enforced)"
     );
 }
+
+#[tokio::test]
+async fn tunnel_works_with_adaptive_daita_pacing() {
+    // 4A: the client shapes egress with the ADAPTIVE pacer (jittered timing + idle taper) instead
+    // of a fixed slot. Same real WireGuard tunnel; assert a packet still crosses and the server
+    // still drops the (now adaptively-paced) cover cells.
+    let obfs_key = [0x9d; 32];
+    let cell_size = oxide_daita::DEFAULT_CELL_SIZE;
+    let slot = Duration::from_millis(2); // fast base cadence so the handshake completes quickly
+
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::obfuscated(server_udp, obfs_key),
+        server_tun,
+    )
+    .with_daita(Daita::framing(cell_size));
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::obfuscated(client_udp, obfs_key),
+        client_tun,
+    )
+    .with_daita(Daita::shaping_adaptive(cell_size, slot));
+
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"adaptive daita works",
+    );
+    client_inject.send(packet.clone()).unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; adaptively-paced DAITA tunnel never delivered")
+        .expect("server tun channel closed");
+    assert_eq!(received, packet);
+
+    // Cover cells (now adaptively paced) must still be recognized and dropped, not surfaced.
+    let leaked = tokio::time::timeout(Duration::from_millis(300), srv_capture.recv()).await;
+    assert!(
+        leaked.is_err(),
+        "adaptive cover must be dropped, not leak to the tunnel"
+    );
+}

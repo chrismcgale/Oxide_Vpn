@@ -248,6 +248,7 @@ pub async fn resolve_mesh(req: &MeshRequest) -> Result<Resolved> {
         decoy_backend: None,
         transport: TransportKind::default(),
         daita: false,
+        daita_adaptive: false,
         split_include: Vec::new(),
         split_exclude: Vec::new(),
     };
@@ -321,6 +322,8 @@ pub fn resolve_registration(
         decoy_backend: None,
         transport,
         daita: reg.daita,
+        // Adaptive pacing isn't distributed via the control plane yet — a static-config choice.
+        daita_adaptive: false,
         split_include: Vec::new(),
         split_exclude: Vec::new(),
     };
@@ -525,10 +528,16 @@ where
     let transport = build_client_transport(kind, bind_port, &peers, key).await?;
 
     let engine = Engine::build(&iface.private_key, peers, transport, tun);
-    // DAITA (traffic-analysis defense): shape client egress to a constant rate + cover.
+    // DAITA (traffic-analysis defense): shape client egress. Adaptive (4A) = jittered timing +
+    // idle taper; otherwise the constant-rate slot.
     let engine = if iface.daita {
-        info!("DAITA enabled (client shaping mode)");
-        engine.with_daita(Daita::client())
+        if iface.daita_adaptive {
+            info!("DAITA enabled (client adaptive pacing)");
+            engine.with_daita(Daita::client_adaptive())
+        } else {
+            info!("DAITA enabled (client shaping mode)");
+            engine.with_daita(Daita::client())
+        }
     } else {
         engine
     };
