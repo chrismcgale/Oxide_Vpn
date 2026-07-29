@@ -343,16 +343,18 @@ crypto/format parts; seccomp test runs in CI.
 
 ### WAVE 4 — Advanced privacy / research bets
 
-- [~] **4A Adaptive DAITA** — *opened (2026-07-29).* First maybenot-style increment: a pure
-  `daita::pacer::Pacer` state machine (Active/Idle) that decides the **delay** before each cell
-  instead of a fixed slot — **jittered timing** (±25%, no fixed inter-cell interval for ML to lock
-  onto, same average rate active) + an **idle taper** (cadence grows to `slot*max_mult` when
-  cover-only, cutting idle cost; leaks the active/idle envelope — the maybenot cost/leak knob).
-  Wired into the engine `shaper_loop` (sleeps the pacer's delay vs the fixed interval); opt-in via
-  `interface.daita_adaptive` (client-only, requires `daita`). Pure state tests + a loopback
-  adaptive-tunnel test. *Remaining:* full maybenot machine framework (multiple states/distributions),
-  **bidirectional** shaping (server-side cover, not just framing), per-hop/multihop cover, and CP
-  distribution of the adaptive choice. 180 tests.
+- [~] **4A Adaptive DAITA** — *core DONE (2026-07-29); two follow-ons remain.* Maybenot-style
+  adaptive pacing, now on a **full state-machine framework**: `daita::machine::Machine` — a
+  data-defined `Vec<State>` (each a delay `Dist` `Constant`/`Uniform` + optional cover-limit +
+  event-driven `transitions`), `next_delay(last_was_real)` transitions then samples. Constant-rate
+  is a 1-state machine, adaptive the old Active/Idle as 2 states (**jittered timing** ±25% +
+  **idle taper** to `slot*max_mult`, leaking only the active/idle envelope — the maybenot knob);
+  arbitrary graphs (bursts, multi-phase) now expressible + unit-tested. **Bidirectional shaping
+  DONE:** shaping is now **per-peer** (`Peer.shaper: OnceLock<Arc<Shaper>>`, `Daita` holds the
+  machine as a per-peer template) and the **server shapes toward every client** (was framing-only)
+  via a multi-peer `shaper_loop` scheduler — so both directions carry paced cover. Opt-in via
+  `interface.daita_adaptive`; serverd honours it. `daita_shapes_bidirectionally` + machine/loopback
+  tests. *Remaining:* per-hop/multihop cover + CP distribution of the adaptive choice. 184 tests.
 - [x] **4B Continuous rekey / PSK rotation** — *DONE + LIVE-VERIFIED (2026-07-29).* Rotate
   the PQ-derived WireGuard PSK at runtime for forward secrecy beyond WG's ephemeral rekey.
   **wg-core**: `EngineHandle::replace_peer` recreates a peer's `Tunn` with a new PSK (boringtun
