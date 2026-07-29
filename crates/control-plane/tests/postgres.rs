@@ -101,6 +101,16 @@ async fn full_flow_on_postgres() {
     assert!(metrics.contains(&format!(
         "oxide_server_capacity{{server=\"{server_id}\"}} 50"
     )));
+    // Phase-1 enrichment renders on Postgres: per-server byte counter, up gauge, and the
+    // stealth adoption gauge (this server has an obfuscation key; never heartbeated → up=1).
+    assert!(metrics.contains(&format!(
+        "oxide_server_tx_bytes_total{{server=\"{server_id}\"}} 0"
+    )));
+    assert!(metrics.contains(&format!("oxide_server_up{{server=\"{server_id}\"}} 1")));
+    // Fleet adoption gauges render (exact count isn't asserted here — the shared PG database
+    // may hold servers from other test runs; the fresh-SQLite test pins the values).
+    assert!(metrics.contains("# TYPE oxide_servers_stealth gauge"));
+    assert!(metrics.contains("# TYPE oxide_server_tx_bytes_total counter"));
 
     // 2C multi-node correctness against live Postgres: with no cross-node lock, N concurrent
     // registrations must each get a distinct IP — the UNIQUE(server_id, tunnel_ip) index +

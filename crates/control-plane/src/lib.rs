@@ -213,6 +213,15 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
             "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
         ));
     };
+    // A per-server labelled counter series: one HELP/TYPE header, then a line per server.
+    let counter_series = |out: &mut String, name: &str, help: &str, rows: &[DbRow], col: &str| {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+        for row in rows {
+            let id = row.text("id");
+            let v = row.int(col);
+            out.push_str(&format!("{name}{{server=\"{id}\"}} {v}\n"));
+        }
+    };
     gauge(
         &mut out,
         "oxide_accounts_total",
@@ -232,13 +241,16 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
         devices,
     );
 
-    // Per-server live load (last heartbeat) and capacity.
+    // Per-server load, capacity, health, bandwidth, and the columns needed for fleet
+    // feature-adoption gauges — one query feeds all the per-server series below.
     let rows = pool
         .fetch_all(
-            "SELECT id, active_peers, capacity FROM servers ORDER BY id",
+            "SELECT id, active_peers, capacity, last_heartbeat, tx_bytes_total, rx_bytes_total, \
+             transport, daita, obfuscation_key, pq_public_key FROM servers ORDER BY id",
             &[],
         )
         .await?;
+
     out.push_str("# HELP oxide_server_active_peers Live peers per server (last heartbeat).\n");
     out.push_str("# TYPE oxide_server_active_peers gauge\n");
     for row in &rows {
@@ -255,6 +267,79 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
         let cap = row.int("capacity");
         out.push_str(&format!("oxide_server_capacity{{server=\"{id}\"}} {cap}\n"));
     }
+
+    // Per-server health: 1 if the server has heartbeated recently (or never — it may not run
+    // the loop), else 0. Same staleness rule as server selection.
+    out.push_str(
+        "# HELP oxide_server_up 1 if the server heartbeated within the freshness window.\n",
+    );
+    out.push_str("# TYPE oxide_server_up gauge\n");
+    let now = db::now_unix();
+    for row in &rows {
+        let id = row.text("id");
+        let up = match row.opt_int("last_heartbeat") {
+            None => 1,
+            Some(t) => (now - t <= SERVER_STALE_SECS) as i64,
+        };
+        out.push_str(&format!("oxide_server_up{{server=\"{id}\"}} {up}\n"));
+    }
+
+    // Per-server cumulative bandwidth (monotonic totals folded from heartbeats).
+    counter_series(
+        &mut out,
+        "oxide_server_tx_bytes_total",
+        "Cumulative bytes sent through the server tunnel.",
+        &rows,
+        "tx_bytes_total",
+    );
+    counter_series(
+        &mut out,
+        "oxide_server_rx_bytes_total",
+        "Cumulative bytes received through the server tunnel.",
+        &rows,
+        "rx_bytes_total",
+    );
+
+    // Fleet feature-adoption gauges (how many servers run each defense/transport). Same
+    // predicates the admin overview uses; counted in Rust from the single query above.
+    let stealth = rows
+        .iter()
+        .filter(|r| r.opt_text("obfuscation_key").is_some())
+        .count() as i64;
+    let quic = rows
+        .iter()
+        .filter(|r| r.opt_text("transport").as_deref() == Some("quic"))
+        .count() as i64;
+    let daita = rows.iter().filter(|r| r.int("daita") != 0).count() as i64;
+    let pq = rows
+        .iter()
+        .filter(|r| r.opt_text("pq_public_key").is_some())
+        .count() as i64;
+    gauge(
+        &mut out,
+        "oxide_servers_stealth",
+        "Servers running stealth (obfuscation).",
+        stealth,
+    );
+    gauge(
+        &mut out,
+        "oxide_servers_quic",
+        "Servers using the QUIC-mimicry transport.",
+        quic,
+    );
+    gauge(
+        &mut out,
+        "oxide_servers_daita",
+        "Servers running DAITA traffic-analysis defense.",
+        daita,
+    );
+    gauge(
+        &mut out,
+        "oxide_servers_pq",
+        "Servers advertising a post-quantum key.",
+        pq,
+    );
+
     Ok(out)
 }
 

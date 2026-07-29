@@ -268,7 +268,8 @@ async fn metrics_report_counts_and_load() {
     use oxide_control_plane::render_metrics;
     let pool = db::connect(&temp_db_path()).await.unwrap();
     let server_pub = public_from_secret(&generate_secret()).to_base64();
-    add_server(
+    // Enable every advertised feature so the fleet adoption gauges are all 1.
+    let token = add_server(
         &pool,
         NewServer {
             id: "m-1",
@@ -279,10 +280,10 @@ async fn metrics_report_counts_and_load() {
             city: None,
             capacity: 250,
             dns: None,
-            obfuscation_key: None,
-            pq_public_key: None,
-            transport: None,
-            daita: false,
+            obfuscation_key: Some("b2Jmcw=="),
+            pq_public_key: Some("cGtwcQ=="),
+            transport: Some("quic"),
+            daita: true,
         },
     )
     .await
@@ -300,15 +301,27 @@ async fn metrics_report_counts_and_load() {
     cc.register_device(&account, dev, "m-1", None)
         .await
         .unwrap();
+    // A heartbeat gives the server a fresh timestamp + cumulative bandwidth.
+    cc.heartbeat("m-1", &token, 5, 4096, 8192).await.unwrap();
 
     let text = render_metrics(&pool).await.unwrap();
     assert!(text.contains("oxide_accounts_total 1"));
     assert!(text.contains("oxide_servers_total 1"));
     assert!(text.contains("oxide_devices_total 1"));
     assert!(text.contains("oxide_server_capacity{server=\"m-1\"} 250"));
-    assert!(text.contains("oxide_server_active_peers{server=\"m-1\"}"));
-    // Prometheus format sanity: HELP/TYPE headers present.
+    assert!(text.contains("oxide_server_active_peers{server=\"m-1\"} 5"));
+    // Bandwidth counters (from the heartbeat) + health.
+    assert!(text.contains("oxide_server_tx_bytes_total{server=\"m-1\"} 4096"));
+    assert!(text.contains("oxide_server_rx_bytes_total{server=\"m-1\"} 8192"));
+    assert!(text.contains("oxide_server_up{server=\"m-1\"} 1"));
+    // Fleet feature-adoption gauges (this server runs all of them).
+    assert!(text.contains("oxide_servers_stealth 1"));
+    assert!(text.contains("oxide_servers_quic 1"));
+    assert!(text.contains("oxide_servers_daita 1"));
+    assert!(text.contains("oxide_servers_pq 1"));
+    // Prometheus format sanity: HELP/TYPE headers present, incl. a counter type.
     assert!(text.contains("# TYPE oxide_accounts_total gauge"));
+    assert!(text.contains("# TYPE oxide_server_tx_bytes_total counter"));
 }
 
 #[tokio::test]
