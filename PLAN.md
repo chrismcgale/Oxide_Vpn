@@ -304,7 +304,7 @@ crypto/format parts; seccomp test runs in CI.
 
 - [ ] **3A Desktop GUI** — a graphical client (e.g. Tauri) over the agent Unix socket; the
   agent is already the privileged helper. Server browser, connect toggle, live stats.
-- [~] **3B Cross-platform data plane** — *architecture DONE + net-macos scaffold (2026-07-29).*
+- [~] **3B Cross-platform data plane** — *architecture DONE + net-macos & net-windows scaffolds (2026-07-29).*
   New **`oxide-net` facade** selects the OS backend by target (`cfg(target_os)` + target-gated
   deps); client-core/agentd/oxide-client depend on it, not `net-linux` directly (server-only
   NAT/sysctl stay in `net-linux`). New **`oxide-net-macos`** (`#![cfg(target_os="macos")]`, empty
@@ -312,9 +312,13 @@ crypto/format parts; seccomp test runs in CI.
   x86_64-apple-darwin`) = `bind_dual_stack`/`shutdown_signal`/`dns`(resolv.conf) + **utun** TunDevice
   (PF_SYSTEM/SYSPROTO_CONTROL, AsyncFd, 4-byte AF-header handling) + `link_index`. **Stubbed
   (`Unsupported`+`TODO(macos)`, needs on-Mac completion):** `Netlink` routing (BSD PF_ROUTE) + pf
-  kill switch. The cross-check caught a real `Send` bug (iovec across `.await`). *Remaining:*
-  finish macOS route/pf on a Mac + live-verify; then `net-windows` (wintun). Fully verified on
-  Linux (170 tests); macOS is compile-checked only (no Mac here).
+  kill switch. The cross-check caught a real `Send` bug (iovec across `.await`). New
+  **`oxide-net-windows`** (same pattern, cross-compile-checked via `x86_64-pc-windows-gnu`):
+  `bind_dual_stack`/`shutdown_signal` done; **TunDevice (Wintun DLL), Netlink (IP Helper
+  API/netsh), dns (SetInterfaceDnsSettings), WFP kill switch all stubbed `Unsupported`+
+  `TODO(windows)`** — Windows diverges more (no TUN fd, no resolv.conf). *Remaining:* finish the
+  macOS route/pf and the Windows TUN/routing/DNS/firewall on real hardware + live-verify. Fully
+  verified on Linux; macOS + Windows are compile-checked only (no Mac/Windows here).
 - [ ] **3C Mobile** — expose `wg-core` as a library via UniFFI; integrate with
   iOS NetworkExtension / Android VpnService.
 - [x] **3D Split tunnelling** (per-destination) — DONE (2026-07-23). `[interface] split_include`
