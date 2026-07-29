@@ -340,7 +340,7 @@ crypto/format parts; seccomp test runs in CI.
 
 - [ ] **4A Adaptive DAITA** — maybenot-style learned/state-machine defenses; bidirectional +
   per-hop cover; constant-rate across the fleet toward a mix-net.
-- [x] **4B Continuous rekey / PSK rotation** — *DONE (2026-07-29); one live run pending.* Rotate
+- [x] **4B Continuous rekey / PSK rotation** — *DONE + LIVE-VERIFIED (2026-07-29).* Rotate
   the PQ-derived WireGuard PSK at runtime for forward secrecy beyond WG's ephemeral rekey.
   **wg-core**: `EngineHandle::replace_peer` recreates a peer's `Tunn` with a new PSK (boringtun
   fixes the PSK at construction) + prunes demux caches; loopback test proves both ends rotating →
@@ -350,9 +350,11 @@ crypto/format parts; seccomp test runs in CI.
   `peers_with_rotated_psk`). **client-core**: `ConnectRequest.rekey_interval` drives a `rekey_loop`
   alongside `run_tunnel` (re-encapsulate → re-register → local `replace_peer`, no reconnect;
   `build_rekey_context` gates to single-hop PQ, unit-tested); `oxide-client connect --rekey-secs
-  N`. Window: client swaps immediately, server catches up within its poll, WG retries bridge it.
-  174 tests. *Pending:* run `scripts/netns-rekey-test.sh` under root to confirm live convergence
-  (authored, not yet run — no root on the dev box).
+  N`. **Server-first ordering** (`REKEY_SERVER_GRACE`): the client waits ~a poll after
+  re-registering so the server applies the new PSK first, keeping its current session live during
+  the grace, so its fresh handshake lands on a ready server (a ~1s blip, not a ~5s boringtun-retry
+  blackhole). 174 tests. **Live-verified** `scripts/netns-rekey-test.sh` (CP-mediated PQ tunnel,
+  rekey every 8s): tunnel survives the rotations (14/18 pings), both sides log the swap. PASS.
 - [ ] **4C Decentralized / community exits** — bring-your-own-exit with reputation; a
   federated relay marketplace.
 - [ ] **4D Developer SDK** — embeddable ephemeral tunnels (the data plane as a library others
