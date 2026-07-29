@@ -62,6 +62,10 @@ enum Cmd {
         /// Block all non-tunnel traffic while connected.
         #[arg(long)]
         kill_switch: bool,
+        /// Rotate the post-quantum PSK every N seconds for forward secrecy (single-hop + PQ
+        /// only). Omit to disable. E.g. `--rekey-secs 3600`.
+        #[arg(long)]
+        rekey_secs: Option<u64>,
     },
     /// Join the account's private mesh (P2P overlay of your own devices) and connect.
     Mesh {
@@ -178,6 +182,7 @@ async fn main() -> Result<()> {
             key_file,
             mtu,
             kill_switch,
+            rekey_secs,
         } => {
             let req = ConnectRequest {
                 control_plane,
@@ -190,6 +195,7 @@ async fn main() -> Result<()> {
                 key_file,
                 mtu,
                 exclude: Vec::new(),
+                rekey_interval: rekey_secs.map(std::time::Duration::from_secs),
             };
             // Always-on: keep the tunnel up across server death / network changes until the
             // user interrupts. A pinned --server just reconnects to the same one.

@@ -22,7 +22,7 @@ use ipnet::IpNet;
 use tracing::{debug, info, warn};
 
 use oxide_common::api::RegisterDeviceResponse;
-use oxide_common::{keys, InterfaceConfig, SecretKey, TransportKind};
+use oxide_common::{keys, InterfaceConfig, PublicKey, SecretKey, TransportKind};
 use oxide_control_client::ControlClient;
 use oxide_net::{bring_up_interface, dns, killswitch, netlink, Netlink, TunDevice};
 use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport};
@@ -53,6 +53,10 @@ pub struct ConnectRequest {
     /// Server ids to avoid when auto-selecting (used on reconnect to skip a just-failed
     /// server). Ignored when an explicit `server`/`exit` is set.
     pub exclude: Vec<String>,
+    /// If set (and the connection is post-quantum + single-hop), rotate the PQ-derived PSK on
+    /// this interval for forward secrecy — re-encapsulate to the server's PQ key, re-register
+    /// the fresh ciphertext, and swap the peer's PSK in place (no reconnect). `None` = off.
+    pub rekey_interval: Option<Duration>,
 }
 
 /// The resolved local config for a connection.
@@ -61,6 +65,9 @@ pub struct Resolved {
     pub peers: Vec<PeerParams>,
     pub server_id: Option<String>,
     pub exit_id: Option<String>,
+    /// The server's post-quantum public key (base64), if it runs PQ — kept so the rekey driver
+    /// can re-encapsulate to it. Only populated for single-hop (rekey targets single-hop).
+    pub pq_public_key: Option<String>,
 }
 
 impl Resolved {
@@ -82,7 +89,9 @@ pub async fn resolve_connection(req: &ConnectRequest) -> Result<Resolved> {
     let device_pub = keys::public_from_secret(&device_key);
     let cc = ControlClient::new(&req.control_plane);
 
-    let (reg, psk, server_id, exit_id) = if let Some(exit_id) = &req.exit {
+    // The single-hop server's PQ public key (base64), captured so the rekey driver can
+    // re-encapsulate. `None` for multihop (rekey targets single-hop in v1).
+    let (reg, psk, server_id, exit_id, pq_public_key) = if let Some(exit_id) = &req.exit {
         let entry_id = match &req.entry {
             Some(e) => e.clone(),
             None => pick_entry(&cc, &account, exit_id).await?,
@@ -109,7 +118,7 @@ pub async fn resolve_connection(req: &ConnectRequest) -> Result<Resolved> {
             .register_device_multihop(&account, device_pub, &entry_id, exit_id, pq_ct.as_deref())
             .await
             .context("registering device (multihop)")?;
-        (reg, psk, None, Some(exit_id.clone()))
+        (reg, psk, None, Some(exit_id.clone()), None)
     } else {
         let chosen = match &req.server {
             Some(id) => cc
@@ -148,11 +157,12 @@ pub async fn resolve_connection(req: &ConnectRequest) -> Result<Resolved> {
             None => (None, None),
         };
         let id = chosen.id.clone();
+        let server_pq = chosen.pq_public_key.clone();
         let reg = cc
             .register_device(&account, device_pub, &id, pq_ct.as_deref())
             .await
             .context("registering device")?;
-        (reg, psk, Some(id), None)
+        (reg, psk, Some(id), None, server_pq)
     };
     info!(assigned_ip = %reg.assigned_ip, endpoint = %reg.server.endpoint, "device registered");
 
@@ -162,6 +172,7 @@ pub async fn resolve_connection(req: &ConnectRequest) -> Result<Resolved> {
         peers: vec![peer],
         server_id,
         exit_id,
+        pq_public_key,
     })
 }
 
@@ -245,6 +256,7 @@ pub async fn resolve_mesh(req: &MeshRequest) -> Result<Resolved> {
         peers,
         server_id: None,
         exit_id: None,
+        pq_public_key: None, // mesh has no exit server to rekey against
     })
 }
 
@@ -582,6 +594,82 @@ where
     Ok(outcome)
 }
 
+/// Everything the rekey driver needs to rotate the PQ PSK on a live single-hop connection.
+struct RekeyContext {
+    control_plane: String,
+    account: String,
+    device_pub: PublicKey,
+    server_id: String,
+    /// The server's decoded PQ public key, to re-encapsulate against.
+    server_pq_public_key: Vec<u8>,
+    /// The peer to rotate — endpoint/allowed-ips/keepalive are preserved; only the PSK changes.
+    peer: PeerParams,
+}
+
+/// Build the rekey context if this connection can rotate its PQ PSK: single-hop (`server_id`
+/// set), the server runs PQ (`pq_public_key`), and the sole peer already uses a PSK. Returns
+/// `None` otherwise (multihop, no PQ, or a mesh) — the driver simply won't run. Pure.
+fn build_rekey_context(req: &ConnectRequest, resolved: &Resolved) -> Option<RekeyContext> {
+    let server_id = resolved.server_id.clone()?;
+    let server_pq_public_key = B64.decode(resolved.pq_public_key.as_ref()?).ok()?;
+    // Single-peer client whose peer already has a PSK (post-quantum actually in use).
+    let [peer] = resolved.peers.as_slice() else {
+        return None;
+    };
+    peer.preshared_key?;
+    Some(RekeyContext {
+        control_plane: req.control_plane.clone(),
+        account: req.account.replace(' ', ""),
+        device_pub: keys::public_from_secret(&resolved.iface.private_key),
+        server_id,
+        server_pq_public_key,
+        peer: peer.clone(),
+    })
+}
+
+/// Rotate the PQ PSK every `interval`: re-encapsulate to the server's PQ key, push the fresh
+/// ciphertext to the control plane (the server derives the same PSK and applies it on its next
+/// poll), and swap the local peer's PSK in place — no reconnect, the TUN stays up. Runs for the
+/// tunnel's lifetime (cancelled when the tunnel ends). A failed rotation is logged and retried
+/// next interval; the current PSK keeps working meanwhile. There is a brief window each rotation
+/// where the client is on the new PSK and the server is still on the old one (until its next
+/// poll) — WireGuard's handshake retries bridge it.
+async fn rekey_loop(
+    ctx: RekeyContext,
+    handle_rx: tokio::sync::watch::Receiver<Option<EngineHandle<TunDevice>>>,
+    interval: Duration,
+) {
+    let cc = ControlClient::new(&ctx.control_plane);
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await; // the first tick fires immediately; skip it
+    loop {
+        tick.tick().await;
+        let Some(handle) = handle_rx.borrow().clone() else {
+            continue; // engine not ready yet
+        };
+        let Some((ct, psk)) = oxide_pq::encapsulate(&ctx.server_pq_public_key) else {
+            warn!("rekey: PQ encapsulation failed");
+            continue;
+        };
+        if let Err(e) = cc
+            .register_device(
+                &ctx.account,
+                ctx.device_pub,
+                &ctx.server_id,
+                Some(&B64.encode(&ct)),
+            )
+            .await
+        {
+            warn!(error = %e, "rekey: re-registration failed; keeping the current PSK");
+            continue;
+        }
+        let mut peer = ctx.peer.clone();
+        peer.preshared_key = Some(psk);
+        handle.replace_peer(peer);
+        info!("rekey: rotated the post-quantum PSK");
+    }
+}
+
 /// Run an **always-on** connection: resolve → tunnel → (on link death) re-select a
 /// different server and reconnect, with capped backoff, until `stop` fires. This is the
 /// classic-VPN reliability loop — it survives server death and network changes.
@@ -663,15 +751,42 @@ where
                 }
             }
         };
-        let outcome = run_tunnel(
-            &resolved.iface,
-            resolved.peers,
-            kill_switch,
-            Some(policy),
-            teardown,
-            on_ready.clone(),
-        )
-        .await?;
+        // Optional PQ-PSK rotation for this connection. The driver runs alongside the tunnel and
+        // is cancelled when the tunnel ends; it needs the engine handle, so wrap `on_ready` to
+        // publish it into a watch channel the driver reads.
+        let rekey_ctx = req
+            .rekey_interval
+            .and_then(|_| build_rekey_context(&req, &resolved));
+        let (handle_tx, handle_rx) =
+            tokio::sync::watch::channel::<Option<EngineHandle<TunDevice>>>(None);
+        let on_ready_attempt = {
+            let outer = on_ready.clone();
+            move |h: EngineHandle<TunDevice>| {
+                let _ = handle_tx.send(Some(h.clone()));
+                outer(h);
+            }
+        };
+        let outcome = match (rekey_ctx, req.rekey_interval) {
+            (Some(ctx), Some(interval)) => {
+                tokio::select! {
+                    o = run_tunnel(&resolved.iface, resolved.peers, kill_switch, Some(policy), teardown, on_ready_attempt) => o?,
+                    _ = rekey_loop(ctx, handle_rx, interval) => {
+                        unreachable!("rekey loop runs until the tunnel future cancels it")
+                    }
+                }
+            }
+            _ => {
+                run_tunnel(
+                    &resolved.iface,
+                    resolved.peers,
+                    kill_switch,
+                    Some(policy),
+                    teardown,
+                    on_ready_attempt,
+                )
+                .await?
+            }
+        };
 
         match outcome {
             TunnelOutcome::Disconnected => {
@@ -816,6 +931,73 @@ mod tests {
             .allowed_ips
             .iter()
             .any(|n| matches!(n, IpNet::V4(v) if v.prefix_len() == 0)));
+    }
+
+    #[test]
+    fn rekey_context_built_only_for_single_hop_pq() {
+        let server_pub = keys::public_from_secret(&keys::generate_secret());
+        let reg = RegisterDeviceResponse {
+            assigned_ip: "10.8.0.5/24".into(),
+            server: ServerConnection {
+                public_key: server_pub,
+                endpoint: "203.0.113.7:51820".into(),
+                tunnel_ip: "10.8.0.1".into(),
+            },
+            dns: None,
+            obfuscation_key: None,
+            transport: None,
+            daita: false,
+        };
+        let req = ConnectRequest {
+            control_plane: "http://cp".into(),
+            account: "1234 5678 9012 3456".into(),
+            server: Some("us-1".into()),
+            exit: None,
+            entry: None,
+            country: None,
+            city: None,
+            key_file: "device.key".into(),
+            mtu: None,
+            exclude: Vec::new(),
+            rekey_interval: Some(Duration::from_secs(60)),
+        };
+        let pq_b64 = B64.encode([7u8; 32]);
+        let resolved = |psk: Option<[u8; 32]>, server_id: Option<&str>, pq: Option<String>| {
+            let (iface, peer) =
+                resolve_registration(keys::generate_secret(), &reg, None, psk).unwrap();
+            Resolved {
+                iface,
+                peers: vec![peer],
+                server_id: server_id.map(str::to_string),
+                exit_id: None,
+                pq_public_key: pq,
+            }
+        };
+
+        // Single-hop + PQ (peer has a PSK) + server PQ key → a context.
+        let ctx = build_rekey_context(
+            &req,
+            &resolved(Some([9u8; 32]), Some("us-1"), Some(pq_b64.clone())),
+        )
+        .expect("single-hop PQ should build a rekey context");
+        assert_eq!(ctx.server_id, "us-1");
+        assert_eq!(ctx.account, "1234567890123456"); // spaces stripped
+        assert_eq!(ctx.server_pq_public_key, [7u8; 32]);
+        assert_eq!(ctx.peer.preshared_key, Some([9u8; 32]));
+
+        // No PSK (not post-quantum) → no rekey.
+        assert!(
+            build_rekey_context(&req, &resolved(None, Some("us-1"), Some(pq_b64.clone())))
+                .is_none()
+        );
+        // No server PQ key → no rekey.
+        assert!(
+            build_rekey_context(&req, &resolved(Some([9u8; 32]), Some("us-1"), None)).is_none()
+        );
+        // Multihop (no single-hop server_id) → no rekey.
+        assert!(
+            build_rekey_context(&req, &resolved(Some([9u8; 32]), None, Some(pq_b64))).is_none()
+        );
     }
 
     #[test]

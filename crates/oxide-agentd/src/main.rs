@@ -152,6 +152,7 @@ async fn dispatch(req: AgentRequest, state: &State, key_file: &Arc<PathBuf>) -> 
                 key_file: (**key_file).clone(),
                 mtu: None,
                 exclude: Vec::new(),
+                rekey_interval: None,
             };
             match connect(state, req, kill_switch).await {
                 Ok(()) => AgentResponse::Ok,
