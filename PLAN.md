@@ -340,17 +340,19 @@ crypto/format parts; seccomp test runs in CI.
 
 - [ ] **4A Adaptive DAITA** — maybenot-style learned/state-machine defenses; bidirectional +
   per-hop cover; constant-rate across the fleet toward a mix-net.
-- [~] **4B Continuous rekey / PSK rotation** — *mechanism DONE + verified (2026-07-29); client
-  driver remains.* Rotate the PQ-derived WireGuard PSK at runtime for forward secrecy beyond WG's
-  ephemeral rekey. **wg-core**: `EngineHandle::replace_peer` recreates a peer's `Tunn` with a new
-  PSK (boringtun fixes the PSK at construction) + prunes demux caches; loopback test proves both
-  ends rotating → traffic resumes, one-sided → breaks (PSK enforced). **control-plane**:
-  re-registering a device now refreshes its stored `pq_ciphertext` (the rotation channel).
-  **oxide-serverd**: the peer-list poll detects a peer whose derived PSK changed and calls
-  `replace_peer` (pure `peers_with_rotated_psk` unit-tested). *Remaining:* the **client-side
-  periodic trigger** (re-encapsulate to the server PQ key + re-register + local `replace_peer` on
-  an interval, wired into `run_supervised`) and the **live poll-window convergence** — deferred to
-  a netns run (can't be validated on this Linux box without a live PQ server + root). 173 tests.
+- [x] **4B Continuous rekey / PSK rotation** — *DONE (2026-07-29); one live run pending.* Rotate
+  the PQ-derived WireGuard PSK at runtime for forward secrecy beyond WG's ephemeral rekey.
+  **wg-core**: `EngineHandle::replace_peer` recreates a peer's `Tunn` with a new PSK (boringtun
+  fixes the PSK at construction) + prunes demux caches; loopback test proves both ends rotating →
+  traffic resumes, one-sided → breaks (PSK enforced). **control-plane**: re-registering a device
+  refreshes its stored `pq_ciphertext` (the rotation channel). **oxide-serverd**: the peer-list
+  poll detects a peer whose derived PSK changed and calls `replace_peer` (pure
+  `peers_with_rotated_psk`). **client-core**: `ConnectRequest.rekey_interval` drives a `rekey_loop`
+  alongside `run_tunnel` (re-encapsulate → re-register → local `replace_peer`, no reconnect;
+  `build_rekey_context` gates to single-hop PQ, unit-tested); `oxide-client connect --rekey-secs
+  N`. Window: client swaps immediately, server catches up within its poll, WG retries bridge it.
+  174 tests. *Pending:* run `scripts/netns-rekey-test.sh` under root to confirm live convergence
+  (authored, not yet run — no root on the dev box).
 - [ ] **4C Decentralized / community exits** — bring-your-own-exit with reputation; a
   federated relay marketplace.
 - [ ] **4D Developer SDK** — embeddable ephemeral tunnels (the data plane as a library others
