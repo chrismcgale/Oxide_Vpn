@@ -289,10 +289,11 @@ crypto/format parts; seccomp test runs in CI.
   API** (`GET /v1/admin/overview` + `/v1/admin/servers`) consumed by the **`oxide-admin-tui`**
   operator console (Overview / Servers / Features + cost + bandwidth sparklines). **`/metrics`
   enriched**: per-server bytes/up + fleet adoption gauges (`oxide_servers_{stealth,quic,daita,pq}`).
-  **Runtime privacy counters**: wg-core counts DAITA real/cover cells + demux probes → heartbeat →
-  per-server `/metrics` counters + admin-TUI detail line. *Deferred (documented follow-ons):*
-  decoy/obfs runtime counters (Transport-layer seam), PQ runtime handshake counter (boringtun
-  opaque; adoption gauge covers it), external Grafana dashboards (user prefers TUI).
+  **Runtime privacy counters**: wg-core counts DAITA real/cover cells + demux probes **+ (2026-07-29)
+  obfs-decode-failures + decoy-forwards** (Transport-layer seam: `Transport { wire, counters }`) →
+  heartbeat → per-server `/metrics` counters + admin-TUI detail line. *Deferred:* PQ runtime
+  handshake counter (boringtun opaque; adoption gauge covers it), external Grafana dashboards (user
+  prefers TUI). The counter follow-ons are all done.
 - [ ] **Client TUI polish + QoL** — *DONE (2026-07-27).* `oxide-tui` is now phase-aware (spinner /
   link-health dot / capability badges / throughput sparklines); `TunnelStatus` gained
   `phase`/`handshake_age_secs`/`transport`/`daita`/`kill_switch`. **QoL batch:** kill-switch toggle,
