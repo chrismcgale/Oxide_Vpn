@@ -291,6 +291,17 @@ pub struct AdminServerInfo {
     /// heartbeats, reset-safe across server restarts).
     pub tx_bytes_total: u64,
     pub rx_bytes_total: u64,
+    /// DAITA runtime counters (latest cumulative-since-start reading; reset on server restart).
+    /// `daita_tx_cover` is 0 on a server (cover is client-generated). See [`HeartbeatRequest`].
+    #[serde(default)]
+    pub daita_tx_real: u64,
+    #[serde(default)]
+    pub daita_tx_cover: u64,
+    #[serde(default)]
+    pub daita_rx_cover_dropped: u64,
+    /// Inbound demux probes (efficiency signal).
+    #[serde(default)]
+    pub decap_probes: u64,
     /// Seconds since the last heartbeat, or `None` if the server has never heartbeated.
     #[serde(default)]
     pub last_heartbeat_secs: Option<i64>,

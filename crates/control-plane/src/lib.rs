@@ -57,7 +57,8 @@ const SERVER_COLUMNS: &str =
 /// feature flags, and bandwidth totals).
 const ADMIN_SERVER_COLUMNS: &str = "id, endpoint, country, city, capacity, active_peers, \
     last_heartbeat, transport, daita, obfuscation_key, pq_public_key, tx_bytes_total, \
-    rx_bytes_total, created_at";
+    rx_bytes_total, daita_tx_real, daita_tx_cover, daita_rx_cover_dropped, decap_probes, \
+    created_at";
 
 /// Max requests per source IP per [`RATE_WINDOW`]. Protects the account-number bearer
 /// auth from brute force and the account-creation endpoint from abuse.
@@ -246,6 +247,7 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
     let rows = pool
         .fetch_all(
             "SELECT id, active_peers, capacity, last_heartbeat, tx_bytes_total, rx_bytes_total, \
+             daita_tx_real, daita_tx_cover, daita_rx_cover_dropped, decap_probes, \
              transport, daita, obfuscation_key, pq_public_key FROM servers ORDER BY id",
             &[],
         )
@@ -298,6 +300,30 @@ pub async fn render_metrics(pool: &Db) -> ApiResult<String> {
         "Cumulative bytes received through the server tunnel.",
         &rows,
         "rx_bytes_total",
+    );
+
+    // Runtime privacy-defense counters (that the defenses are actually firing). Cover *sent*
+    // is client-only, so a server reports 0 there; rx-cover-dropped shows the cover it absorbed.
+    counter_series(
+        &mut out,
+        "oxide_server_daita_tx_real_total",
+        "DAITA real cells framed and sent by the server.",
+        &rows,
+        "daita_tx_real",
+    );
+    counter_series(
+        &mut out,
+        "oxide_server_daita_rx_cover_dropped_total",
+        "Inbound DAITA cover cells dropped before boringtun.",
+        &rows,
+        "daita_rx_cover_dropped",
+    );
+    counter_series(
+        &mut out,
+        "oxide_server_decap_probes_total",
+        "Inbound demux decapsulate probes (efficiency: ~1 per packet steady-state).",
+        &rows,
+        "decap_probes",
     );
 
     // Fleet feature-adoption gauges (how many servers run each defense/transport). Same
@@ -974,11 +1000,14 @@ async fn server_heartbeat(
     let (new_tx_total, new_tx_last) = accumulate_bytes(tx_total, tx_last, hb.tx_bytes as i64);
     let (new_rx_total, new_rx_last) = accumulate_bytes(rx_total, rx_last, hb.rx_bytes as i64);
 
+    // DAITA/demux counters are stored as the raw latest cumulative reading (Prometheus counters
+    // are expected to reset on server restart; rate()/increase() handle it). No reset-safe fold.
     state
         .pool
         .execute(
             "UPDATE servers SET active_peers = ?, last_heartbeat = ?,
-                 tx_bytes_total = ?, rx_bytes_total = ?, last_tx_bytes = ?, last_rx_bytes = ?
+                 tx_bytes_total = ?, rx_bytes_total = ?, last_tx_bytes = ?, last_rx_bytes = ?,
+                 daita_tx_real = ?, daita_tx_cover = ?, daita_rx_cover_dropped = ?, decap_probes = ?
              WHERE id = ?",
             &[
                 Val::from(hb.active_peers as i64),
@@ -987,6 +1016,10 @@ async fn server_heartbeat(
                 Val::from(new_rx_total),
                 Val::from(new_tx_last),
                 Val::from(new_rx_last),
+                Val::from(hb.daita_tx_real as i64),
+                Val::from(hb.daita_tx_cover as i64),
+                Val::from(hb.daita_rx_cover_dropped as i64),
+                Val::from(hb.decap_probes as i64),
                 Val::from(server_id.as_str()),
             ],
         )
@@ -1204,6 +1237,10 @@ fn admin_server_info_from_row(row: &DbRow) -> AdminServerInfo {
         stealth: row.opt_text("obfuscation_key").is_some(),
         tx_bytes_total: row.int("tx_bytes_total").max(0) as u64,
         rx_bytes_total: row.int("rx_bytes_total").max(0) as u64,
+        daita_tx_real: row.int("daita_tx_real").max(0) as u64,
+        daita_tx_cover: row.int("daita_tx_cover").max(0) as u64,
+        daita_rx_cover_dropped: row.int("daita_rx_cover_dropped").max(0) as u64,
+        decap_probes: row.int("decap_probes").max(0) as u64,
         last_heartbeat_secs,
         created_at: row.int("created_at"),
     }

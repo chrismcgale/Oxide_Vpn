@@ -491,6 +491,10 @@ mod tests {
             stealth: false,
             tx_bytes_total: 2_000_000_000,
             rx_bytes_total: 1_000_000_000,
+            daita_tx_real: 0,
+            daita_tx_cover: 0,
+            daita_rx_cover_dropped: 0,
+            decap_probes: 0,
             last_heartbeat_secs: Some(5),
             created_at,
         }

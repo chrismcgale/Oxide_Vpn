@@ -311,10 +311,22 @@ async fn metrics_report_counts_and_load() {
     cc.register_device(&account, dev, "m-1", None)
         .await
         .unwrap();
-    // A heartbeat gives the server a fresh timestamp + cumulative bandwidth.
-    cc.heartbeat("m-1", &token, &hb(5, 4096, 8192))
-        .await
-        .unwrap();
+    // A heartbeat gives the server a fresh timestamp + cumulative bandwidth + defense counters.
+    cc.heartbeat(
+        "m-1",
+        &token,
+        &oxide_common::api::HeartbeatRequest {
+            active_peers: 5,
+            tx_bytes: 4096,
+            rx_bytes: 8192,
+            daita_tx_real: 111,
+            daita_tx_cover: 0,
+            daita_rx_cover_dropped: 222,
+            decap_probes: 333,
+        },
+    )
+    .await
+    .unwrap();
 
     let text = render_metrics(&pool).await.unwrap();
     assert!(text.contains("oxide_accounts_total 1"));
@@ -331,9 +343,14 @@ async fn metrics_report_counts_and_load() {
     assert!(text.contains("oxide_servers_quic 1"));
     assert!(text.contains("oxide_servers_daita 1"));
     assert!(text.contains("oxide_servers_pq 1"));
+    // Runtime DAITA/demux counters (from the heartbeat).
+    assert!(text.contains("oxide_server_daita_tx_real_total{server=\"m-1\"} 111"));
+    assert!(text.contains("oxide_server_daita_rx_cover_dropped_total{server=\"m-1\"} 222"));
+    assert!(text.contains("oxide_server_decap_probes_total{server=\"m-1\"} 333"));
     // Prometheus format sanity: HELP/TYPE headers present, incl. a counter type.
     assert!(text.contains("# TYPE oxide_accounts_total gauge"));
     assert!(text.contains("# TYPE oxide_server_tx_bytes_total counter"));
+    assert!(text.contains("# TYPE oxide_server_daita_tx_real_total counter"));
 }
 
 #[tokio::test]
@@ -730,10 +747,21 @@ async fn admin_read_endpoints_and_byte_accounting() {
     cc.heartbeat("s-quic", &tokens["s-quic"], &hb(5, 5_000, 8_000))
         .await
         .unwrap(); // +4_000 tx, +6_000 rx
-    cc.heartbeat("s-quic", &tokens["s-quic"], &hb(4, 200, 100))
-        .await
-        .unwrap(); // reset: +200 tx, +100 rx
-                   // Totals: tx = 5_000 + 200 = 5_200 ; rx = 8_000 + 100 = 8_100.
+    cc.heartbeat(
+        "s-quic",
+        &tokens["s-quic"],
+        &oxide_common::api::HeartbeatRequest {
+            active_peers: 4,
+            tx_bytes: 200,
+            rx_bytes: 100,
+            daita_tx_real: 9,
+            daita_rx_cover_dropped: 77,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap(); // reset: +200 tx, +100 rx
+               // Totals: tx = 5_000 + 200 = 5_200 ; rx = 8_000 + 100 = 8_100.
 
     cc.heartbeat("s-plain", &tokens["s-plain"], &hb(2, 700, 900))
         .await
@@ -749,6 +777,9 @@ async fn admin_read_endpoints_and_byte_accounting() {
     assert_eq!(quic.rx_bytes_total, 8_100);
     assert_eq!(quic.active_peers, 4);
     assert_eq!(quic.transport.as_deref(), Some("quic"));
+    // Runtime DAITA counters flow through the admin API (raw-latest reading).
+    assert_eq!(quic.daita_tx_real, 9);
+    assert_eq!(quic.daita_rx_cover_dropped, 77);
     assert!(quic.daita);
     assert!(quic.post_quantum);
     assert!(!quic.stealth);

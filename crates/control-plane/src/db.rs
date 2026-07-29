@@ -343,6 +343,10 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
             rx_bytes_total INTEGER NOT NULL DEFAULT 0,
             last_tx_bytes  INTEGER NOT NULL DEFAULT 0,
             last_rx_bytes  INTEGER NOT NULL DEFAULT 0,
+            daita_tx_real  INTEGER NOT NULL DEFAULT 0,
+            daita_tx_cover INTEGER NOT NULL DEFAULT 0,
+            daita_rx_cover_dropped INTEGER NOT NULL DEFAULT 0,
+            decap_probes   INTEGER NOT NULL DEFAULT 0,
             created_at     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS devices (
@@ -397,6 +401,12 @@ async fn init_schema_sqlite(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN rx_bytes_total INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN last_tx_bytes INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN last_rx_bytes INTEGER NOT NULL DEFAULT 0",
+        // Runtime privacy-defense counters (2H): latest cumulative-since-start reading per
+        // server; Prometheus counters handle the per-restart reset, so no reset-safe folding.
+        "ALTER TABLE servers ADD COLUMN daita_tx_real INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN daita_tx_cover INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN daita_rx_cover_dropped INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN decap_probes INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE devices ADD COLUMN pq_ciphertext TEXT",
         // Concurrency-safe allocation constraints (2C), added idempotently so existing
         // databases pick them up. On a legacy DB that already holds duplicates, index
@@ -438,6 +448,10 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
             rx_bytes_total BIGINT NOT NULL DEFAULT 0,
             last_tx_bytes  BIGINT NOT NULL DEFAULT 0,
             last_rx_bytes  BIGINT NOT NULL DEFAULT 0,
+            daita_tx_real  BIGINT NOT NULL DEFAULT 0,
+            daita_tx_cover BIGINT NOT NULL DEFAULT 0,
+            daita_rx_cover_dropped BIGINT NOT NULL DEFAULT 0,
+            decap_probes   BIGINT NOT NULL DEFAULT 0,
             created_at     BIGINT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS devices (
@@ -479,6 +493,11 @@ async fn init_schema_pg(pool: &PgPool) -> Result<()> {
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS rx_bytes_total BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_tx_bytes BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS last_rx_bytes BIGINT NOT NULL DEFAULT 0",
+        // Runtime privacy-defense counters (2H).
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita_tx_real BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita_tx_cover BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS daita_rx_cover_dropped BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS decap_probes BIGINT NOT NULL DEFAULT 0",
     ];
     for stmt in statements {
         sqlx::query(stmt)
