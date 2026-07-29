@@ -396,20 +396,16 @@ impl<T: TunQueue> Engine<T> {
     /// datagram if any, else a cover cell — to the single peer's endpoint. This is what
     /// makes the client→server flow a constant-rate, constant-size, contentless stream.
     async fn shaper_loop(shared: Arc<Shared<T>>, daita: Arc<Daita>) {
-        // Constant-rate DAITA uses a fixed-cadence interval; adaptive pacing (4A) sleeps for the
-        // pacer's jittered/tapered delay each iteration. `last_was_real` feeds the pacer's state.
-        let mut tick = interval(daita.slot);
+        // The cell cadence is driven by the pacing state machine (4A): constant-rate is a single
+        // `Constant` state, adaptive a multi-state machine. `last_was_real` feeds it back each cell.
+        // (Only spawned when `shape_egress`, so `machine` is always `Some` here.)
+        let Some(machine) = daita.machine.as_ref() else {
+            return;
+        };
         let mut last_was_real = false;
         loop {
-            match &daita.pacer {
-                Some(pacer) => {
-                    let delay = pacer.lock().unwrap().next_delay(last_was_real);
-                    tokio::time::sleep(delay).await;
-                }
-                None => {
-                    tick.tick().await;
-                }
-            }
+            let delay = machine.lock().unwrap().next_delay(last_was_real);
+            tokio::time::sleep(delay).await;
             // v1 targets the single-peer client: find the one peer we have an endpoint for.
             let endpoint = shared
                 .table
