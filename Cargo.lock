@@ -1680,7 +1680,7 @@ dependencies = [
  "clap",
  "oxide-client-core",
  "oxide-common",
- "oxide-net-linux",
+ "oxide-net",
  "oxide-wg-core",
  "serde_json",
  "tokio",
@@ -1710,7 +1710,7 @@ dependencies = [
  "oxide-client-core",
  "oxide-common",
  "oxide-control-client",
- "oxide-net-linux",
+ "oxide-net",
  "oxide-wg-core",
  "tokio",
  "tracing",
@@ -1726,7 +1726,7 @@ dependencies = [
  "ipnet",
  "oxide-common",
  "oxide-control-client",
- "oxide-net-linux",
+ "oxide-net",
  "oxide-pq",
  "oxide-wg-core",
  "tokio",
@@ -1793,6 +1793,13 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "oxide-net"
+version = "0.1.0"
+dependencies = [
+ "oxide-net-linux",
 ]
 
 [[package]]

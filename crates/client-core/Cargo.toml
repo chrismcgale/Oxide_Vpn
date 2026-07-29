@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 oxide-common = { path = "../common" }
 oxide-wg-core = { path = "../wg-core" }
-oxide-net-linux = { path = "../net-linux" }
+oxide-net = { path = "../net" }
 oxide-control-client = { path = "../control-client" }
 oxide-pq = { path = "../pq" }
 tokio = { workspace = true }

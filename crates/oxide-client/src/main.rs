@@ -16,7 +16,7 @@ use oxide_client_core::{
 };
 use oxide_common::{keys, Config, SecretKey};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::shutdown_signal;
+use oxide_net::shutdown_signal;
 use oxide_wg_core::PeerParams;
 
 #[derive(Parser)]

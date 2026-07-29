@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use oxide_client_core::{run_supervised, ConnEvent, ConnectRequest, ReconnectPolicy};
 use oxide_common::agent::{AgentRequest, AgentResponse, ConnPhase, TunnelStatus, DEFAULT_SOCKET};
-use oxide_net_linux::TunDevice;
+use oxide_net::TunDevice;
 use oxide_wg_core::EngineHandle;
 
 #[derive(Parser)]

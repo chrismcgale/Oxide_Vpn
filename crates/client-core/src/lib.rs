@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use oxide_common::api::RegisterDeviceResponse;
 use oxide_common::{keys, InterfaceConfig, SecretKey, TransportKind};
 use oxide_control_client::ControlClient;
-use oxide_net_linux::{bring_up_interface, dns, killswitch, netlink, Netlink, TunDevice};
+use oxide_net::{bring_up_interface, dns, killswitch, netlink, Netlink, TunDevice};
 use oxide_wg_core::{Daita, Engine, EngineHandle, MimicTransport, PeerParams, Transport};
 
 pub mod latency;
@@ -339,7 +339,7 @@ async fn build_client_transport(
     // endpoint from one socket (falls back to 0.0.0.0 if IPv6 is disabled).
     let bind_udp = || async {
         let std_sock =
-            oxide_net_linux::bind_dual_stack(bind_port).context("binding client UDP socket")?;
+            oxide_net::bind_dual_stack(bind_port).context("binding client UDP socket")?;
         tokio::net::UdpSocket::from_std(std_sock).context("binding client UDP socket")
     };
     match kind {
