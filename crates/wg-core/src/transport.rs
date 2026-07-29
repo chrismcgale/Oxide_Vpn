@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,7 +30,32 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-pub enum Transport {
+/// Runtime counters for the stealth transports — observability that the defenses are firing.
+/// Cheap `Relaxed` atomics; snapshot via [`Transport::counters`].
+#[derive(Default)]
+pub struct TransportCounters {
+    /// Undecodable inbound datagrams dropped by the obfs layer (scans/probes/junk on the port).
+    pub obfs_decode_failures: AtomicU64,
+    /// Unauthenticated first-contact Initials spliced to the decoy backend (active-probe
+    /// deflections). Server-side only (decoy runs on the server).
+    pub decoy_forwards: AtomicU64,
+}
+
+/// A snapshot of [`TransportCounters`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransportStats {
+    pub obfs_decode_failures: u64,
+    pub decoy_forwards: u64,
+}
+
+/// The datagram transport: a wire backend plus runtime counters. Kept a concrete type (not a
+/// generic) so the engine's `Shared` doesn't grow a type parameter.
+pub struct Transport {
+    wire: Wire,
+    counters: Arc<TransportCounters>,
+}
+
+enum Wire {
     /// Plain UDP — standard WireGuard on the wire.
     Plain(UdpSocket),
     /// Obfuscated UDP: each datagram is wrapped so DPI can't fingerprint it.
@@ -57,26 +83,33 @@ pub enum Transport {
 }
 
 impl Transport {
+    fn wrap(wire: Wire) -> Self {
+        Transport {
+            wire,
+            counters: Arc::new(TransportCounters::default()),
+        }
+    }
+
     pub fn plain(socket: UdpSocket) -> Self {
-        Transport::Plain(socket)
+        Self::wrap(Wire::Plain(socket))
     }
 
     pub fn obfuscated(socket: UdpSocket, key: [u8; 32]) -> Self {
-        Transport::Obfuscated { socket, key }
+        Self::wrap(Wire::Obfuscated { socket, key })
     }
 
     pub fn mimic(transport: MimicTransport) -> Self {
-        Transport::Mimic(transport)
+        Self::wrap(Wire::Mimic(transport))
     }
 
     pub fn quic_mimic(socket: UdpSocket, key: [u8; 32]) -> Self {
-        Transport::QuicMimic {
+        Self::wrap(Wire::QuicMimic {
             socket: Arc::new(socket),
             key,
             sent_initial: Mutex::new(HashSet::new()),
             seen_initials: Mutex::new(HashMap::new()),
             decoy: None,
-        }
+        })
     }
 
     /// QUIC mimicry with **decoy-forwarding**: unauthenticated first-contact Initials are
@@ -89,25 +122,33 @@ impl Transport {
     ) -> Self {
         let socket = Arc::new(socket);
         let decoy = DecoyForwarder::new(socket.clone(), decoy_backend);
-        Transport::QuicMimic {
+        Self::wrap(Wire::QuicMimic {
             socket,
             key,
             sent_initial: Mutex::new(HashSet::new()),
             seen_initials: Mutex::new(HashMap::new()),
             decoy: Some(decoy),
+        })
+    }
+
+    /// Snapshot the stealth-defense counters (undecodable-datagram drops + decoy deflections).
+    pub fn counters(&self) -> TransportStats {
+        TransportStats {
+            obfs_decode_failures: self.counters.obfs_decode_failures.load(Ordering::Relaxed),
+            decoy_forwards: self.counters.decoy_forwards.load(Ordering::Relaxed),
         }
     }
 
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        match self {
-            Transport::Plain(s) => s.send_to(buf, addr).await,
-            Transport::Obfuscated { socket, key } => {
+        match &self.wire {
+            Wire::Plain(s) => s.send_to(buf, addr).await,
+            Wire::Obfuscated { socket, key } => {
                 let framed = obfuscate(key, buf);
                 socket.send_to(&framed, addr).await?;
                 Ok(buf.len())
             }
-            Transport::Mimic(m) => m.send_to(buf, addr).await,
-            Transport::QuicMimic {
+            Wire::Mimic(m) => m.send_to(buf, addr).await,
+            Wire::QuicMimic {
                 socket,
                 key,
                 sent_initial,
@@ -130,23 +171,27 @@ impl Transport {
     }
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        match self {
-            Transport::Plain(s) => s.recv_from(buf).await,
-            Transport::Obfuscated { socket, key } => {
+        match &self.wire {
+            Wire::Plain(s) => s.recv_from(buf).await,
+            Wire::Obfuscated { socket, key } => {
                 let mut raw = [0u8; OBFS_BUF];
                 loop {
                     let (n, addr) = socket.recv_from(&mut raw).await?;
                     // Undecodable datagrams (scans/probes) are silently dropped: giving
-                    // no response is itself part of resisting active detection.
+                    // no response is itself part of resisting active detection. Counted so the
+                    // operator can see junk/probe volume on the port.
                     if let Some(plain) = deobfuscate(key, &raw[..n]) {
                         let m = plain.len().min(buf.len());
                         buf[..m].copy_from_slice(&plain[..m]);
                         return Ok((m, addr));
                     }
+                    self.counters
+                        .obfs_decode_failures
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Transport::Mimic(m) => m.recv_from(buf).await,
-            Transport::QuicMimic {
+            Wire::Mimic(m) => m.recv_from(buf).await,
+            Wire::QuicMimic {
                 socket,
                 key,
                 seen_initials,
@@ -163,6 +208,7 @@ impl Transport {
                     if let Some(d) = decoy {
                         if d.is_decoy(&addr).await {
                             d.forward(dg, addr).await;
+                            self.counters.decoy_forwards.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                     }
@@ -181,6 +227,7 @@ impl Transport {
                             _ => {
                                 if let Some(d) = decoy {
                                     d.forward(dg, addr).await;
+                                    self.counters.decoy_forwards.fetch_add(1, Ordering::Relaxed);
                                 }
                                 continue;
                             }
@@ -196,6 +243,9 @@ impl Transport {
                         buf[..m].copy_from_slice(&plain[..m]);
                         return Ok((m, addr));
                     }
+                    self.counters
+                        .obfs_decode_failures
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -334,6 +384,43 @@ mod tests {
             "response must appear to come from the server's port"
         );
         assert!(b[..n].starts_with(b"decoy-backend:"));
+        // The deflection is counted for observability (2H).
+        assert!(
+            server.counters().decoy_forwards >= 1,
+            "the decoy forward must be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn obfs_decode_failures_are_counted() {
+        // Undecodable inbound datagrams (scans/probes) are dropped silently but counted, so an
+        // operator can see junk volume on the port.
+        let key = [7u8; 32];
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = Transport::obfuscated(server_sock, key);
+
+        // From one socket (ordered on loopback): a junk byte, then a valid obfuscated datagram.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"x", server_addr).await.unwrap(); // too short to decode
+        sender
+            .send_to(&obfuscate(&key, b"hello"), server_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.recv_from(&mut buf),
+        )
+        .await
+        .expect("recv should return on the valid datagram")
+        .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert!(
+            server.counters().obfs_decode_failures >= 1,
+            "the junk datagram must be counted as a decode failure"
+        );
     }
 
     #[tokio::test]

@@ -178,6 +178,10 @@ pub struct EngineStats {
     /// Per-candidate `decapsulate` probes made by the inbound demux (efficiency: probes per
     /// packet — ~1 in steady state thanks to the receiver-index cache).
     pub decap_probes: u64,
+    /// Undecodable inbound datagrams dropped by the stealth (obfs) layer — scans/probes/junk.
+    pub obfs_decode_failures: u64,
+    /// Unauthenticated Initials spliced to the decoy backend (active-probe deflections, server-side).
+    pub decoy_forwards: u64,
 }
 
 /// A cheap, cloneable handle for mutating a running engine's peer set. The control
@@ -676,6 +680,7 @@ impl<T: TunQueue> EngineHandle<T> {
 
     /// Current load and throughput: peer counts plus total bytes tx/rx across peers.
     pub fn stats(&self) -> EngineStats {
+        let transport_stats = self.shared.transport.counters();
         let peers = self.shared.table.read().unwrap().snapshot();
         let total_peers = peers.len();
         let mut active_peers = 0;
@@ -705,6 +710,8 @@ impl<T: TunQueue> EngineHandle<T> {
             daita_tx_cover: self.shared.daita_tx_cover.load(Ordering::Relaxed),
             daita_rx_cover_dropped: self.shared.daita_rx_cover_dropped.load(Ordering::Relaxed),
             decap_probes: self.shared.decap_probes.load(Ordering::Relaxed),
+            obfs_decode_failures: transport_stats.obfs_decode_failures,
+            decoy_forwards: transport_stats.decoy_forwards,
         }
     }
 
