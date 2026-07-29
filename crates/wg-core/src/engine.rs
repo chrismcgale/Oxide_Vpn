@@ -115,8 +115,16 @@ struct Shared<T: TunQueue> {
     /// index that new packets carry, so old indices simply age out (pruned on peer removal).
     recv_index_to_peer: Mutex<HashMap<u32, PeerId>>,
     /// Count of per-candidate `decapsulate` attempts in the inbound demux. Lets tests
-    /// prove that index/addr routing resolves a datagram without scanning every peer.
+    /// prove that index/addr routing resolves a datagram without scanning every peer, and is
+    /// surfaced as a metric (demux efficiency: probes per inbound packet).
     decap_probes: AtomicU64,
+    /// DAITA cell counters (runtime observability that the defense is actually running).
+    /// `daita_tx_real`/`daita_tx_cover` are the real vs. cover cells this engine *emitted*;
+    /// cover is only produced on the shaping (client) side, so a framing-only server reads 0
+    /// cover. `daita_rx_cover_dropped` is inbound cover cells dropped before boringtun.
+    daita_tx_real: AtomicU64,
+    daita_tx_cover: AtomicU64,
+    daita_rx_cover_dropped: AtomicU64,
     /// Optional DAITA traffic shaping. When set, outbound datagrams are wrapped in
     /// fixed-size cells (and, on the shaping/client side, drained at a constant rate with
     /// cover traffic), and inbound cover cells are dropped before boringtun. See
@@ -160,6 +168,15 @@ pub struct EngineStats {
     /// peer has ever handshaked. Used by the client's liveness watchdog: a growing age past
     /// the rekey window means the link is dead (server gone / network changed).
     pub handshake_age_secs: Option<u64>,
+    /// DAITA cells emitted: real (carrying a datagram) vs. cover (idle-slot filler). Cover is
+    /// only generated on the shaping (client) side; a framing-only server reports 0 cover.
+    pub daita_tx_real: u64,
+    pub daita_tx_cover: u64,
+    /// Inbound DAITA cover cells dropped before boringtun (how much cover this engine absorbed).
+    pub daita_rx_cover_dropped: u64,
+    /// Per-candidate `decapsulate` probes made by the inbound demux (efficiency: probes per
+    /// packet — ~1 in steady state thanks to the receiver-index cache).
+    pub decap_probes: u64,
 }
 
 /// A cheap, cloneable handle for mutating a running engine's peer set. The control
@@ -224,6 +241,9 @@ impl<T: TunQueue> Engine<T> {
                 addr_to_peer: Mutex::new(HashMap::new()),
                 recv_index_to_peer: Mutex::new(HashMap::new()),
                 decap_probes: AtomicU64::new(0),
+                daita_tx_real: AtomicU64::new(0),
+                daita_tx_cover: AtomicU64::new(0),
+                daita_rx_cover_dropped: AtomicU64::new(0),
                 daita: None,
             }),
         }
@@ -350,7 +370,10 @@ impl<T: TunQueue> Engine<T> {
                 Ok(())
             }
             Some(d) => match oxide_daita::frame_real(&datagram, d.cell_size) {
-                Some(cell) => shared.transport.send_to(&cell, endpoint).await.map(|_| ()),
+                Some(cell) => {
+                    shared.daita_tx_real.fetch_add(1, Ordering::Relaxed);
+                    shared.transport.send_to(&cell, endpoint).await.map(|_| ())
+                }
                 None => {
                     trace!("daita: datagram too large for a cell; dropping");
                     Ok(())
@@ -384,6 +407,14 @@ impl<T: TunQueue> Engine<T> {
                 continue;
             };
             let cell = daita.shaper.next_cell();
+            // Classify by the emitted cell's tag byte (race-free vs. inspecting the queue):
+            // a real datagram was drained if the tag is REAL, otherwise a cover cell filled
+            // the slot.
+            if cell.first() == Some(&oxide_daita::REAL) {
+                shared.daita_tx_real.fetch_add(1, Ordering::Relaxed);
+            } else {
+                shared.daita_tx_cover.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = shared.transport.send_to(&cell, ep).await;
         }
     }
@@ -447,7 +478,12 @@ impl<T: TunQueue> Engine<T> {
             let datagram = match shared.daita.as_deref() {
                 Some(_) => match oxide_daita::parse(&buf[..n]) {
                     Some(oxide_daita::Cell::Real(wg)) => wg,
-                    Some(oxide_daita::Cell::Cover) => continue,
+                    Some(oxide_daita::Cell::Cover) => {
+                        shared
+                            .daita_rx_cover_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     None => continue,
                 },
                 None => buf[..n].to_vec(),
@@ -642,6 +678,10 @@ impl<T: TunQueue> EngineHandle<T> {
             tx_bytes,
             rx_bytes,
             handshake_age_secs,
+            daita_tx_real: self.shared.daita_tx_real.load(Ordering::Relaxed),
+            daita_tx_cover: self.shared.daita_tx_cover.load(Ordering::Relaxed),
+            daita_rx_cover_dropped: self.shared.daita_rx_cover_dropped.load(Ordering::Relaxed),
+            decap_probes: self.shared.decap_probes.load(Ordering::Relaxed),
         }
     }
 

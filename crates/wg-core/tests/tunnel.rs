@@ -469,6 +469,93 @@ async fn tunnel_works_with_daita_shaping() {
 }
 
 #[tokio::test]
+async fn daita_counts_cover_and_real() {
+    // The runtime DAITA counters (EngineStats) reflect the defence actually running: the
+    // shaping client emits cover cells on idle slots and a real cell for a datagram, and the
+    // framing server drops the client's inbound cover cells.
+    let obfs_key = [0x3a; 32];
+    let cell_size = oxide_daita::DEFAULT_CELL_SIZE;
+    let slot = Duration::from_millis(2);
+
+    let server_priv = generate_secret();
+    let server_pub = public_from_secret(&server_priv);
+    let client_priv = generate_secret();
+    let client_pub = public_from_secret(&client_priv);
+
+    let server_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let (server_tun, _srv_inject, mut srv_capture) = MockTun::pair();
+    let server = Engine::build(
+        &server_priv,
+        vec![PeerParams {
+            public_key: client_pub,
+            preshared_key: None,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }],
+        Transport::obfuscated(server_udp, obfs_key),
+        server_tun,
+    )
+    .with_daita(Daita::framing(cell_size));
+
+    let (client_tun, client_inject, _cli_capture) = MockTun::pair();
+    let client = Engine::build(
+        &client_priv,
+        vec![PeerParams {
+            public_key: server_pub,
+            preshared_key: None,
+            endpoint: Some(server_addr),
+            allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+            persistent_keepalive: Some(5),
+        }],
+        Transport::obfuscated(client_udp, obfs_key),
+        client_tun,
+    )
+    .with_daita(Daita::shaping(cell_size, slot));
+
+    // Grab handles BEFORE run() consumes the engines.
+    let server_handle = server.handle();
+    let client_handle = client.handle();
+    tokio::spawn(server.run());
+    tokio::spawn(client.run());
+
+    // Drive one real datagram through so a real cell is emitted, then let cover accrue.
+    let packet = ipv4_packet(
+        Ipv4Addr::new(10, 8, 0, 2),
+        Ipv4Addr::new(10, 8, 0, 1),
+        b"counted",
+    );
+    client_inject.send(packet.clone()).unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(10), srv_capture.recv())
+        .await
+        .expect("timed out; DAITA tunnel never delivered")
+        .expect("server tun channel closed");
+    assert_eq!(received, packet);
+
+    // Let many cover slots elapse (slot = 2ms).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let cs = client_handle.stats();
+    assert!(
+        cs.daita_tx_real >= 1,
+        "client should have emitted a real cell"
+    );
+    assert!(
+        cs.daita_tx_cover > 0,
+        "idle shaping client should emit cover cells"
+    );
+
+    let ss = server_handle.stats();
+    assert!(
+        ss.daita_rx_cover_dropped > 0,
+        "framing server should drop the client's inbound cover cells"
+    );
+}
+
+#[tokio::test]
 async fn peer_added_at_runtime_comes_up() {
     // Same as above, but the server starts with NO peers and the client is added
     // live through the EngineHandle after the engine is already running — the path
