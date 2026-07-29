@@ -627,13 +627,19 @@ fn build_rekey_context(req: &ConnectRequest, resolved: &Resolved) -> Option<Reke
     })
 }
 
+/// After pushing the new ciphertext, wait this long before swapping the local PSK. This lets the
+/// **server apply the new PSK first** (it does so on its next control-plane poll), so when we
+/// swap and our fresh handshake initiation goes out, the server already has the matching PSK and
+/// answers immediately — instead of failing and waiting ~5s for boringtun's next retry (a long
+/// data-plane blip). Our *current* session keeps carrying traffic during this grace. It should
+/// comfortably exceed the server's poll interval; `rekey_interval` in turn should exceed this.
+const REKEY_SERVER_GRACE: Duration = Duration::from_secs(3);
+
 /// Rotate the PQ PSK every `interval`: re-encapsulate to the server's PQ key, push the fresh
-/// ciphertext to the control plane (the server derives the same PSK and applies it on its next
-/// poll), and swap the local peer's PSK in place — no reconnect, the TUN stays up. Runs for the
-/// tunnel's lifetime (cancelled when the tunnel ends). A failed rotation is logged and retried
-/// next interval; the current PSK keeps working meanwhile. There is a brief window each rotation
-/// where the client is on the new PSK and the server is still on the old one (until its next
-/// poll) — WireGuard's handshake retries bridge it.
+/// ciphertext to the control plane, wait a grace so the server applies it first, then swap the
+/// local peer's PSK in place — no reconnect, the TUN stays up. Runs for the tunnel's lifetime
+/// (cancelled when the tunnel ends). A failed rotation is logged and retried next interval; the
+/// current PSK keeps working meanwhile.
 async fn rekey_loop(
     ctx: RekeyContext,
     handle_rx: tokio::sync::watch::Receiver<Option<EngineHandle<TunDevice>>>,
@@ -663,6 +669,9 @@ async fn rekey_loop(
             warn!(error = %e, "rekey: re-registration failed; keeping the current PSK");
             continue;
         }
+        // Let the server pick up the new ciphertext and rotate first (see the grace note); the
+        // current session keeps working until we swap.
+        tokio::time::sleep(REKEY_SERVER_GRACE).await;
         let mut peer = ctx.peer.clone();
         peer.preshared_key = Some(psk);
         handle.replace_peer(peer);

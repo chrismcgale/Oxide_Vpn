@@ -41,7 +41,21 @@ trap cleanup EXIT
 
 if [ -z "${OXIDE_SKIP_BUILD:-}" ]; then
     echo "== building =="
-    ( . "$HOME/.cargo/env" 2>/dev/null; cargo build -p oxide-serverd -p oxide-client -p oxide-control-plane )
+    # Under sudo, HOME is root's, so point cargo/rustup at the invoking user's toolchain.
+    U_HOME="/home/${SUDO_USER:-$USER}"
+    CARGO_ENV="$HOME/.cargo/env"
+    [ -f "$CARGO_ENV" ] || CARGO_ENV="$U_HOME/.cargo/env"
+    [ -f "$CARGO_ENV" ] && . "$CARGO_ENV"
+    command -v cargo >/dev/null 2>&1 || PATH="$U_HOME/.cargo/bin:$PATH"
+    [ -d "$U_HOME/.rustup" ] && export RUSTUP_HOME="$U_HOME/.rustup"
+    [ -d "$U_HOME/.cargo" ] && export CARGO_HOME="$U_HOME/.cargo"
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "!! cargo not found (running under sudo?). Build first, then skip the build:"
+        echo "     cargo build -p oxide-serverd -p oxide-client -p oxide-control-plane"
+        echo "     sudo OXIDE_SKIP_BUILD=1 bash scripts/netns-rekey-test.sh"
+        exit 1
+    fi
+    cargo build -p oxide-serverd -p oxide-client -p oxide-control-plane
 fi
 SERVERD="$PWD/$BIN/oxide-serverd"
 CLIENT="$PWD/$BIN/oxide-client"
@@ -65,6 +79,11 @@ ip -n "$CLI" addr add 10.50.0.2/24 dev veth-cs
 ip -n "$SRV" addr add 10.50.0.1/24 dev veth-sc
 ip -n "$CLI" link set lo up; ip -n "$SRV" link set lo up
 ip -n "$CLI" link set veth-cs up; ip -n "$SRV" link set veth-sc up
+# A default route so the client can pin the server ENDPOINT around the (full-tunnel) tunnel —
+# CP `connect` is full-tunnel (peer 0.0.0.0/0). The endpoint 10.50.0.1 is pinned via this gw
+# (dev veth-cs), so both the WG underlay and the CP (10.50.0.1:8080, for rekey re-registration)
+# stay reachable outside the tunnel while everything else swings through oxide0.
+ip -n "$CLI" route add default via 10.50.0.1
 
 echo "== control plane + register the PQ server (prints its auth token) =="
 ip netns exec "$SRV" "$CP_BIN" --db "$DB" add-server \
@@ -96,9 +115,12 @@ sleep 1
 echo "== account + connect with a short rekey interval =="
 ACCT=$(ip netns exec "$CLI" "$CLIENT" account --control-plane "$CPURL" | tr -dc '0-9')
 echo "  account: ${ACCT:0:4}…"
+# rekey every 8s: comfortably above the server's 2s poll + the client's 3s server-first grace,
+# so each rotation settles (a ~1s blip) long before the next. (Production would rotate far less
+# often; 8s just exercises several rotations quickly.)
 ip netns exec "$CLI" env RUST_LOG=info "$CLIENT" connect \
     --control-plane "$CPURL" --account "$ACCT" --server srv-pq --key-file "$KEYFILE" \
-    --rekey-secs 4 >"$DIR/cli.log" 2>&1 &
+    --rekey-secs 8 >"$DIR/cli.log" 2>&1 &
 CLI_PID=$!
 
 echo "== wait for the handshake =="
@@ -111,12 +133,12 @@ else
     echo "  tunnel up (initial PSK): FAIL ✗"; RC=1
 fi
 
-echo "== let ~3 rotations happen (rekey every 4s), pinging throughout =="
-# A continuous ping spanning several rotations. A rotation may drop a packet or two during the
-# re-handshake window, so we require MOST to succeed, not all.
-GOT=$(ip netns exec "$CLI" ping -c 15 -i 1 -W 2 10.8.0.1 2>/dev/null | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+' || echo 0)
-echo "  pings received across rotations: ${GOT}/15"
-if [ "${GOT:-0}" -ge 11 ]; then
+echo "== let a couple rotations happen (rekey every 8s), pinging throughout =="
+# A continuous ping spanning ~2 rotations. Each rotation blips ~1s (the server-first grace keeps
+# it short), so we require MOST to succeed, not all.
+GOT=$(ip netns exec "$CLI" ping -c 18 -i 1 -W 2 10.8.0.1 2>/dev/null | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+' || echo 0)
+echo "  pings received across rotations: ${GOT}/18"
+if [ "${GOT:-0}" -ge 13 ]; then
     echo "  traffic survives PSK rotation: PASS ✓"
 else
     echo "  traffic survives PSK rotation: FAIL ✗  (too many drops)"; RC=1
