@@ -526,6 +526,18 @@ fn draw_server_detail(f: &mut Frame, app: &App, area: Rect) {
         format!("{:.1}h", hours_since(s.created_at, app.now)),
     ));
     lines.push(kv("est. cost", format!("${:.2}", app.server_cost(s))));
+    // DAITA runtime activity (only when the server runs it): real cells framed + inbound cover
+    // absorbed prove the defense is firing, not just configured. Counts, not bytes.
+    if s.daita {
+        lines.push(kv(
+            "daita",
+            format!(
+                "real ↑{} drop ↓{}",
+                s.daita_tx_real, s.daita_rx_cover_dropped
+            ),
+        ));
+    }
+    lines.push(kv("demux", format!("{} probes", s.decap_probes)));
 
     // Per-server throughput-over-time, built from this server's own byte-total deltas.
     lines.push(Line::from(""));
@@ -764,6 +776,10 @@ mod render_tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("throughput"), "detail per-server graph label");
+        // us-a runs DAITA (fixture daita_tx_real=1234, rx_cover_dropped=5678, decap_probes=42).
+        assert!(text.contains("real ↑1234"), "daita real cells");
+        assert!(text.contains("drop ↓5678"), "daita cover dropped");
+        assert!(text.contains("42 probes"), "demux probes");
     }
 
     #[test]
