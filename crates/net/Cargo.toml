@@ -15,3 +15,6 @@ oxide-net-linux = { path = "../net-linux" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 oxide-net-macos = { path = "../net-macos" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+oxide-net-windows = { path = "../net-windows" }

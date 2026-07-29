@@ -5,6 +5,7 @@ members = [
     "crates/wg-core",
     "crates/net-linux",
     "crates/net-macos",
+    "crates/net-windows",
     "crates/net",
     "crates/control-plane",
     "crates/control-client",

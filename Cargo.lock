@@ -1801,6 +1801,7 @@ version = "0.1.0"
 dependencies = [
  "oxide-net-linux",
  "oxide-net-macos",
+ "oxide-net-windows",
 ]
 
 [[package]]
@@ -1825,6 +1826,16 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "libc",
+ "oxide-common",
+ "socket2 0.5.10",
+ "tokio",
+]
+
+[[package]]
+name = "oxide-net-windows"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
  "oxide-common",
  "socket2 0.5.10",
  "tokio",

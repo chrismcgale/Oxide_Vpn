@@ -23,4 +23,8 @@ pub use oxide_net_macos::{
     TunDevice,
 };
 
-// A future Windows arm re-exports the same names from `oxide-net-windows` under its own cfg.
+#[cfg(target_os = "windows")]
+pub use oxide_net_windows::{
+    bind_dual_stack, bring_up_interface, dns, killswitch, netlink, shutdown_signal, Netlink,
+    TunDevice,
+};
