@@ -343,8 +343,16 @@ crypto/format parts; seccomp test runs in CI.
 
 ### WAVE 4 — Advanced privacy / research bets
 
-- [ ] **4A Adaptive DAITA** — maybenot-style learned/state-machine defenses; bidirectional +
-  per-hop cover; constant-rate across the fleet toward a mix-net.
+- [~] **4A Adaptive DAITA** — *opened (2026-07-29).* First maybenot-style increment: a pure
+  `daita::pacer::Pacer` state machine (Active/Idle) that decides the **delay** before each cell
+  instead of a fixed slot — **jittered timing** (±25%, no fixed inter-cell interval for ML to lock
+  onto, same average rate active) + an **idle taper** (cadence grows to `slot*max_mult` when
+  cover-only, cutting idle cost; leaks the active/idle envelope — the maybenot cost/leak knob).
+  Wired into the engine `shaper_loop` (sleeps the pacer's delay vs the fixed interval); opt-in via
+  `interface.daita_adaptive` (client-only, requires `daita`). Pure state tests + a loopback
+  adaptive-tunnel test. *Remaining:* full maybenot machine framework (multiple states/distributions),
+  **bidirectional** shaping (server-side cover, not just framing), per-hop/multihop cover, and CP
+  distribution of the adaptive choice. 180 tests.
 - [x] **4B Continuous rekey / PSK rotation** — *DONE + LIVE-VERIFIED (2026-07-29).* Rotate
   the PQ-derived WireGuard PSK at runtime for forward secrecy beyond WG's ephemeral rekey.
   **wg-core**: `EngineHandle::replace_peer` recreates a peer's `Tunn` with a new PSK (boringtun
