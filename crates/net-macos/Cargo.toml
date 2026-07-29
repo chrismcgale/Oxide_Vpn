@@ -1,0 +1,17 @@
+[package]
+name = "oxide-net-macos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oxide_net_macos"
+path = "src/lib.rs"
+
+# The whole crate is `#![cfg(target_os = "macos")]`, so on other targets it builds empty and
+# these deps are only pulled for a macOS build. All are cross-platform crates.
+[dependencies]
+oxide-common = { path = "../common" }
+tokio = { workspace = true }
+ipnet = { workspace = true }
+libc = { workspace = true }
+socket2 = "0.5"

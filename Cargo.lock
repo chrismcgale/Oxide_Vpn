@@ -1800,6 +1800,7 @@ name = "oxide-net"
 version = "0.1.0"
 dependencies = [
  "oxide-net-linux",
+ "oxide-net-macos",
 ]
 
 [[package]]
@@ -1816,6 +1817,17 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "oxide-net-macos"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "libc",
+ "oxide-common",
+ "socket2 0.5.10",
+ "tokio",
 ]
 
 [[package]]

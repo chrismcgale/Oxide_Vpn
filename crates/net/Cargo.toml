@@ -9,7 +9,9 @@ path = "src/lib.rs"
 
 # The privileged network backend, selected by target OS. Consumers (client-core, the agent,
 # the CLI) depend on this facade and never name a specific OS crate, so a new platform is a
-# new sibling here — not a change to every caller. The macOS arm (oxide-net-macos) is wired
-# in a follow-up.
+# new sibling here — not a change to every caller.
 [target.'cfg(target_os = "linux")'.dependencies]
 oxide-net-linux = { path = "../net-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+oxide-net-macos = { path = "../net-macos" }
