@@ -86,26 +86,22 @@ impl ControlClient {
         Ok(resp.json().await?)
     }
 
-    /// Report live load + cumulative bandwidth to the control plane (server-authenticated
-    /// heartbeat). `tx_bytes`/`rx_bytes` are the engine's counters since the server started;
-    /// the control plane folds them into reset-safe per-server totals.
+    /// Report live load + cumulative bandwidth/defense counters to the control plane
+    /// (server-authenticated heartbeat). The `report`'s byte + DAITA fields are the engine's
+    /// counters since the server started; the control plane folds bytes into reset-safe totals
+    /// and records the latest defense counters. Callers build the [`HeartbeatRequest`] from
+    /// their `EngineStats` (see `oxide-serverd`).
     pub async fn heartbeat(
         &self,
         server_id: &str,
         token: &str,
-        active_peers: u32,
-        tx_bytes: u64,
-        rx_bytes: u64,
+        report: &HeartbeatRequest,
     ) -> Result<()> {
         let resp = self
             .http
             .post(self.url(&format!("/v1/internal/servers/{server_id}/heartbeat")))
             .bearer_auth(token)
-            .json(&HeartbeatRequest {
-                active_peers,
-                tx_bytes,
-                rx_bytes,
-            })
+            .json(report)
             .send()
             .await
             .context("POST heartbeat")?;

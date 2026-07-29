@@ -19,7 +19,7 @@ use ipnet::IpNet;
 use oxide_relay::Relay;
 use tracing::{info, warn};
 
-use oxide_common::api::PeerEntry;
+use oxide_common::api::{HeartbeatRequest, PeerEntry};
 use oxide_common::{keys, Config, ControlPlaneConfig, InterfaceConfig, SecretKey, TransportKind};
 use oxide_control_client::ControlClient;
 use oxide_net_linux::{bring_up_interface, nat, netlink, shutdown_signal, sysctl, Netlink};
@@ -552,16 +552,16 @@ async fn poll_control_plane<T: TunQueue>(
 
         // Report live load so the control plane can balance new clients across servers.
         let stats = handle.stats();
-        if let Err(e) = client
-            .heartbeat(
-                &cp.server_id,
-                &cp.token,
-                stats.active_peers as u32,
-                stats.tx_bytes,
-                stats.rx_bytes,
-            )
-            .await
-        {
+        let report = HeartbeatRequest {
+            active_peers: stats.active_peers as u32,
+            tx_bytes: stats.tx_bytes,
+            rx_bytes: stats.rx_bytes,
+            daita_tx_real: stats.daita_tx_real,
+            daita_tx_cover: stats.daita_tx_cover,
+            daita_rx_cover_dropped: stats.daita_rx_cover_dropped,
+            decap_probes: stats.decap_probes,
+        };
+        if let Err(e) = client.heartbeat(&cp.server_id, &cp.token, &report).await {
             warn!(error = %e, "heartbeat failed");
         }
     }

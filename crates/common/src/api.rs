@@ -66,7 +66,7 @@ fn default_true() -> bool {
 /// turns them into monotonic per-server totals by accumulating deltas (reset-safe). These are
 /// fleet-level infrastructure metrics (aggregate bytes per *server*, like `active_peers`) — not
 /// per-account traffic, so they don't breach the no-logs posture.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub active_peers: u32,
     /// Cumulative bytes the server has sent through the tunnel since it started.
@@ -75,6 +75,19 @@ pub struct HeartbeatRequest {
     /// Cumulative bytes the server has received through the tunnel since it started.
     #[serde(default)]
     pub rx_bytes: u64,
+    /// DAITA runtime counters since the server started (observability that the defense is
+    /// live). `daita_tx_cover` is only non-zero on a shaping (client) engine — a server frames
+    /// real cells and drops inbound cover, so it reports 0 cover *sent* and a growing
+    /// `daita_rx_cover_dropped`. All `#[serde(default)]` so older servers interoperate.
+    #[serde(default)]
+    pub daita_tx_real: u64,
+    #[serde(default)]
+    pub daita_tx_cover: u64,
+    #[serde(default)]
+    pub daita_rx_cover_dropped: u64,
+    /// Inbound demux probes since start (efficiency: probes per packet).
+    #[serde(default)]
+    pub decap_probes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

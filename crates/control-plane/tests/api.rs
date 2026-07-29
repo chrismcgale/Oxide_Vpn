@@ -8,6 +8,16 @@ use oxide_common::keys::{generate_secret, public_from_secret};
 use oxide_control_client::ControlClient;
 use oxide_control_plane::{add_server, app, db, serve, AppState, NewServer};
 
+/// A heartbeat carrying just load + bandwidth (DAITA/demux counters default to 0).
+fn hb(active_peers: u32, tx_bytes: u64, rx_bytes: u64) -> oxide_common::api::HeartbeatRequest {
+    oxide_common::api::HeartbeatRequest {
+        active_peers,
+        tx_bytes,
+        rx_bytes,
+        ..Default::default()
+    }
+}
+
 fn temp_db_path() -> String {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
@@ -173,13 +183,13 @@ async fn best_server_selection_balances_by_load_and_location() {
     let account = cc.create_account().await.unwrap();
 
     // Report load: us-a heavy, us-b light, de-a lightest.
-    cc.heartbeat("us-a", &tokens["us-a"], 50, 0, 0)
+    cc.heartbeat("us-a", &tokens["us-a"], &hb(50, 0, 0))
         .await
         .unwrap();
-    cc.heartbeat("us-b", &tokens["us-b"], 10, 0, 0)
+    cc.heartbeat("us-b", &tokens["us-b"], &hb(10, 0, 0))
         .await
         .unwrap();
-    cc.heartbeat("de-a", &tokens["de-a"], 5, 0, 0)
+    cc.heartbeat("de-a", &tokens["de-a"], &hb(5, 0, 0))
         .await
         .unwrap();
 
@@ -194,7 +204,7 @@ async fn best_server_selection_balances_by_load_and_location() {
     assert_eq!(best_us.id, "us-b");
 
     // A new heartbeat shifts the balance: now us-b is heavier than us-a.
-    cc.heartbeat("us-b", &tokens["us-b"], 90, 0, 0)
+    cc.heartbeat("us-b", &tokens["us-b"], &hb(90, 0, 0))
         .await
         .unwrap();
     let best_us = cc.best_server(&account, Some("us"), None).await.unwrap(); // case-insensitive
@@ -302,7 +312,9 @@ async fn metrics_report_counts_and_load() {
         .await
         .unwrap();
     // A heartbeat gives the server a fresh timestamp + cumulative bandwidth.
-    cc.heartbeat("m-1", &token, 5, 4096, 8192).await.unwrap();
+    cc.heartbeat("m-1", &token, &hb(5, 4096, 8192))
+        .await
+        .unwrap();
 
     let text = render_metrics(&pool).await.unwrap();
     assert!(text.contains("oxide_accounts_total 1"));
@@ -712,18 +724,18 @@ async fn admin_read_endpoints_and_byte_accounting() {
     let cc = ControlClient::new(&format!("http://{addr}"));
 
     // s-quic reports cumulative counters that grow, then reset (restart), then grow again.
-    cc.heartbeat("s-quic", &tokens["s-quic"], 3, 1_000, 2_000)
+    cc.heartbeat("s-quic", &tokens["s-quic"], &hb(3, 1_000, 2_000))
         .await
         .unwrap();
-    cc.heartbeat("s-quic", &tokens["s-quic"], 5, 5_000, 8_000)
+    cc.heartbeat("s-quic", &tokens["s-quic"], &hb(5, 5_000, 8_000))
         .await
         .unwrap(); // +4_000 tx, +6_000 rx
-    cc.heartbeat("s-quic", &tokens["s-quic"], 4, 200, 100)
+    cc.heartbeat("s-quic", &tokens["s-quic"], &hb(4, 200, 100))
         .await
         .unwrap(); // reset: +200 tx, +100 rx
                    // Totals: tx = 5_000 + 200 = 5_200 ; rx = 8_000 + 100 = 8_100.
 
-    cc.heartbeat("s-plain", &tokens["s-plain"], 2, 700, 900)
+    cc.heartbeat("s-plain", &tokens["s-plain"], &hb(2, 700, 900))
         .await
         .unwrap();
 
