@@ -51,6 +51,7 @@ const MAX_PKT: usize = 2048;
 const TIMER_TICK: Duration = Duration::from_millis(250);
 
 /// Parameters describing one peer, mapped from config by the caller.
+#[derive(Clone)]
 pub struct PeerParams {
     pub public_key: PublicKey,
     pub preshared_key: Option<[u8; 32]>,

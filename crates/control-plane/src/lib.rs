@@ -630,6 +630,17 @@ async fn register_core(
             if owner != account {
                 return Err(AppError::Conflict("device key already registered".into()));
             }
+            // Refresh the stored PQ ciphertext on re-registration. This is what lets a client
+            // **rotate its post-quantum PSK** (4B continuous rekey): it re-encapsulates to the
+            // server's PQ key and re-registers with the same device key but a fresh ciphertext;
+            // the server picks it up on its next peer-list poll and rotates the peer's PSK.
+            state
+                .pool
+                .execute(
+                    "UPDATE devices SET pq_ciphertext = ? WHERE public_key = ?",
+                    &[Val::from(pq_ciphertext), Val::from(device_pk.as_str())],
+                )
+                .await?;
             return response_for(
                 existing.text("tunnel_ip"),
                 cidr,

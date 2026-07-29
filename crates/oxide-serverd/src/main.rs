@@ -7,7 +7,7 @@
 //! Requires `CAP_NET_ADMIN` (run as root in M1): it creates a TUN device, edits
 //! routes/sysctls, and installs an nftables masquerade table.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -524,6 +524,9 @@ async fn poll_control_plane<T: TunQueue>(
     let mut tick = tokio::time::interval(Duration::from_secs(cp.poll_interval_secs.max(1)));
     // Relay listen ports we've already started (this server acting as a multihop entry).
     let mut running_relays: HashSet<u16> = HashSet::new();
+    // PSK last applied per peer (by pubkey bytes), so we can detect a rotated PQ ciphertext and
+    // recreate that peer's session — `reconcile` leaves existing peers untouched (4B rekey).
+    let mut applied_psk: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::new();
     loop {
         tick.tick().await;
         match client.fetch_peers(&cp.server_id, &cp.token).await {
@@ -532,8 +535,24 @@ async fn poll_control_plane<T: TunQueue>(
                     .iter()
                     .filter_map(|e| peer_from_entry(e, pq_seed.as_deref()))
                     .collect();
-                info!(peers = desired.len(), "reconciled peers from control plane");
+                // Peers whose PSK changed since we last applied it need their session recreated
+                // (clone them out before `reconcile` consumes `desired`; they must stay in the
+                // reconcile set so it doesn't remove them).
+                let rotated: Vec<PeerParams> = peers_with_rotated_psk(&applied_psk, &desired);
+                applied_psk = desired
+                    .iter()
+                    .map(|p| (p.public_key.0, p.preshared_key))
+                    .collect();
+                info!(
+                    peers = desired.len(),
+                    rotated = rotated.len(),
+                    "reconciled peers from control plane"
+                );
                 handle.reconcile(desired);
+                for p in rotated {
+                    info!("rotating PSK for a peer (fresh handshake)");
+                    handle.replace_peer(p);
+                }
             }
             Err(e) => warn!(error = %e, "failed to fetch peers from control plane"),
         }
@@ -620,9 +639,51 @@ fn peer_from_entry(entry: &PeerEntry, pq_seed: Option<&[u8]>) -> Option<PeerPara
     })
 }
 
+/// Which desired peers need their session recreated because their preshared key changed since we
+/// last applied it. An *existing* peer with a changed PSK is returned (its live `Tunn` must be
+/// replaced — `reconcile` won't touch it); a first-seen peer is not (reconcile adds it with its
+/// PSK). Pure, so the rotation decision is unit-tested. Clones only the peers being rotated.
+fn peers_with_rotated_psk(
+    applied: &HashMap<[u8; 32], Option<[u8; 32]>>,
+    desired: &[PeerParams],
+) -> Vec<PeerParams> {
+    desired
+        .iter()
+        .filter(|p| matches!(applied.get(&p.public_key.0), Some(prev) if *prev != p.preshared_key))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotated_psk_detects_changes_not_new_or_unchanged() {
+        let pk = |b: u8| oxide_common::PublicKey([b; 32]);
+        let peer = |b: u8, psk: Option<[u8; 32]>| PeerParams {
+            public_key: pk(b),
+            preshared_key: psk,
+            endpoint: None,
+            allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        };
+        // Previously applied: peer 1 had PSK A, peer 2 had PSK B.
+        let applied: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::from([
+            ([1u8; 32], Some([0xAu8; 32])),
+            ([2u8; 32], Some([0xBu8; 32])),
+        ]);
+        // Desired now: peer 1 rotated to C, peer 2 unchanged, peer 3 is new.
+        let desired = vec![
+            peer(1, Some([0xCu8; 32])),
+            peer(2, Some([0xBu8; 32])),
+            peer(3, Some([0xDu8; 32])),
+        ];
+        let rotated = peers_with_rotated_psk(&applied, &desired);
+        // Only peer 1 (existing, changed PSK) is returned — not the unchanged 2 or the new 3.
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(rotated[0].public_key.0, [1u8; 32]);
+    }
 
     #[test]
     fn render_config_has_required_sections() {

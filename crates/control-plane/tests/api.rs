@@ -804,3 +804,62 @@ async fn admin_read_endpoints_and_byte_accounting() {
     assert_eq!(ov.pq_servers, 1);
     assert_eq!(ov.stealth_servers, 1);
 }
+
+#[tokio::test]
+async fn reregistration_updates_pq_ciphertext_for_rekey() {
+    // 4B: a client rotates its PQ PSK by re-registering the same device key with a fresh
+    // ciphertext; the control plane must store the new ciphertext (so the server picks it up on
+    // its next peer-list poll and rotates the peer's PSK), while keeping the same tunnel IP.
+    let pool = db::connect(&temp_db_path()).await.unwrap();
+    let server_pub = public_from_secret(&generate_secret()).to_base64();
+    let token = add_server(
+        &pool,
+        NewServer {
+            id: "pq-1",
+            public_key: &server_pub,
+            endpoint: "203.0.113.9:51820",
+            cidr: "10.8.0.0/24".parse().unwrap(),
+            country: None,
+            city: None,
+            capacity: 0,
+            dns: None,
+            obfuscation_key: None,
+            pq_public_key: Some("cGtwcQ=="),
+            transport: None,
+            daita: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+    let cc = ControlClient::new(&format!("http://{addr}"));
+
+    let account = cc.create_account().await.unwrap();
+    let dev = public_from_secret(&generate_secret());
+
+    // Register with ciphertext CT1, then re-register the same device with CT2 (a rotation).
+    let r1 = cc
+        .register_device(&account, dev, "pq-1", Some("Q1Q1Q1=="))
+        .await
+        .unwrap();
+    let r2 = cc
+        .register_device(&account, dev, "pq-1", Some("Q2Q2Q2=="))
+        .await
+        .unwrap();
+    // Same tunnel IP (idempotent identity), but the server now sees the new ciphertext.
+    assert_eq!(r1.assigned_ip, r2.assigned_ip);
+    let peers = cc.fetch_peers("pq-1", &token).await.unwrap();
+    let me = peers
+        .iter()
+        .find(|p| p.public_key == dev)
+        .expect("device present");
+    assert_eq!(
+        me.pq_ciphertext.as_deref(),
+        Some("Q2Q2Q2=="),
+        "re-registration must store the rotated ciphertext"
+    );
+}
